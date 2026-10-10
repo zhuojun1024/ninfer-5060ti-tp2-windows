@@ -211,17 +211,42 @@ proposed text and therefore the target's near-ties.
 Convert and check:
 
 ```bash
-python3 -m tools.convert --model /path/to/Qwen3.8-27B --recipe qwen3_8_27b \
-  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 --components text,vision,mtp,dflash2 \
+python3 -m tools.convert --model /path/to/NVFP4/W4A4-W8A8 --recipe qwen3_8_27b \
+  --source dflash2=/path/to/NVFP4/W4A4-W8A8/DFlash2-FP8 --components text,vision,mtp,dflash2 \
   --proposal --out models/my_qwen.ninfer
 python3 -m tools.artifact.inspect models/my_qwen.ninfer --objects --bindings
 ```
 
-Quantizing the selector codebooks as well saves a further 178.09 MiB, but it measured about 2pp
-less acceptance on a 33k-token prompt at K=7, and those bytes land on the selector's shard
-rather than the masked draft's, so they buy no context. The shipped recipes keep the codebooks in
-BF16; a custom recipe can assign Q4 itself (see
-[change part of a recipe](docs/weight-conversion.md#change-part-of-a-recipe)).
+Quantizing the selector codebooks as well saves a further 178.09 MiB, but it measured about 2pp less
+acceptance on a 33k-token prompt at K=7, and those bytes land on the selector's shard rather than
+the masked draft's, so they buy no context. The shipped recipes keep the codebooks in BF16.
+
+### Quantizing a DFlash2 draft yourself
+
+The same lever is available as an explicit override, `tools/convert/overrides/dflash2_draft_q4.py`,
+for a conversion whose base recipe does not already select it: an artifact you rebuild from your own
+recipe, or one you want to compare against an all-Q8 draft. Start with a plan that writes nothing:
+
+```bash
+python3 -m tools.convert --model /path/to/NVFP4/W4A4-W8A8 --recipe my_recipe.py \
+  --source dflash2=/path/to/NVFP4/W4A4-W8A8/DFlash2-FP8 --components text,vision,mtp,dflash2 \
+  --override tools/convert/overrides/dflash2_draft_q4.py --dry-run
+```
+
+`--dry-run` applies the base recipe, the proposal head and the override, prints every selection as
+`name [begin,end) format method`, and writes nothing; `--out` is required only without it. Drop the
+flag and add `--out models/my_qwen.ninfer` to convert. The default entry function `configure`
+assigns Q4 to the draft projections and leaves every other parameter at whatever the base recipe
+chose; the codebook lever is a second entry point:
+
+```bash
+  --override tools/convert/overrides/dflash2_draft_q4.py:configure_with_codebooks
+```
+
+The override fails loudly when the model has no `dflash2/feature_projection`, has no draft layers,
+or has a layer missing one of the nine projections it quantizes, so a partial conversion cannot pass
+unnoticed. The general mechanism is
+[changing part of a recipe](docs/weight-conversion.md#change-part-of-a-recipe).
 
 ## Performance
 
