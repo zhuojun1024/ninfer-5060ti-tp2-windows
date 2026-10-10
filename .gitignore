@@ -19,7 +19,7 @@ venv/
 *.egg-info/
 
 # Raw third-party weight checkpoints (large; produced by offline tooling).
-# Engine artifacts (*.ninfer) under out/ ARE tracked: this is a personal fork.
+# Engine artifacts (*.ninfer) under out/ are tracked; raw checkpoints are not.
 *.qus
 *.bin
 *.safetensors

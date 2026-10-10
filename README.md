@@ -41,8 +41,8 @@ build rejects CUDA architectures other than `sm_120a`.
 Build the product binaries:
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
+git clone https://github.com/zhuojun1024/ninfer-5060ti-tp2-windows.git
+cd ninfer-5060ti-tp2-windows
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -282,15 +282,16 @@ capacities remain fixed for the process lifetime.
 
 Run the relevant `--help` for the exact current option contract.
 
-## Support
+## Relationship to upstream
 
-NInfer is a personal project that I develop out of interest. If you find it useful and would like
-to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
-
-Support is entirely voluntary. It is not a purchase or investment and does not come with financial
-returns, promised services or features, or a role in project decisions. The project's direction,
-priorities, technical choices, and release schedule remain independently determined by the
-maintainer.
+This repository is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer). It keeps the
+upstream engine, the `.ninfer` artifact format, the converter recipes, the model cards and the
+published artifacts, and adds the dual-GPU tensor-parallel-2 (TP-2) route for two 16 GiB cards plus
+a native Windows build. Upstream is the authority for the engine itself; the TP-2 additions, their
+measurements and the full adaptation record are documented in
+[Dual RTX 5060 Ti TP-2 tuning](docs/tp2-dual-5060ti.md),
+[Settled TP-2 decisions](docs/tp2-decisions.md) and the
+[TP-2 adaptation worklog](docs/maintainer/tp2-adaptation-worklog.md).
 
 ## License
 

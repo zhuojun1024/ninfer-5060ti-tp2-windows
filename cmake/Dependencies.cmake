@@ -12,7 +12,7 @@ if(WIN32)
   if(NOT NINFER_FFMPEG_ROOT)
     message(FATAL_ERROR
       "NINFER_FFMPEG_ROOT must name an FFmpeg prefix (include/ and lib/); for example "
-      "-DNINFER_FFMPEG_ROOT=D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared")
+      "-DNINFER_FFMPEG_ROOT=C:/ffmpeg")
   endif()
   find_path(NINFER_FFMPEG_INCLUDE_DIR NAMES libavcodec/avcodec.h
             PATHS "${NINFER_FFMPEG_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
@@ -47,7 +47,7 @@ if(NINFER_BUILD_PRODUCT_SUPPORT)
     if(NOT NINFER_LIBCURL_ROOT)
       message(FATAL_ERROR
         "NINFER_LIBCURL_ROOT must name a libcurl prefix (include/ and lib/); for example "
-        "-DNINFER_LIBCURL_ROOT=D:/curl-dev/expanded/curl-8_x-win64-mingw")
+        "-DNINFER_LIBCURL_ROOT=C:/curl")
     endif()
     find_path(NINFER_LIBCURL_INCLUDE_DIR NAMES curl/curl.h
               PATHS "${NINFER_LIBCURL_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
