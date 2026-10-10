@@ -40,10 +40,14 @@ build at 131,072 (see Verification).
 | MTP K=2 fp8, `--lm-head-draft` | 131,072 | 14,940 / 14,678 MiB | - | 46-49 tok/s |
 | plain, fp8 KV (pre-split build) | 262,144 | out of memory | - | - |
 | **MTP K=2 fp8, `--lm-head-draft`, shard split** | **262,144** | **15,614 / 15,094 MiB** | **1,588 tok/s** | **59.0 tok/s** |
+| DFlash2 K=2 fp8 | 4,096 | - | - | 51.0 tok/s |
+| **DFlash2 K=7 fp8** | **4,096** | **-** | **-** | **63.6 tok/s** |
 
 The 65,536 and 131,072 rows use the historical protocol (prefill: 279-token prompt, 8-token output;
 decode: 256-token output reported end-to-end, so it understates sustained decode). The 262,144 rows
-use `temperature 0` per request and the response's `usage` token counts, one request at a time:
+use `temperature 0` per request and the response's `usage` token counts, one request at a time. The
+two DFlash2 rows use the B5 basis (4,096-token context, 65-token prompt, 128-token greedy output,
+one request at a time) and anchor [DFlash2 throughput](#throughput) below:
 
 - **Prefill**: a 16,057-token prompt produced its first token in 10.11 s (1,588 tok/s); a 65k-token
   prompt returned a complete answer in 48.1 s end to end (~1.35k tok/s of prompt), against 96.8 s for
@@ -297,6 +301,38 @@ conversation and the same reuse boundary, only the draft toggled - keeping it de
 with 28 of 63 drafts accepted, against 22.5 tok/s declined. What it accepts follows the text it is
 predicting, not the route: the same served recipe and the same 2,442-token reuse decode a prose
 answer at 54 tok/s (31 of 147 accepted) and a number list at 176 tok/s (446 of 448).
+
+### Throughput
+
+The route's controlled numbers are measured on the served TP-2 path, one request at a time, fp8 KV.
+The 4,096-token-context rows are the B5 basis - a 65-token prompt and a 128-token greedy output -
+and the two controls are there to read the route's gain:
+
+| Route | Context | Decode | Acceptance | Notes |
+|---|---|---|---|---|
+| plain (control) | 4,096 | 35.1 tok/s | - | |
+| MTP K=2 (control) | 4,096 | 62.8 tok/s | 63.4%, 2.27 tokens/round | |
+| DFlash2 K=2 | 4,096 | 51.0 tok/s | 59.5% | |
+| **DFlash2 K=7** | 4,096 | **63.6 tok/s** | 30.0%, 3.10 tokens/round | 1.81x plain, on par with the MTP control |
+| DFlash2 K=7, drafts live on unaligned reuse | 4,096 | ~71 tok/s | 3.17 tokens/round | the released configuration |
+| DFlash2 K=5 / K=7, `draftall` artifact | 245,760 | 96.4 / 96.1 tok/s | - | interleaved recheck 93.3 / 96.9 |
+
+Two properties of the route show up as spread rather than as one figure, and both are measured in
+the paragraph above: what the draft accepts follows the text being predicted, and a declined draft
+costs most of the route's speed.
+
+What bounds the route is bandwidth. A forward stream reads 10.15 GB per shard, so no round can
+finish in less than 10.15/448 = 22.7 ms on TP-2, against 20.3/1,792 = 11.3 ms for the same stream
+on a single 5090; with the verify window still eager (the feature sink cannot enter the capture)
+and the proposal at 6.4-6.8 ms per round, the roofline estimate in
+[tp2-plan.md](maintainer/tp2-plan.md) §3.6 is 108 tok/s, and K=7's 63.6 tok/s does not reach it.
+Two route-specific terms sit on top of that floor: the draft's 2.07 GiB lives on shard 0 alone,
+about 5.0 ms per round against 1.24 ms on the 5090, while MTP pays 7-10 ms per round for the
+host-serialized draft chain DFlash2 does not have. The platforms are otherwise comparable in
+efficiency - the 5090's 192.5 tok/s at 37.0% acceptance is 3.59 tokens per round in 18.6 ms, 61% of
+that card's floor, and TP-2's MTP K=2 is 38.2 ms per round at 59% of its own - so the roughly 2x
+gap between them is the bandwidth ratio rather than an implementation difference. Single-5090
+numbers for the same route are tabulated in [qwen3.8-27b.md](performance/qwen3.8-27b.md).
 
 ### Verify CUDA graph
 
