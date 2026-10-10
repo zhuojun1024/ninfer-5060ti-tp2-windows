@@ -27,16 +27,23 @@ approval requirements beyond the user's instructions and the actual execution en
 
 ## Product and architecture
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
-`Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. The implementation targets `sm_120a` and
-is tuned on NVIDIA GeForce RTX 5090.
+NInfer is a from-scratch C++/CUDA inference engine, and this repository is its dual-GPU TP-2
+fork for two RTX 5060 Ti (16 GiB) cards. The primary product route is `ninfer-serve --devices 0,1`
+on native Windows: one resident model sharded across both cards, one to four queued requests
+batched into one decode round, and long-context reuse sized to the artifacts that leave room for
+it. The same route runs under Linux and WSL2. Single-GPU execution is the base the fork extends and
+stays the reference for numerical work and for the RTX 5090 tuning the engine was written for; the
+fork does not change the single-GPU route's semantics.
 
-Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
-bounded FIFO ingress, no active-request preemption, and one compact decode batch per round. The
-dedicated TP-2 route (`ninfer-serve --devices a,b`) fills that one round with up to four queued
-requests on its plain, DFlash2 and MTP rounds; its contract, limits, and measurements are in
-`docs/serving.md`.
+The engine implements `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8
+artifacts and user recipes use the same architecture, binding and execution path. The implementation
+targets `sm_120a`.
+
+Generation uses one resident model, bounded FIFO ingress, no active-request preemption, and one
+compact decode batch per round: startup-fixed concurrency of one to eight requests on one GPU, and
+up to four queued requests per round on the TP-2 route's plain, DFlash2 and MTP rounds. Its
+contract, limits and measurements are in `docs/serving.md`, `docs/tp2-dual-5060ti.md` and
+`docs/tp2-decisions.md`.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous
@@ -133,25 +140,32 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Decision | Entry point |
 |---|---|
 | Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
+| Dual-card TP-2 route: contract, tuning, measurements | `docs/serving.md`; `docs/tp2-dual-5060ti.md`, `docs/tp2-decisions.md`; `docs/windows.md` |
 | Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
 | Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
+| Dual-card serving measurements | `tools/win_port/bench_serve.ps1` |
 | In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 
 ## Local operations
 
-Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
-causes failures or interferes with the task, and briefly explain why.
+The primary workflow is the native Windows build: `tools/win_port/build.ps1` produces
+`build-win/apps/ninfer-serve.exe` and needs `-FfmpegRoot`/`-LibcurlRoot` (or `NINFER_FFMPEG_ROOT` /
+`NINFER_LIBCURL_ROOT`); `tools/win_port/serve.ps1` starts the dual-card route and
+`tools/win_port/bench_serve.ps1` measures it from the served endpoint's own `timings`. Use
+`cmake --build <build-dir> -j` for the Linux tree (`build/`). Adjust parallelism when actual
+resource pressure causes failures or interferes with the task, and briefly explain why.
 
 Use a Python 3.11 interpreter selected by explicit path; the default shell's `python3` may be a
 different version. Use `python3` only after checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the Linux verification toolchain is CUDA 13.1,
-the native Windows build toolchain CUDA 13.3 (see [Windows build](docs/windows.md)).
+Normal resources are `build-win/`, `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json`
+report, and `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the native Windows build toolchain
+is CUDA 13.3 and the Linux verification toolchain CUDA 13.1 (see [Windows
+build](docs/windows.md)).
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
