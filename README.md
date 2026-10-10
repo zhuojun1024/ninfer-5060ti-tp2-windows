@@ -1,5 +1,7 @@
 # NInfer
 
+**English** | [简体中文](README.zh-CN.md)
+
 > Dual RTX 5060 Ti tensor-parallel-2 serving, natively on Windows.
 
 This repository is the dual-GPU fork of [Neroued/ninfer](https://github.com/Neroued/ninfer). It
