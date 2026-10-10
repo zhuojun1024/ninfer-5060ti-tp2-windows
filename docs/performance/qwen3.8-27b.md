@@ -308,7 +308,7 @@ speedup is reported. Neither the phase-rate nor makespan comparisons establish a
 
 ## Reproduction and reports
 
-Build [ninfer-serve](../../README.md#quick-start) and run from the repository root with Python 3.11:
+Build [ninfer-serve](../../README.md#quick-start-native-windows) and run from the repository root with Python 3.11:
 
 ```bash
 export NINFER_BENCH_PYTHON=/path/to/python3.11

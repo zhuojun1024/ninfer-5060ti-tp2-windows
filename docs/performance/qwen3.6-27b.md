@@ -139,7 +139,7 @@ comparison. MTP0 and MTP3 use different workloads; no per-scenario speculative s
 
 ## Reproduction and reports
 
-Build [ninfer-serve](../../README.md#quick-start) and run from the repository root with Python 3.11:
+Build [ninfer-serve](../../README.md#quick-start-native-windows) and run from the repository root with Python 3.11:
 
 ```bash
 export NINFER_BENCH_PYTHON=/path/to/python3.11

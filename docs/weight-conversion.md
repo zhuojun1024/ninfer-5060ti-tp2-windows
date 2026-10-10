@@ -11,7 +11,7 @@ Run the commands below from the repository root.
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
 and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
-[rebuild NInfer](../README.md#quick-start), then run with Python 3.11:
+[rebuild NInfer](../README.md#quick-start-native-windows), then run with Python 3.11:
 
 ```bash
 python3 tools/upgrade_ninfer_v2_to_v3.py \
@@ -149,6 +149,15 @@ python3 -m tools.convert \
 The default entry function is `configure`; `--recipe my_recipe.py:customize` selects another
 function. Alternatively, use an official `--recipe` and put only the changes in an `--override`
 file. Overrides run after the base recipe and optional proposal-head setup.
+
+Overrides shipped with the converter live in `tools/convert/overrides/`. For example,
+`tools/convert/overrides/dflash2_draft_q4.py` states the DFlash2 draft quantization described in
+the [README](../README.md#quantizing-a-dflash2-draft-yourself): its default `configure` applies only
+that lever, and its `configure_with_codebooks` entry also quantizes the two selector codebooks.
+
+Add `--dry-run` to a conversion to apply the base recipe, the proposal head and the override, print
+every selection as `name [begin,end) format method` together with per-format counts, and write
+nothing. `--out` is required only without it.
 
 `model.parameters` maps logical names to their shape, source and mathematical inputs. To see the
 available names for your selected components, a recipe can print them:
