@@ -55,6 +55,9 @@ returns (the engine then never reaches the GPU).
 
 ## Verified behavior on Windows
 
+These rows were recorded on an earlier build as a Linux/Windows parity check; the current four-route
+throughput table is in the [README](../README.md#single-request-serving).
+
 | Check | Linux (WSL2) | Windows |
 |---|---|---|
 | TP-2 plain decode | 32.8 tok/s | 32.9 tok/s |

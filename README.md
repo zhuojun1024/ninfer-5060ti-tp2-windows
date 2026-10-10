@@ -257,26 +257,36 @@ index](docs/performance.md) holds upstream's single-GPU measurements on an RTX 5
 
 ### Single-request serving
 
-| Route | KV capacity | Prefill | Decode |
-|---|---:|---:|---:|
-| plain, fp8 KV | 131,072 | — | 8.10 s for 256 tokens (end to end) |
-| MTP K=2 `--lm-head-draft` | 131,072 | — | 46-49 tok/s |
-| **MTP K=2 `--lm-head-draft`, shard split** | **262,144** | **1,588 tok/s** | **59.0 tok/s** |
-| DFlash2 K=2 | 4,096 | — | 51.0 tok/s |
-| DFlash2 K=7 | 4,096 | — | 63.6 tok/s |
+Measured on the 2026-10-11 build with
+[`tools/win_port/bench_serve.ps1`](tools/win_port/bench_serve.ps1) against
+`Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer` (the Coder390 artifact above with its
+vision component) at `--max-context 225280 --kv-dtype fp8`, one request at a time. Prefill is a
+one-token request over a filler prompt; decode is a 128-token answer after a 7,200-token prompt.
+Every number comes from the server's own `timings` block, and every prompt carries a nonce, so
+prefix reuse cannot fake prefill. Each arm ran four times.
 
-A 16,057-token prompt produced its first token in 10.11 s (1,588 tok/s), and a 65k-token prompt
-returned a complete answer in 48.1 s end to end (~1.35k tok/s of prompt) against 96.8 s for a
-118,869-token prompt at the previous 131,072-token ceiling. A 512-token answer took 8.68 s (59.0
-tok/s over 223 MTP rounds, 2.3 committed tokens per round, 64.6% per-draft acceptance) and a
-64-token answer measured 63.6 tok/s; the previous ceiling's sustained decode was 46-49 tok/s, so
-doubling the context also moved throughput ~20% forward, because the split halves each shard's
-proposal-head read and lets both shards draft in parallel. Repeating an identical 16,057-token
-prompt returned in 0.30 s (0.33 s at 65k) against 10.11 s fresh. Startup after CUDA-graph capture is
-a one-off 14.4 s and is outside these numbers. Against a tuned llama.cpp TP-2 build on the same two
-cards, NInfer's prefill measured 1.83x, 1.60x and 1.53x (1.9k, 7.2k and 28.5k-token prompts) and
-decode 1.08x (56.7 against 51.7-52.7 tok/s); the [cross-engine
-comparison](docs/tp2-dual-5060ti.md#cross-engine-comparison-llamacpp-ar3-opt) has the protocol.
+| Route | Prefill 1.9k | 7.2k | 28.6k | Decode | vs plain |
+|---|---:|---:|---:|---:|---:|
+| plain, no draft (`-Plain`) | 1,796 | 1,943 | 1,772 | 35.9 | 1.0x |
+| MTP K=3 `--lm-head-draft` | 1,797 | 1,917 | 1,753 | 71-79 | ~2.1x |
+| DFlash2 K=5 `--lm-head-draft` | 1,618 | 1,629 | 1,557 | 81-96 | ~2.5x |
+| DFlash2 K=7 `--lm-head-draft` | 1,595 | 1,626 | 1,556 | 87-90 | ~2.5x |
+
+All figures are tok/s. Prefill cells are the mean of the runs (four for the 1.9k column, two for the
+others) and spread by under 2%; the decode cells are the range over the runs that produced the full
+128 tokens. That range is the accepted-draft rate moving with the text, not measurement noise:
+answers from a short prompt measured 66-84 (MTP K=3), 84-104 (DFlash2 K=5) and 85-97 (DFlash2 K=7)
+tok/s over outputs of 43-181 tokens. The draft buys decode with prefill - DFlash2's own forward pass
+costs about 15% of prefill throughput at every prompt size, MTP's about 1% - and DFlash2 K=5 and K=7
+are within each other's spread.
+
+Memory at this capacity, `nvidia-smi` per card: 13,688 MiB for the plain arm (`-Plain` also drops
+vision and the sampling overrides), 14,820 / 14,638 MiB for MTP K=3, 14,954 / 14,884 MiB for DFlash2
+K=5 and 14,960 / 14,886 MiB for K=7. Engine load is a one-off 40 s (plain) to 44 s (DFlash2) and is
+outside these numbers. Earlier figures taken under other protocols - the 16,057-token TTFT, the
+prefix-reuse latency and the llama.cpp cross-engine comparison - are in the [TP-2
+note](docs/tp2-dual-5060ti.md), which keeps every measurement next to the protocol it was taken
+under.
 
 ### Multi-request serving
 

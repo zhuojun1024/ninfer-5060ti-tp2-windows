@@ -1,9 +1,11 @@
 # Dual RTX 5060 Ti TP-2 tuning (Qwen3.8-27B NVFP4)
 
 This note records the tensor-parallel-2 (TP-2) adaptation of this engine for two RTX 5060 Ti
-(16 GiB) cards running `Qwen3.8-27B` NVFP4. Numbers were measured on this machine with
-`ninfer-serve` on `--devices 0,1`, greedy sampling. The serving numbers below are single-request
-unless a concurrency is named. The retained measurement routines live in
+(16 GiB) cards running `Qwen3.8-27B` NVFP4. Every number was measured on this machine with
+`ninfer-serve` on `--devices 0,1`, one request at a time unless a concurrency is named.
+[Current measurement](#current-measurement) is the reading on the current build; the sections after
+it are the tuning record, and each table keeps the protocol and the artifact it was measured under.
+The retained measurement routines live in
 [`tools/tp_bootstrap/`](../tools/tp_bootstrap/README.md).
 
 ## Recommended configuration
@@ -19,11 +21,50 @@ The full `max_position_embeddings` of the artifact (262,144 tokens) now fits: 15
 and 15,094 MiB on shard 1, i.e. 697 / 1,217 MiB still free per card (`nvidia-smi`). Splitting the
 vocabulary- and hidden-parallel shard weights is what closed the gap; with the reduced state and
 workspace pools alone, fp8 KV topped out near 229,376 tokens. `--kv-dtype fp8` costs 16.125 KiB per
-token per shard. `--spec mtp --draft-tokens 2` adds ~90% sustained decode over the plain route and is
+token per shard. `--spec mtp --draft-tokens 2` is the speculative route that still fits the full
+context and adds sustained decode over the plain route ([Current
+measurement](#current-measurement) has the current four-route table) and is
 verified non-degenerate (see the MTP section); `--lm-head-draft` selects the artifact's reduced
 proposal head for the draft side; drop those two flags for the plain route. Every one of those
 choices is numerically transparent: the greedy output at 262,144 is byte-identical to the pre-split
 build at 131,072 (see Verification).
+
+## Current measurement
+
+The four serving routes on the current build, measured 2026-10-11 with
+[`tools/win_port/bench_serve.ps1`](../tools/win_port/bench_serve.ps1) against
+`Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer`, started through
+[`tools/win_port/serve.ps1`](../tools/win_port/serve.ps1) with `--max-context 225280 --kv-dtype fp8
+--vision-item-tokens 8192 --host-kv-mib 32768`, one request at a time. Prefill is a one-token
+request over a filler prompt (1.9k / 7.2k / 28.6k prompt tokens); decode is a 128-token answer
+after a 7.2k-token prompt. Every number is the server's own `timings` block, and every prompt
+carries a nonce, so prefix reuse cannot fake prefill. Each arm ran four times.
+
+| Route | Prefill 1.9k | 7.2k | 28.6k | Decode | VRAM shard 0 / 1 | Load |
+|---|---:|---:|---:|---:|---|---:|
+| plain, no draft (`-Plain`) | 1,796 | 1,943 | 1,772 | 35.9 | 13,688 MiB | 40-41 s |
+| MTP K=3 `--lm-head-draft` | 1,797 | 1,917 | 1,753 | 70.6-79.1 | 14,820/14,638 MiB | 43 s |
+| DFlash2 K=5 `--lm-head-draft` | 1,618 | 1,629 | 1,557 | 80.8-95.6 | 14,954/14,884 MiB | 43 s |
+| DFlash2 K=7 `--lm-head-draft` | 1,595 | 1,626 | 1,556 | 87.2-90.1 | 14,960/14,886 MiB | 43-44 s |
+
+Prefill and decode are tok/s; the prefill cells are the mean of the runs - four for the 1.9k column,
+two for the others - which spread by under 2%, and the decode cells are the range over the runs that
+produced the full 128 tokens. The spread
+inside an arm is the accepted-draft rate following the text: answers from a short prompt measured
+66-84 (MTP K=3), 84-104 (DFlash2 K=5) and 85-97 (DFlash2 K=7) tok/s over outputs of 43-181 tokens.
+DFlash2's own forward pass costs about 15% of prefill throughput at every prompt size; MTP's costs
+about 1%.
+
+The engine's memory ledger at `--max-context 225280` puts the artifact at 9.51 GiB of weights
+(plain), 10.1 GiB (MTP K=3) and 10.6 GiB (DFlash2), and leaves 1,602 / 478 / 340 / 334 MiB free on
+shard 0 for the four routes in table order. DFlash2 K=5 and K=7 are the fastest decode of the four
+and are what the draft's memory buys; at this capacity the plain route is the only one that could
+still reach 262,144 tokens, which is why the configuration above is an MTP one. The plain arm runs
+`-Plain`, which also drops vision and the sampling overrides, so only its decode column is directly
+comparable.
+
+The tables below keep the protocols and artifacts they were measured under; this section is the
+current reading.
 
 ## Benchmarks
 
