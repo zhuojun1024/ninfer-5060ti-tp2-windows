@@ -9,8 +9,12 @@ import sys
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import binding_parts
 
+ROOT = Path(__file__).resolve().parents[2]
 
-def test_cli_custom_sources_method_template_and_shards(tmp_path):
+
+def _tiny_source(tmp_path):
+    """A one-layer model and a custom recipe, small enough to convert on CPU."""
+
     source = tmp_path / "source"
     source.mkdir()
     config = {
@@ -27,14 +31,13 @@ def test_cli_custom_sources_method_template_and_shards(tmp_path):
         "rope_parameters": {"partial_rotary_factor": 0.5, "mrope_section": [1, 1, 0]},
     }
     (source / "config.json").write_text(json.dumps(config))
+    (source / "chat_template.jinja").write_text("source {{ messages }}")
     for name, value in {
         "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
         "tokenizer_config.json": {},
         "generation_config.json": {},
     }.items():
         (source / name).write_text(json.dumps(value))
-    template = tmp_path / "template.jinja"
-    template.write_text("custom {{ messages }}")
     recipe = tmp_path / "recipe.py"
     recipe.write_text("""import torch
 from tools.convert.sources.logical import array_source
@@ -50,6 +53,23 @@ def configure(model, recipe, sources):
     for role, format in zip(("query", "key", "gate", "value"), ("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")):
         recipe.assign("text/layers/0/attention/" + role, format=format, method="grouped_absmax")
 """)
+    return source, recipe
+
+
+def _run(command):
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+
+def test_cli_custom_sources_method_template_and_shards(tmp_path):
+    source, recipe = _tiny_source(tmp_path)
+    template = tmp_path / "template.jinja"
+    template.write_text("custom {{ messages }}")
     output = tmp_path / "custom.ninfer"
     command = [
         sys.executable,
@@ -75,14 +95,7 @@ def configure(model, recipe, sources):
         "--rows-per-chunk",
         "3",
     ]
-    root = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        command,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-    )
+    result = _run(command)
     assert result.returncode == 0, result.stderr
     with Artifact(output) as artifact:
         assert set(artifact.directory.components) == {"text"}
@@ -116,3 +129,41 @@ def configure(model, recipe, sources):
             artifact.directory.bindings["text/layers/0/mlp/up"], artifact.by_id
         )[0][0]
         assert gate != up
+
+
+def test_cli_dry_run_prints_the_plan_and_writes_nothing(tmp_path):
+    source, recipe = _tiny_source(tmp_path)
+    output = tmp_path / "dry.ninfer"
+    result = _run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "tools.convert",
+            "--model",
+            str(source),
+            "--recipe",
+            str(recipe),
+            "--dry-run",
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "plan: " in result.stdout
+    assert "q4_g64_fp16" in result.stdout
+    assert "DRYRUN: plan validated, nothing written" in result.stdout
+    assert not output.exists()
+
+    missing = _run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "tools.convert",
+            "--model",
+            str(source),
+            "--recipe",
+            str(recipe),
+        ]
+    )
+    assert missing.returncode != 0
+    assert "--out is required" in missing.stderr

@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import importlib.util
 from pathlib import Path
 import sys
+from collections import Counter
 from collections.abc import Mapping
 
 from .official_recipes import RECIPES
@@ -97,6 +98,23 @@ def _function(value: str):
     return result
 
 
+def _print_plan(recipe):
+    """Print the resolved format and method of every planned parameter."""
+
+    counts = Counter(
+        selection.format
+        for selections in recipe.selections.values()
+        for selection in selections
+    )
+    print(f"plan: {len(recipe.selections)} parameters, {sum(counts.values())} selections")
+    for format, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        print(f"  {format}: {count}")
+    for name in sorted(recipe.selections):
+        for selection in recipe.selections[name]:
+            method = getattr(selection.method, "__name__", selection.method)
+            print(f"{name} [{selection.begin},{selection.end}) {selection.format} {method}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -141,11 +159,18 @@ def main(argv=None):
     parser.add_argument("--proposal-rows", type=int, default=131072)
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
     parser.add_argument("--name", help="public instance name saved in metadata")
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=Path, help="output artifact path")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the planned selections and write nothing",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
     args = parser.parse_args(argv)
+    if args.out is None and not args.dry_run:
+        parser.error("--out is required unless --dry-run is given")
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
@@ -171,6 +196,10 @@ def main(argv=None):
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
         if args.override:
             _function(args.override)(model, recipe, sources)
+        if args.dry_run:
+            _print_plan(recipe)
+            print("DRYRUN: plan validated, nothing written", flush=True)
+            return
 
         def progress(index, total, job):
             label = job.parameters[0]
