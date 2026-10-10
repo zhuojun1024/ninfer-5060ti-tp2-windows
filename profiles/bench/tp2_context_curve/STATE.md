@@ -34,7 +34,7 @@ Driver: `tools/win_port/context_curve.ps1` (HTTP chat timings, published single-
 - `--no-prefix-reuse` still leaves a root-only cache that can hit the ~49-token Qwen template
   preamble; prefill stats therefore use only `cache_n == 0` records, decode is unaffected.
 - User's original server (MTP3 + vision, port 3456) was stopped for the run and restarted
-  afterwards via `C:/Users/zhuojun/start-ninfer-tp2.ps1`; it is currently running as a
+  afterwards via a local launcher script (`start-ninfer-tp2.ps1`); it is currently running as a
   DSH-managed background job.
 
 

@@ -1,7 +1,7 @@
 """Reconstruct the per-GPU device memory composition of the running ninfer-serve process.
 
 Inputs:
-  - artifact D:\LLM\qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer (weight bytes per object)
+  - artifact <models-dir>/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer (weight bytes per object)
   - tp_split_spec.cpp classification rules (applied verbatim)
   - runtime arena formulas from tp2_generation_core.cpp / planning code (hand-computed here)
 
@@ -11,10 +11,10 @@ import collections
 import pathlib
 import sys
 
-sys.path.insert(0, r"D:\Documents\workbench\ninfer")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from tools.artifact.reader import Artifact
 
-ARTIFACT = pathlib.Path(r"D:\LLM\qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")
+ARTIFACT = pathlib.Path(r"<models-dir>/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")
 
 # --- text geometry (from artifact text config) ---
 HIDDEN = 5120

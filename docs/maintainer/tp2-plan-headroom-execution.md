@@ -162,10 +162,10 @@ Changes (reuse `HostBuffer(HostPinning::Pageable)`, keep no dual path):
 
 Landed as designed above (no dual path): h:195/:200 changed to `unique_ptr<HostBuffer>`; cpp:929/:1117 changed to `make_unique<HostBuffer>(bytes, HostPinning::Pageable)`; the image parameters of `store_dflash_image`/`load_dflash_image`/`session_capture_shared_state` changed to "raw mapping + length", `frozen[2]`/`frozen_draft`/`block_draft` changed to `const void*`; `(pageable)` added to the `[mem]` line. Build BUILD_EXIT=0 (26-28 s, multiple times).
 
-- Model tests (`NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`):
+- Model tests (`NINFER_TEST_ARTIFACT=<models-dir>/qwen3_8_27b_swift15_dflash2_final.ninfer`):
   `ninfer_qwen3_5_tp2_lanes_test.exe` all pass (LANES_EXIT=0; mid-batch arrival 0.729842 s / 3.89515 s, against the existing baseline 0.59 s / 3.67 s, same order of magnitude); `..._sessions_test.exe` still fails, but the failing lines are **byte-identical** to the old pinned baseline (_temp/cnt1_sessions_full.log), and Compare-Object over the `^TP-2 ` lines of the two logs shows no difference ⇒ no new failures (that test stops at the first FAIL, and so does the old log).
 - **Full model test accounting + HEAD baseline comparison (final binary)**:
-  `$env:NINFER_TEST_ARTIFACT='D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer'; & tools/win_port/test.ps1 -Filter 'qwen3_5_tp2'`
+  `$env:NINFER_TEST_ARTIFACT='<models-dir>/qwen3_8_27b_swift15_dflash2_final.ninfer'; & tools/win_port/test.ps1 -Filter 'qwen3_5_tp2'`
   → 67% passed out of 6 (load/forward Skipped, sessions Failed, dflash_solo Failed, dflash_append Passed 47.51 s, lanes Passed 69.56 s). After stashing all changes and rebuilding HEAD (464 s), the same filter was re-run and **both failures reproduce byte-for-byte**: sessions' `got [2752 13 198 197 197 92 198 197] expected [467 419 538 13 198 197 197 92]`, dflash_solo's `the recalled walk diverged from the from-scratch walk on its first sample: [59399 475 327 363 62 16 15 15] vs [365 4577 62 16 15 15 15 15]`
   ⇒ both are **pre-existing failures**, unrelated to this round's changes. Evidence _temp/20261002-1745_modelverify_new.md.
 - Runtime evidence: `[mem] host checkpoint ring 36 slots x 73.4 MiB/lane/shard (pageable)`, `[mem] host-checkpoints shard 0/1 slots 36 (...) x 73.4 MiB | stride 43776 tok | pageable 2642.6 MiB` (against the old line `... | pinned 734.1 MiB`, 11 slots).
@@ -214,7 +214,7 @@ Benefit assessment: at width≤16, "fewer kernel launches" does not automaticall
 
 ### Item D additional measurement (width cost, 2026-10-02, deciding whether the minimal slice is worth writing)
 
-Before writing the slice, first measure the true cost of the slice's **only newly added op** (one B-lane × W-column `forward_tp2_window_batch`, including the in-model GDN record path): `[tp2-time] spec-batch`'s `verify` = `close_round`'s elapsed(1,2), which exactly brackets that call. Config: artifact D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer, TP-2 dual card, int8, 131072, C=4, prefill-chunk 1024, `--spec dflash2 --draft-tokens 5|15`, ARM P4 four shorts in the same batch (harness _temp/20261002-1925_w16probe2.ps1, client _temp/20261002-1620_mtpshort.mjs). Note that MTP cannot reach width 16 (src/product/speculative_options.h:41-43 limits draft-tokens≤5); only dflash2 (≤15) can.
+Before writing the slice, first measure the true cost of the slice's **only newly added op** (one B-lane × W-column `forward_tp2_window_batch`, including the in-model GDN record path): `[tp2-time] spec-batch`'s `verify` = `close_round`'s elapsed(1,2), which exactly brackets that call. Config: artifact <models-dir>/qwen3_8_27b_swift15_dflash2_final.ninfer, TP-2 dual card, int8, 131072, C=4, prefill-chunk 1024, `--spec dflash2 --draft-tokens 5|15`, ARM P4 four shorts in the same batch (harness _temp/20261002-1925_w16probe2.ps1, client _temp/20261002-1620_mtpshort.mjs). Note that MTP cannot reach width 16 (src/product/speculative_options.h:41-43 limits draft-tokens≤5); only dflash2 (≤15) can.
 
 Accounting: `++timing.rounds` increments by 1 per submitted column (tp2_generation_core.cpp:3590 and :4815); a round has B lanes each submitting one column ⇒ per-round cost = reported value × B (B=4).
 

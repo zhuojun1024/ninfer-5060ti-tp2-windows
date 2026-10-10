@@ -2271,7 +2271,7 @@ llama.cpp's Qwen3.5 MTP structure is the same, and its documentation likewise on
 
 | Item | Value |
 |---|---|
-| Build/run | WSL2; Windows work tree `D:\Documents\workbench\ninfer`, build tree `$HOME/ninfer` |
+| Build/run | WSL2; Windows work tree (this repository), build tree `<build-dir>` |
 | Build | `bash tools/tp_bootstrap/build_r35.sh` (rsync `src tests apps include bench tools` then `cmake --build build -j 8`; success marker `BUILD_EXIT=0`, about 2–3 minutes) |
 | Service | 8088; `serve_stop.sh` → background `wsl -e bash .../serve_supervise.sh <ctx> 8088 '<extra args>'` → poll for "listening on http://127.0.0.1:8088" (30–37 s to load) |
 | First request | pays CUDA graph capture (measured 14.4 s); only steady-state numbers are meaningful |
@@ -5162,7 +5162,7 @@ the 14:24–14:30 r57e (graph pressure 60/60 PASS) and r57f (serve recheck) ran 
       → `WARN req#2 failed during generation | HTTP 503 | service unavailable` → error body `TP-2 allreduce stalled (token skew 1)…`
       → after reset, dump `tok=[34054,34054]`, arrival/order all 0 → **the next two requests got HTTP 200 within 1 s**. Phase 1 complete.
       Lesson recorded: the original text of this acceptance survives only in this section and that session — `C:\ninfer\serve-win.log` was overwritten by the subsequent clean restart; future acceptances should use `--request-log-jsonl` first or copy the log first.
-      **Regression matrix** (artifact `D:/LLM/qwen3_8_27b_w4a4_dflash2_draftall.ninfer`; every item was run twice, "after the change / git-stash to pre-change HEAD"):
+      **Regression matrix** (artifact `<models-dir>/qwen3_8_27b_w4a4_dflash2_draftall.ninfer`; every item was run twice, "after the change / git-stash to pre-change HEAD"):
       `ninfer_tp_device_pair_test` (including the new injection case) **PASS**; `ninfer_qwen3_5_tp2_dflash_solo_test` (solo digest) **PASS**; `ninfer_qwen3_5_tp2_dflash_append_test` (K=7/K=5 hashes) **PASS**; 3× `ninfer_linear_tp2_split_*` **PASS**;
       `tp2_sessions_test` (plain recall sequence divergence), `dflash2_real_test` (1.7 s cudaMalloc OOM), `dflash_real_test` (0xc0000409 fast fail) — these three **reproduce byte-for-byte / with the same code on pre-change HEAD** ⇒ pre-existing issues unrelated to this change
       (sessions is the ulp non-contract noted in the worklog as "a hot engine replaying from zero is not guaranteed to match the cold oracle token by token"; the other two are artifact/environment class, and the docs do not list these two case names).
@@ -5283,7 +5283,7 @@ i.e. the context cache ring is usable at full depth.
 
 **Question**: §3.12 measured prefill rate 1,905 → 569 tok/s (3.3×) — is there optimization headroom.
 
-**Architectural fact** (`D:/LLM/W4A16/NVFP4/W4A4/config.json`): Qwen3.5 is **hybrid attention** — of 64 layers only **16 are full attention**
+**Architectural fact** (`<models-dir>/W4A16/NVFP4/W4A4/config.json`): Qwen3.5 is **hybrid attention** — of 64 layers only **16 are full attention**
 (24 Q / 4 KV / head_dim 256; TP-2 single card 12 Q / 2 KV), while the other **48 layers are linear attention (GDN) whose cost is depth-independent**.
 ⇒ The entire slope comes from 16/64 layers alone; if all 64 layers were full attention, at the same depth it would be ≈185 tok/s (currently 569, the hybrid structure has already bought 3.1×).
 
@@ -5928,7 +5928,7 @@ Archived verbatim from the working PLAN.md when it was reduced to key informatio
 - **Branch**: `feat/windows-native-port` (Windows native + WSL2 dual tree). All 20 commits by which origin/master was ahead have been
   cherry-picked (frontend jinja chain + three NVFP4 performance items), with no end-to-end A/B regression.
 - **Hardware**: 2× RTX 5060 Ti 16G (SYS topology, no P2P, 448 GB/s per card). WSL2 build tree `$HOME/ninfer`;
-  Windows working tree `D:\Documents\workbench\ninfer` (build tree `build-win`).
+  Windows working tree (this repository, build tree `build-win`).
 - **Main workload**: Qwen3.8-27B NVFP4, TP-2 (weights split in half per shard, locally built half-geometry shapes). Draft backend: `--spec dflash2`
   (K=5/7, K=7 is the binary default) or `--spec mtp` (K=2, `--lm-head-draft`); `--spec dflash` (v1) is rejected at construction time.
 - **Current state**: delivery goals ①–⑤ all complete; vision, the Windows port, the multi-session KV pool, and the decode graph + AR strategy have all landed and been measured;

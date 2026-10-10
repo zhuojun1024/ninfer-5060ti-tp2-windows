@@ -2,13 +2,13 @@ import collections
 import pathlib
 import sys
 
-sys.path.insert(0, r"D:\Documents\workbench\ninfer")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from tools.artifact.reader import Artifact
 
 HIDDEN, ATTN_Q, ATTN_K = 5120, 24 * 256, 4 * 256
 GDN_K, GDN_V, INTER = 16 * 128, 48 * 128, 17408
 
-with Artifact(pathlib.Path(r"D:\LLM\qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")) as a:
+with Artifact(pathlib.Path(r"<models-dir>/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")) as a:
     d = a.directory
     names_by_object = collections.defaultdict(set)
     for name, binding in d.bindings.items():

@@ -3,7 +3,7 @@ schema_version: 1
 # NIAH (needle-in-a-haystack) sweep for KV-cache format comparison.
 #
 # The served model is the TP-2 vision artifact on the two RTX 5060 Ti cards:
-#   ninfer-serve D:\LLM\Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer \
+#   ninfer-serve <models-dir>/Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer \
 #     --devices 0,1 --max-context 262144 --kv-capacity auto --kv-dtype <arm> \
 #     --model-id qwen38-tp2 --port 18080 --greedy
 # Only the --kv-dtype flag changes between arms; this config stays fixed.
@@ -47,7 +47,7 @@ suites:
               document_depth_percent_min: 50
               document_depth_percent_max: 50
               document_depth_percent_intervals: 1
-              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              tokenizer_path: <models-dir>/Qwen3.8-27B-NVFP4
               show_score: true
 
   native_long:
@@ -71,7 +71,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              tokenizer_path: <models-dir>/Qwen3.8-27B-NVFP4
               show_score: true
 
       - id: needle_haystack_128k
@@ -93,7 +93,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              tokenizer_path: <models-dir>/Qwen3.8-27B-NVFP4
               show_score: true
 
       - id: needle_haystack_260k
@@ -115,7 +115,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: D:/LLM/Qwen3.8-27B-NVFP4
+              tokenizer_path: <models-dir>/Qwen3.8-27B-NVFP4
               show_score: true
 
 runtime:

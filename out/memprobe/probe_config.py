@@ -3,10 +3,10 @@ import json
 import pathlib
 import sys
 
-sys.path.insert(0, r"D:\Documents\workbench\ninfer")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from tools.artifact.reader import Artifact
 
-p = pathlib.Path(r"D:\LLM\qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")
+p = pathlib.Path(r"<models-dir>/qwen3_8_27b_w4a4_w8a8_dflash2_draftall.ninfer")
 with Artifact(p) as a:
     d = a.directory
     print("artifact_id:", a.artifact_id.hex())

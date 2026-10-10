@@ -36,7 +36,7 @@ CORPUS_FILES = {
     "chinese": "Journey_to_the_West.txt",
 }
 DEFAULT_CORPUS_DIR = ROOT / "_temp" / "niah_corpus"
-DEFAULT_TOKENIZER_PATH = r"D:\LLM\Qwen3.8-27B-NVFP4"
+DEFAULT_TOKENIZER_PATH = r"<models-dir>/Qwen3.8-27B-NVFP4"
 
 # 11 visible-length targets, spanning the 128K and 260K points the suite used.
 # The last entry is the *total* prompt budget: max_context is 262144, and the

@@ -2,7 +2,7 @@
 
 > **This file is the single active plan for the TP-2 shared KV project**, and the persistent memory across context compression; after the context is compressed or the session is resumed, re-read this file before continuing.
 >
-> - **Baseline**: branch `feat/tp2-concurrency`, `HEAD = 94e6cc64` (11 commits, not pushed); Windows worktree `Documents/workbench/ninfer`, build `build-win` (VS2022 + CUDA 13.3).
+> - **Baseline**: branch `feat/tp2-concurrency`, `HEAD = 94e6cc64` (11 commits, not pushed); Windows worktree (this repository), build `build-win` (VS2022 + CUDA 13.3).
 > - **Provenance**: this file was solidified from a source-level evaluation (user instruction m00683 "land the document and start implementing", evaluation request m00552 "evaluate dynamic sharing. You may also refer to how a local clone of that fork does it").
 > - **Adjacent authorities**: `tp2-plan-concurrency.md` (the main multi-concurrency plan; this file is the continuation of its KV semantics), `docs/serving.md` (external contract), `docs/maintainer/paged-kv-cache.md` (KV physical model and execution row), `docs/maintainer/engine-architecture.md` (single-card execution/scheduling contract), `docs/cli.md` (startup knobs).
 > - **Semantics**: shared KV in this project = **one physical pool + full per-request reservation at admission + return at request terminal state + no preemption**. Consistent with the single-card route's KV semantics; it does not include per-round free-slot search, eviction of idle slots, or cross-lane preemption.

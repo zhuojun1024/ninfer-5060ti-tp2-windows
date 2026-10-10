@@ -2,7 +2,7 @@
 # other win_port scripts call cmake, ninja and nvcc directly instead of wrapping cmd.
 #
 # Usage:  . "$PSScriptRoot/vcvars.ps1"
-#         . "$PSScriptRoot/vcvars.ps1" -VsPath "D:/Program Files/Microsoft Visual Studio/2022/Community"
+#         . "$PSScriptRoot/vcvars.ps1" -VsPath "C:/Program Files/Microsoft Visual Studio/2022/Community"
 #
 # The Visual Studio installation is located in this order:
 #   1. -VsPath, if given (the installation root, i.e. the directory that contains VC/).
