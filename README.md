@@ -182,6 +182,47 @@ full `max_position_embeddings` and is what the [TP-2 note](docs/tp2-dual-5060ti.
 shipped Windows `serve.ps1` recipe uses 131,072 with `--vision`, because the vision workspace on top
 of a 262,144-token KV pool leaves too little VRAM for comfort under WDDM.
 
+### DFlash2 draft weights
+
+A DFlash2 artifact carries a second, masked draft model next to the target weights. Every shipped
+conversion recipe stores that draft's projections in `q4_g64_fp16` and its selector codebooks in
+BF16, so the draft occupies 1,155.3 MiB instead of the 2,123.6 MiB an all-Q8 draft takes. Two
+conversions of the same model that differ only in the draft objects are 968.3 MiB (0.946 GiB) apart.
+
+Those bytes are freed on the shard that carries the masked draft, which is the shard that bounds
+context capacity, and it is the heavier of the two, so the pair ends up more even and the saving
+converts straight into KV: at 16.125 KiB per token, 968.3 MiB is about 61,000 more fp8 tokens there.
+An artifact whose `dflash2/` bindings still name `q8_g32_fp16` objects carries the older draft and
+pays that memory for nothing; re-converting with a shipped recipe reclaims it. No flag or extra
+script is involved, because the format set is fixed by `tools/convert/official_recipes.py`:
+
+- Q4: the fused attention QKV parent (one shared `[6144, 5120]` object per layer, which
+  `context_key`/`context_value` are views of), attention output, MLP gate/up/down, both dynamic-conv
+  kernel projections and `dflash2/feature_projection` — 31 stored objects, 909.8 MiB;
+- BF16: the two selector codebooks (242.5 MiB) and the norms;
+- Q8: DFlash v1 and MTP drafts.
+
+The set is the campaign's qualified result rather than a per-recipe choice. Each step was A/B-tested
+on this pair; the merged artifact measured +1.15pp at K=7 and +3.72pp at K=5 over the draft it
+replaced on pooled sampling acceptance, and the promotion into the recipes landed within 1σ over 30
+repetitions. A greedy probe cannot compare two artifacts at all, because a changed draft changes the
+proposed text and therefore the target's near-ties.
+
+Convert and check:
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.8-27B --recipe qwen3_8_27b \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 --components text,vision,mtp,dflash2 \
+  --proposal --out models/my_qwen.ninfer
+python3 -m tools.artifact.inspect models/my_qwen.ninfer --objects --bindings
+```
+
+Quantizing the selector codebooks as well saves a further 178.09 MiB, but it measured about 2pp
+less acceptance on a 33k-token prompt at K=7, and those bytes land on the selector's shard
+rather than the masked draft's, so they buy no context. The shipped recipes keep the codebooks in
+BF16; a custom recipe can assign Q4 itself (see
+[change part of a recipe](docs/weight-conversion.md#change-part-of-a-recipe)).
+
 ## Performance
 
 Every number below was measured on this pair (`--devices 0,1`) with `ninfer-serve`, one request at a
