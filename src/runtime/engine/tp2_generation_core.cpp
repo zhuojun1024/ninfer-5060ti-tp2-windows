@@ -44,7 +44,7 @@ namespace qwen = ninfer::models::qwen3_5;
 using Clock = std::chrono::steady_clock;
 
 // Phase timing for the TP-2 prefill/decode walk, enabled with NINFER_TP2_TIMING=1. It exists to
-// attribute a decode round to its phases while the round is being optimised (see PLAN.md Round 11);
+// attribute a decode round to its phases while the round is being optimised (see the worklog, Round 11);
 // with the flag off every call is one branch on a cached bool. The marks are recorded on shard A's
 // stream and read back after that round's synchronization, so every event has completed and
 // cudaEventElapsedTime cannot report a partial interval.
@@ -405,7 +405,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         dflash_drafts_ = std::clamp<std::uint32_t>(options.speculative.draft_tokens, 1U,
                                                    qwen::kDFlashDecodeMaximumDrafts);
     }
-    // The plain, MTP and DFlash2 rounds all carry a batch (docs/PLAN-tp2-concurrency.md P2.1c/P2.1b);
+    // The plain, MTP and DFlash2 rounds all carry a batch (tp2-plan-concurrency.md P2.1c/P2.1b);
     // only `--spec dflash` has no TP-2 context layout, so a multi-lane run on that route would
     // silently feed every lane through row 0. Collapse it and report. The plain route keeps its
     // lanes.
@@ -418,7 +418,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         std::fprintf(stderr,
                      "[tp2-lane] --max-concurrency %u collapses to 1 lane on the speculative "
                      "route (only the MTP and DFlash2 rounds are batched; see "
-                     "docs/PLAN-tp2-concurrency.md)\n",
+                     "tp2-plan-concurrency.md)\n",
                      lanes_);
         lanes_ = 1U;
     }
@@ -441,7 +441,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     {
         const std::uint32_t host_slots = options_.context_cache.host_state_slots;
         session_retention_floor_tokens_ = options_.context_cache.session_retention_floor_tokens;
-        // docs/PLAN-tp2-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
+        // tp2-plan-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
         // each lane owns its own slice of the ring, so the pinned budget is the lanes=1 budget
         // whatever the lane count. The batch executors recall into their own lane (Stage 1d), so
         // the ring is live at every lane count.
@@ -483,7 +483,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         // DFlash2 takes part: a session slab holds the draft ring beside the target KV and GDN
         // state, so a recall restores the whole conversation rather than only its target half.
         // A session image carries the same per-lane state, so the catalog splits its slabs by lane
-        // (docs/PLAN-tp2-concurrency.md 12.6).
+        // (tp2-plan-concurrency.md 12.6).
         if (host_kv_bytes / 2 != 0 && sessions > 1) {
             host_kv_shard_bytes_ = host_kv_bytes / 2;
             session_capacity_    = sessions;
@@ -497,7 +497,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     // The text KV pool is one physical allocation shared by every lane. A multi-lane route hands it
     // out dynamically: a request reserves exactly the pages its own prompt plus output budget need
     // when it is admitted and returns them when it retires, so a lane that runs alone may use the
-    // whole pool instead of a fixed 1/lanes slice (docs/PLAN-tp2-kv-sharing.md). The admission
+    // whole pool instead of a fixed 1/lanes slice (tp2-plan-kv-sharing.md). The admission
     // ceiling is a policy value clamped to the pool minus the route's write margin; the clamp
     // guarantees that a request admitted at this ceiling always finds its pages, which is what keeps
     // the executors' requeue path from waiting forever.
@@ -832,7 +832,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     // planned for. `kTp2GenerationMaxConcurrency` (include/ninfer/tp2_capacity.h) pins this to
     // one today, so the layouts below stay byte-for-byte the single-request ones; raising that
     // gate additionally requires the batch execution path and per-lane KV/GDN publication, not
-    // just this width. P1.2 of docs/PLAN-tp2-concurrency.md.
+    // just this width. P1.2 of tp2-plan-concurrency.md.
     const std::int32_t lanes = static_cast<std::int32_t>(lanes_);
 
     // Per-shard config: the mixer head counts are halved (each shard owns half the attention/GDN
@@ -939,7 +939,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
         // compute - a slower store and recall, not a correctness change: no CUDA Graph capture
         // region references the ring (see docs/serving.md). A slot holds one compact single-lane
         // image and belongs to the lane whose slice of the ring it is, so the host footprint is the
-        // lanes=1 budget whatever the lane count (docs/PLAN-tp2-concurrency.md 12.6).
+        // lanes=1 budget whatever the lane count (tp2-plan-concurrency.md 12.6).
         // One lane's slice per lane, plus the prompt-end slot appended after all of them: those images
         // are written once per completed prefill and never rotate, so they belong to no lane's slice
         // (see snapshot_host_checkpoint).
@@ -1204,7 +1204,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     //
     // On a multi-lane route the pool is shared and handed out per request instead: this block only
     // acquires one execution row per lane, and reserve_lane_kv() republishes a lane's row with the
-    // pages of whichever request currently holds that lane (S1 of docs/PLAN-tp2-kv-sharing.md).
+    // pages of whichever request currently holds that lane (S1 of tp2-plan-kv-sharing.md).
     // Every page is then owned by exactly one live request, so a lane can never reach another
     // request's pages, and the admitted window is bound to the pages that request reserved.
     {
@@ -1234,7 +1234,7 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
             tables.publish(shard.kv_rows.back().handle(), 0, handles, shard.device.stream);
         } else {
             // Each row is published per request; the invariant the static split used to pin here (A3
-            // of docs/PLAN-tp2-concurrency-review-remediation.md) is checked in reserve_lane_kv()
+            // of tp2-plan-concurrency-review-remediation.md) is checked in reserve_lane_kv()
             // against the pages that request actually reserved.
             for (std::int32_t lane = 0; lane < lanes; ++lane) {
                 shard.kv_rows.push_back(tables.acquire(lane));
@@ -2229,7 +2229,7 @@ bool lane_trace_enabled() {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
-// Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4)
+// Multi-lane admission (tp2-plan-concurrency.md P1.4)
 // ---------------------------------------------------------------------------------------------
 
 // A submission to the multi-lane route never touches the device itself. It appends itself to the
@@ -2526,7 +2526,7 @@ void TP2GenerationCore::drive_lane_queue() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Batched-lane prefix retention (docs/PLAN-tp2-concurrency.md P2.3)
+// Batched-lane prefix retention (tp2-plan-concurrency.md P2.3)
 // ---------------------------------------------------------------------------------------------
 //
 // A batched lane owns one KV row, one GDN state slot and one slice of every retention buffer, so
@@ -3050,7 +3050,7 @@ std::shared_ptr<TP2GenerationCore::PendingRequest> TP2GenerationCore::try_pop_la
     }
 }
 
-// S1 (docs/PLAN-tp2-kv-sharing.md): one request's share of the shared KV pool. The request gets
+// S1 (tp2-plan-kv-sharing.md): one request's share of the shared KV pool. The request gets
 // exactly the pages its own prompt plus output budget need - rounded up to the page grid, plus the
 // route's write margin - on both shards and, when the MTP layer is live, on shard 0's own cache.
 // The reservation is all-or-nothing and happens before the request is admitted, so a pool that
@@ -3254,7 +3254,7 @@ std::uint32_t TP2GenerationCore::lane_need_tokens(const PendingRequest& pending)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Batched plain walk (docs/PLAN-tp2-concurrency.md P1.4c)
+// Batched plain walk (tp2-plan-concurrency.md P1.4c)
 // ---------------------------------------------------------------------------------------------
 //
 // One round of this walk runs a single batched decode window for every lane still live. That shared
@@ -7784,7 +7784,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // handshake can interleave with an op one shard has not finished yet and the
                 // window logits come out a few bf16 ulps apart from run to run, which the
                 // near-tied last column then turns into a different token. MTP builds its window on
-                // the host and never meets this (PLAN.md section 3.6, "S1").
+                // the host and never meets this (tp2-plan.md section 3.6, "S1").
                 shard_a_.device.bind_to_current_thread();
                 CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));
                 CUDA_CHECK(cudaDeviceSynchronize());

@@ -311,7 +311,7 @@ public:
     //                                                                         payload on this path, so
     //                                                                         a signaling-NaN bit
     //                                                                         pattern is not preserved
-    //                                                                         (PLAN.md section 3.3)
+    //                                                                         (tp2-plan.md 3.3)
     //   proposal_argmax             BF16 [hidden, T]               allreduce  broadcast over a zeroed
     //                                                                         peer
     //   proposal_topk_tp2  hidden    BF16 [hidden, C]               allreduce  broadcast over a zeroed

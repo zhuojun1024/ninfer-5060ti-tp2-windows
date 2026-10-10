@@ -219,7 +219,7 @@ Select an unused `NINFER_PERF_OUTPUT` directory for a new run.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target ninfer-serve
 
-NINFER_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
+NINFER_BENCH_PYTHON=/path/to/python3.11
 NINFER_PERF_OUTPUT=profiles/bench/qwen3_6_35b_a3b_performance
 NINFER_PERF_COMMON=(
   --serve build/apps/ninfer-serve

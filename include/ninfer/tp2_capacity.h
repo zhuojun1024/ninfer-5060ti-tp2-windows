@@ -7,7 +7,7 @@
 namespace ninfer {
 
 // Concurrent requests the dedicated tensor-parallel (TP-2) generation core can run in one decode
-// batch, i.e. the number of lanes its round loop can carry (see docs/PLAN-tp2-concurrency.md).
+// batch, i.e. the number of lanes its round loop can carry (see tp2-plan-concurrency.md).
 //
 // The core drives its own round loop on the `--devices a,b` route, so it - not the Engine - is the
 // authority on how many requests that route can execute at once. Both `normalize_engine_options`

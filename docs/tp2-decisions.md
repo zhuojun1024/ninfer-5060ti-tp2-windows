@@ -4,11 +4,13 @@ Quick reference of settled conclusions from the 2× RTX 5060 Ti TP-2 campaign
 (Qwen3.8-27B NVFP4). Check this file before re-investigating any topic: entries
 record what was tried, what the evidence showed, and where the full record lives.
 
-Historical reference only: current state and remaining work live in `PLAN.md`
-(repository root); product behavior and measurements live in
-[tp2-dual-5060ti.md](tp2-dual-5060ti.md). Worklog line numbers refer to
-[tp2-dual-5060ti-worklog.md](tp2-dual-5060ti-worklog.md) as of 2026-09-27
-(7,939 lines).
+Historical reference only: current state and remaining work live in
+[tp2-plan.md](maintainer/tp2-plan.md). Product behavior and measurements live in
+[tp2-dual-5060ti.md](tp2-dual-5060ti.md). Two shorthands are used throughout:
+`worklog §N` and `worklog Round N` cite
+[tp2-adaptation-worklog.md](maintainer/tp2-adaptation-worklog.md) — the
+chronological round-by-round record — by section and round heading rather than by
+line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
 
 ## Architecture and ownership
 
@@ -18,26 +20,26 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   complete tensor, splits, and uploads per shard; reuses the official 23.7 GB
   artifact. (worklog §2)
 - **DFlash2 and MTP are mutually exclusive backends.** Choosing DFlash2 frees
-  shard 0's MTP weights (430 MiB) + KV (516 MiB). (worklog L3757–3760)
+  shard 0's MTP weights (430 MiB) + KV (516 MiB). (worklog §3.6)
 - **Whole-copy draft is infeasible.** At full context (262,144 / fp8 / MTP K=2)
   free is only 697/1,217 MiB vs a 2.07 GiB/card draft; after splitting ~1.04
   GiB/card. The proposal condition is a 5-block residual concatenation
   projection ⇒ cross-card handoff is required (residuals bit-identical across
   cards; only shard 0 captured). The candidate selector reads the full-vocab
   codebook directly (~254 MiB) and must stay whole. Do not re-investigate.
-  (worklog L3757–3762; PLAN §3.4)
+  (worklog §3.6; tp2-plan.md §3.4)
 - **`--spec dflash` (v1) is rejected at construction time** — product decision;
-  DFlash2 and MTP are the only supported draft backends. (worklog L3717)
+  DFlash2 and MTP are the only supported draft backends. (worklog §3.6)
 - **`--chat-template` is now a generic Jinja interpreter (this entry is
   superseded).** As of the first-tier cherry-pick (`b9219f3f` import llama-jinja
   + `98dada0e` execute custom jinja, 2026-09-21) the frontend compiles and runs
   arbitrary Jinja via the in-tree `third_party/llama-jinja` runtime, and
   `--chat-template FILE` loads a custom template (verified in source
   2026-09-29). The earlier "hand-written renderer + sha256 whitelist" state
-  (worklog L2554–2565) is obsolete.
+  (worklog §11.8) is obsolete.
 - **Vision: single-image cap 8,192 tokens**, static shard split (MTP→shard 0,
   vision→shard 1); images above the cap are rejected at request time with a
-  pointer to the `[mem] vision` ledger. (worklog L2456)
+  pointer to the `[mem] vision` ledger. (worklog §11.4)
 
 ## Rejected optimizations (measured)
 
@@ -50,7 +52,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   repository root as `PLAN-fp8pv-v1b.patch`. The lasting result is the attribution:
   **barrier stall 4.23 cyc/inst (34.2%) + math pipe throttle 3.12 (25.2%)** ⇒ the
   headroom is in the phase structure, not the PV dtype. (worklog 2026-09-27 archive
-  §6; PLAN §2)
+  §6; tp2-plan.md §2)
 - **Cross-tile phase pipelining (2026-09-27): rejected.** G0 confirmed barrier is
   still the second stall on the reverted FP16-PV baseline (3.34 cyc/inst, 26.3%; 97%
   of it after the two block-wide `__syncthreads()`), but both resident-role
@@ -60,7 +62,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   pushes the producer past its working-set wall. The baseline "8 producer ∥ 8 Vdeq →
   16-warp PV" packing is optimal in the 1 block/SM envelope. Closed unless the
   envelope changes (Br=32, or a >100 KB block-level smem budget). (worklog 2026-09-27
-  archive §7; PLAN §2)
+  archive §7; tp2-plan.md §2)
 - **Upstream ninfer-all items closed by measurement (2026-09-26).** Per-device
   `cudaFuncSetAttribute` and the 170-SM hardcoding were fixed (3 sites made
   runtime-derived; two stayed comments only, because the derived value would change
@@ -69,42 +71,42 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   staging was ported but is Op-level only (−22~27%, unmeasurable end to end); 5a
   small-T tensor-core covers only q4/q5 and does not apply to the TP-2 NVFP4/FP8
   trunks; item 4 (re-quantizing the streamed FP8 tensors to NVFP4/Q4) was dropped by
-  user decision. (worklog 2026-09-27 archive §5; PLAN §2, §3.8)
+  user decision. (worklog 2026-09-27 archive §5; tp2-plan.md §2, §3.8)
 - **Prefill AR∥MMA sub-block pipeline (R12 host-side chunk interleave): ~5%
   slower, rolled back.** That implementation, not the lever: a re-implementation
   with per-sub-block events and a dedicated collective stream nets **+11%**
   (see the L2 entry below). R12's stated reason — the in-kernel AR spin is
   "already masked by the peer's compute" — was also contradicted by the
   2026-09-26 divisor arm (AR is 48% of block time and strictly serial).
-  (worklog L1425–1468)
+  (worklog Round 11-12)
 - **Multi-block AR: no difference** (TTFT 859/877/879/879/830/861 ms for
-  1/2/4/8/16 blocks) — not a single-SM issue. (worklog L653–655)
+  1/2/4/8/16 blocks) — not a single-SM issue. (worklog Round 35b)
 - **Copy-engine rendezvous (small payloads): slower (951 vs 857 ms) and shard
   logits disagree** — rendezvous/double-buffer semantics do not hold. (worklog
-  L655–656)
+  Round 35b)
 - **Large-payload event path (Phase 3): rejected.** Copy-engine floor 3.32 ms vs
-  sliced 2.70 ms; the event fence alone is +23%. (worklog L5059, L5114)
+  sliced 2.70 ms; the event fence alone is +23%. (worklog §3.8)
 - **Copy-engine large-payload arm (design stage): not implemented.** The real
   lever is the 128 calls/round count, not the transfer mechanism; the prefill
-  control arm was left untouched and proved it. (worklog L3503)
+  control arm was left untouched and proved it. (worklog Round 17)
 - **GQA-aware prompt kernel (L1): falsified at the measurement gate.** ncu on
   the production prompt kernel: DRAM 1.09% (KV traffic absorbed by L2), tensor
   pipeline 63.5% busiest, occupancy locked at 33% (100 regs + ~100 KB smem per
   thread). Warp doubling: −12% (register spilling). Bc 64→128: cannot launch.
-  The 6× KV-request redundancy is not a DRAM cost. (worklog L5290, L5344–5365)
+  The 6× KV-request redundancy is not a DRAM cost. (worklog §3.14)
 - **Reducing AR call count requires giving up weight splitting** ⇒ always a loss
-  in decode. The only correct direction is overlap. (worklog L2757–2758)
+  in decode. The only correct direction is overlap. (worklog §12)
 - **Prefill allreduce is at the hardware floor.** Card 2 sits in a chipset
   Gen4 x4 slot (~7 GB/s) ⇒ 2.67k tok/s ceiling; the measured marginal slope
   (0.368 ms/token) sits exactly on it, independent of chunk width. The largest
   single lever is hardware: move card 2 to a CPU-direct Gen5 x8 slot. (worklog
-  L642–659)
+  Round 35b)
 - **Overclock/power wall and P2P are infeasible** (already at full clock,
   93/85 W; the consumer driver masks P2P, `canAccessPeer=0`, SYS topology
-  across root complexes). (worklog L2543, L5282)
+  across root complexes). (worklog §11.7, §3.13)
 - **Device-plane divergence anchor (+73.4 MiB/card): abandoned.** Saves only
   ~9.9 ms per session; in real chat the reachability guard usually holds and
-  the device path is taken. (worklog L1976–1984)
+  the device path is taken. (worklog Round 17)
 
 ## Upstream merge-value assessments
 
@@ -112,7 +114,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   through `a012e2bc` (2026-09-28): assessed 2026-09-29, no TP-2 merge value.**
   Checked the perf candidates against the settled bottleneck - decode is
   weight-stream bandwidth-bound (GEMV 75-90%, lm_head ~439 GB/s ≈ 5060 Ti peak;
-  36 SM, worklog L7360):
+  36 SM, worklog §5.2):
   - *Linear unification + sliced-K MMA* (09-26 batch `229c1832`…`ecbc3357`): no
     gain. Sliced-K does not cut weight traffic on a bandwidth-bound GEMM; the
     NVFP4 trunk is W4A4 while upstream's sliced-K targets the A16 route
@@ -125,12 +127,12 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   - *q4/q5 dispatch tuning* (`d3c125ed`/`beedffa0`/`bb844c43`/`a9a0d10a`/
     `b39de4d5`/`9e163eee`/`5b4303c0`/`594930e7`): not on the trunk (mainline is
     NVFP4; q4/q5 only in the DFlash2 draft path, also bandwidth-bound). Already
-    "not scheduled" (worklog L4357).
+    "not scheduled" (worklog §5).
   - *Custom Jinja chat templates* (`98dada0e` + `b9219f3f`): a feature, not a
     perf lever - already merged (first tier) with local extensions;
     `--chat-template FILE` runs via the in-tree `third_party/llama-jinja`
     runtime. Nothing to merge.
-  Real levers remain those in worklog/PLAN (allreduce, AR∥MMA overlap N=4, CUDA
+  Real levers remain those in tp2-plan.md (allreduce, AR∥MMA overlap N=4, CUDA
   graph, card-2 Gen5 slot). Re-assess only if `origin/master` moves past
   `e31bc99b` in a way that touches the trunk. (source-verified 2026-09-29)
 
@@ -167,7 +169,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
     `ninfer_jinja_test` / `ninfer_qwen3_5_frontend_test` /
     `ninfer_prompt_input_test` / the OpenAI+Anthropic schema tests /
     `ninfer_prepare_ragged_prefix_test` pass with it. `ninfer_chat_templates_test`
-    fails on its recorded host-side cause (worklog L7396), identically before and
+    fails on its recorded host-side cause (worklog §5.2), identically before and
     after the port.
   - *Ported - `75a89050` "fix(runtime): wait for compute before request cleanup".*
     `ProgramImpl::abort` and the `start_request` rollback returned the lane's
@@ -190,7 +192,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
     transaction (so admission cannot interleave before the upload completes), and
     `fail_all_cleanup` runs on the terminal `failed_` path where the pool is never
     handed out again. Evidence: full build; `ninfer_qwen3_5_tp2_lanes_test`
-    (2xRTX 5060 Ti, `NINFER_TEST_ARTIFACT=D:/LLM/qwen3_8_27b_swift15_dflash2_final.ninfer`,
+    (2xRTX 5060 Ti, `NINFER_TEST_ARTIFACT=<models-dir>/qwen3_8_27b_swift15_dflash2_final.ninfer`,
     five scenarios including queued cancellation and a driver stop with a request
     in flight) and `ninfer_tp_device_pair_test` (in-kernel AR stall/give-up) exit
     0, the materialization/resource-manager/engine-options/HTTP host tests pass,
@@ -205,7 +207,7 @@ Historical reference only: current state and remaining work live in `PLAN.md`
     prefill grid cap and the attention split budgets still need a 5060 Ti A/B);
     the attention/linear perf batch (`23b0997d`…`7f6aafed`) is half-geometry MMA
     under the same no-gain argument as the 2026-09-29 assessment; `1cfdb4d6`/
-    `84cf93e4` are no-ops at the local CUDA 13.1 toolchain. Inventory in PLAN.md
+    `84cf93e4` are no-ops at the local CUDA 13.1 toolchain. Inventory in tp2-plan.md
     3.8. (source-verified 2026-10-05)
 
 ## Withdrawn approaches (falsified by real traffic)
@@ -213,20 +215,20 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **"Continuation boundary" (reuse to the end of the last generation):
   withdrawn.** DSH re-renders the assistant turn instead of echoing the
   generated token stream; the continuation slot was used 0/36 in real traffic.
-  (worklog L1495–1510)
+  (worklog Round 13-14)
 - **Template `|trim` → `rstrip('\n')`: rolled back.** Even with a maintained
   override template, verbatim replay of `reasoning_content` still stops at the
-  previous prompt length. (worklog L5405–5406)
+  previous prompt length. (worklog §4)
 - **Text-protocol replay cannot guarantee token-exact reproduction.** The first
   generated token is not in the published reasoning text (`max_tokens=1` ⇒
   empty `reasoning_content`); with the DFlash2 cost gate (decline draft ≈ 3×
   decode vs saved prefill), recomputing is the rational choice. The only lever
   for token-exact reuse is a continuation protocol carrying token ids
-  (unscheduled). (worklog L5408–5413, L5457)
+  (unscheduled). (worklog §4, §6)
 
   *Byte-exactness withdrawn; the generated span is adopted instead.* The
   template's `|trim` removes the leading whitespace of the model's reasoning
-  (worklog L5389–5391), so a replayed turn parts from the resident history at
+  (worklog §4), so a replayed turn parts from the resident history at
   its first token while describing the same turn. When the two renderings agree
   - same trimmed reasoning, same trimmed content, byte-identical tool-call
   region - the walk replaces the replay with the tokens this lineage generated
@@ -239,64 +241,64 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   round: declining 22.5 vs keeping 87.1 tok/s with near-identical acceptance ⇒
   the gate, `draft_context_declined`, `reuse_grid` and session-mean pricing
   were removed; a single scan with the deepest boundary wins. (worklog
-  L4251–4279 background)
+  §3.6 background)
 - **DFlash2 TP-2 option (b) (2026-09-22): implemented, then rolled back.** It
   was not the cause of the solo-probe instability; the route went back to
   construction-time rejection until the clamping-round root cause was fixed
-  (B5). (worklog L3974–3978)
+  (B5). (worklog §3.6)
 
 ## Measurement and methodology rules
 
 - **Acceptance-rate verdicts need a 30-rep pool.** The 15-rep inter-arm noise
   floor is ~±2 pp; two "−2 pp cost" verdicts from 15-rep pools were later shown
-  to be noise. (worklog L6200–6206)
+  to be noise. (worklog §3.9)
 - **Greedy cross-arm comparison is invalid.** Draft proposal length changes the
   verify batch shape ⇒ target numerics change ⇒ text drifts (6/7 probe prompts
   differ). Greedy probes are deterministic regression checks only; pooled
-  sampling is the acceptance-rate statistic. (worklog L5788–5793)
+  sampling is the acceptance-rate statistic. (worklog §8.6)
 - **`CUDA_LAUNCH_BLOCKING=1` / compute-sanitizer are incompatible with the
   TP-2 in-kernel AR** — the A-side launch becomes blocking, the B-side kernel
   waits for it ⇒ the first collective always gives up (self-deadlock).
   Kernel-level attribution requires source-level probe bisection. (worklog
-  L6431–6433)
+  §3.10)
 - **Boundary sensitivity:** the last chunk width is not the variable; the
-  boundary position is; 120-step decode shows zero flips. (worklog L3587)
+  boundary position is; 120-step decode shows zero flips. (worklog §2)
 - **B7 (verify graph) settling needs ≥24 reps/arm.** Current A/B: 6 reps/arm,
-  aggregate +5.2%, per-request t=0.99 (not significant). (PLAN §3.4)
+  aggregate +5.2%, per-request t=0.99 (not significant). (tp2-plan.md §3.4)
 - **The Q4 selector uses coarse T buckets, not per-T capacity buckets** —
   per-T instantiation is pure code bloat under the mask path. (worklog
-  L5709–5712)
+  §8.6)
 - **Draft-quantization overrides are cumulative by design** — each arm must be
   the cumulative artifact, otherwise it falls back to the official Q8 recipe
-  and the test is not of the product path. (worklog L5719–5721)
+  and the test is not of the product path. (worklog §8.6)
 
 ## Root causes (settled)
 
 - **MTP consistency (①): shards never wrote replay records** (fold consumed an
   empty log). Fixed; criteria were no-regression + same quality tier + speedup.
-  (worklog L1255)
+  (worklog Round 36f)
 - **Spin hang (2026-09-23): token counter cross-card false sharing.** Fixed;
-  `DevicePair::start_ar_watchdog` retained as a diagnostic. (worklog L4648)
+  `DevicePair::start_ar_watchdog` retained as a diagnostic. (worklog §8.9)
 - **Clamping rounds: `forward_tp2_window` never bound
   `active_valid_columns_` / `valid_columns`** ⇒ paged-KV same-slot tearing.
-  Fixed. (worklog L4137, L4816)
+  Fixed. (worklog §3.6)
 - **DFlash2 22 tok/s: the decline guard misfired on the template prefix**
   (~37–57 tokens always hit the unaligned fallback ⇒ `extent=0` every round).
-  Fixed with a 16×-budget cost gate. (worklog L4251–4279)
+  Fixed with a 16×-budget cost gate. (worklog §3.6)
 - **TP-2 decode double preview:** `preview_model` already handles termination;
-  the decode loop was publishing a second preview. (worklog L395–396)
+  the decode loop was publishing a second preview. (worklog Round 28)
 - **Early GDN test failures: test bug** (GDN state pool not reset between the
-  card-local double forwards). (worklog L335)
+  card-local double forwards). (worklog Round 18)
 - **Bounded-spin give-up inside a captured window:** the round keeps running
   with locally-only partial sums; the window's kernels consume the inconsistent
   data as addresses ⇒ illegal address; no host-side check can make it in time.
   Only eager-prefill give-ups become clean 503s. Mitigations in place:
   abandon-output (1b), watchdog (default on), timeout default 2000→10,000 ms
   (a second-level stall is a host/driver event, not a slow kernel). (worklog
-  L6436–6441, L6472–6481; PLAN §3.6)
+  §3.10; tp2-plan.md §3.6)
 - **Two low-frequency failures (r67 IllegalAddress req#14; r69 HTTP 503
   req#14) are the same event class.** Natural rate ≲1/1,500 requests; long runs
-  (1,500 requests, watchdog on) have not caught the trigger. (PLAN §3.3, §3.6)
+  (1,500 requests, watchdog on) have not caught the trigger. (tp2-plan.md §3.3, §3.6)
 - **The two low-frequency transport failures are a one-collective rendezvous skew
   (settled 2026-10-06).** The in-kernel allreduce published one id per slice and spun
   until the peer's slot equalled it, while the engine legitimately lets the mirror shard
@@ -312,8 +314,8 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   so the bank still holds the id the slow side is waiting for. Acceptance: the
   `check_ar_skew` case in `ninfer_tp_device_pair_test` (hold injection: 1 bank must
   still give up, 4 banks must complete bit exact) and
-  `tools/tp_bootstrap/r89_skew_acceptance.ps1` (1 bank must fail - the warmup with a stall
-  message or a request with 503 and a watchdog dump - and 4 banks must start and serve).
+  the `NINFER_TP2_AR_FAULT_HOLD_POLL` skew acceptance run (1 bank must fail - the warmup with a
+  stall message or a request with 503 and a watchdog dump - and 4 banks must start and serve).
   Injection: `NINFER_TP2_AR_FAULT_HOLD_POLL=<eager serial>:<ns>[:self]` (0 = every eager
   collective; captures are excluded, since a hold recorded into a captured graph would be
   replayed by every launch of it); both fault hooks log `[ar-fault]` when they land.
@@ -321,58 +323,58 @@ Historical reference only: current state and remaining work live in `PLAN.md`
 - **BF16-add allreduce is bit-safe only for BF16 payloads.** I32/FP32 ids can
   carry signaling-NaN bit patterns; use `DevicePair::sendrecv` for byte-exact
   cross-card exchange. DFlash2's equivalent paths are fixed; the MTP route at
-  `execution/text.cpp:486` is not (verification cost high). (PLAN §3.3)
+  `execution/text.cpp:486` is not (verification cost high). (tp2-plan.md §3.3)
 - **Official NVFP4 artifact's lower acceptance rate vs synthetic/self-
   converted:** the difference is in the text weights, not the components.
   (worklog 2026-09-27 archive)
 - **Solo-probe determinism: ~6% flip rate** refutes "byte-identical across
-  runs" for the dflash2 solo probe. (worklog L4097)
+  runs" for the dflash2 solo probe. (worklog §3.6)
 - **The sessions plain-route failure is pre-existing** (the r57 baseline
   artifact reproduces it token-exactly; dflash2/mtp routes pass) ⇒ blocks the
   three-suite all-green; the sessions gate runs on the dflash2 route. (worklog
-  L5811–5815; PLAN §3.3)
+  §8.6; tp2-plan.md §3.3)
 
 ## Tool and environment boundaries
 
 - **WSL2 CUDA is unusable for execution** (PTX JIT segfault in
   `cudaGetDeviceCount()`; GPU held by Windows services) ⇒ the WSL tree is
   compile-verification only; all tests run on the Windows side
-  (`tools/win_port/test.ps1`). (PLAN §3.5)
+  (`tools/win_port/test.ps1`). (tp2-plan.md §3.5)
 - **Three GPUs visible:** nvidia-smi order 0/2 = 5060 Ti, 1 = Tesla T10;
   `--devices 0,1` picks the two 5060 Tis by CUDA ordinal (offset from
-  nvidia-smi order). (PLAN §1)
+  nvidia-smi order). (tp2-plan.md §1)
 - **Windows PATH must include the FFmpeg and libcurl `bin` dirs** or
   solo/sessions die at load with `0xC0000135` (append does not use the media
-  path). (PLAN §1)
+  path). (tp2-plan.md §1)
 - **Windows libcurl link:** `find_library` picks the static `libcurl.a`
   (MSVC cannot link it); prefer `find_file(... libcurl.dll.a)`. (worklog
-  L2680)
+  §12)
 - **Process discipline:** one model process machine-wide (WSL 8088 vs Windows
   8099 mutually exclusive); stop the service before relinking the exe
   (LNK1104); `build-win/apps/ninfer-serve.exe` is not auto-synced to
-  `C:\ninfer\`. (PLAN §1)
+  `C:\ninfer\`. (tp2-plan.md §1)
 - **Watchdog cost model:** `note_ar_call` was already unconditional; the
   thread polls host counters every 25 ms, calls no CUDA API, touches no
   stream; large dumps are rate-limited to one per stall. A/B: no measurable
-  cost. (worklog L6485–6492)
+  cost. (worklog §3.10)
 - **The frontend test fixture rejection is a pre-existing failure** (fixture
   template rejected by the chat-template whitelist; expected to turn green
-  after the cherry-pick). (worklog L4321)
+  after the cherry-pick). (worklog §4)
 
 ## Deferred (settled as "not now")
 
 - **Full draft NVFP4: not advancing** (source-level audit;
-  [tp2-dflash2-draft-nvfp4.md](tp2-dflash2-draft-nvfp4.md)). Only ~202.3 MiB
+  [tp2-dflash2-draft-nvfp4.md](maintainer/tp2-dflash2-draft-nvfp4-feasibility.md)). Only ~202.3 MiB
   left vs r66 q4all, of which 174.3 MiB is the non-GEMM codebook; NVFP4
   0.5625 B/elem > Q4 0.53125 B/elem, so re-quantizing already-Q4 tensors would
   grow them; three hard blockers (no float→NVFP4 quantizer in the converter and
   no A4 activation calibration for the dynamic-FP8 draft source; NVFP4 native
   Weight only takes full parents; consumer op NVFP4 geometries are closed
   sets). Reopen only with a W4A4-family / prefill-TMA motivation. (worklog
-  L6053–6060)
+  §3.7)
 - **Ring K/V quantization (CyclicKVCache): deferred.** Locked in three places
   (`CyclicKVCache` layout, SWA validation, `context_kv_materialize`
-  `validate_cache`); ~55 MiB, worst cost/benefit. (worklog L5534)
+  `validate_cache`); ~55 MiB, worst cost/benefit. (worklog §8)
 - **L2 (AR∥MMA overlap): retested with a corrected schedule; +11% prefill.**
   The prefill chunk is split into N 64-aligned sub-blocks and each sub-block's
   collective runs on a second stream (`DeviceContext::collective_stream`) while
@@ -386,15 +388,15 @@ Historical reference only: current state and remaining work live in `PLAN.md`
   the 256-token sub-block width, not extrapolate N. Re-verified at chunk 512:
   0.625 serial → 0.572 with 256-wide sub-blocks (−8.4%). Bit-identical to the
   single-block loop (tp2_forward_test chunk-split invariant exact at N=2 and
-  N=4). This supersedes R12's −5% and the "unscheduled" status. (worklog L5291
+  N=4). This supersedes R12's −5% and the "unscheduled" status. (worklog §3.14
   + the two 2026-09-27 entries)
 - **Gate revision (sampling-led acceptance verdict): separate from the
   promotion.** The literal greedy gate `|Δacc| ≤ 1.0pp` failed at K=7
   (−1.60 pp, proven cross-arm text drift); the promotion is done (r69,
   user-confirmed); 30-rep pooled sampling is the de facto method. Formalize in
-  one place if/when. (worklog L5826; PLAN §3.4)
-- **Genuinely open items** (tracked in PLAN §3, not settled): bf16 KV + MTP
+  one place if/when. (worklog §8.6; tp2-plan.md §3.4)
+- **Genuinely open items** (tracked in tp2-plan.md §3, not settled): bf16 KV + MTP
   first-prefill crash; MTP I32 sNaN risk; MTP3 ≥70 tok/s; perplexity on TP-2;
   trigger source of the low-frequency transport failures; B7 settling
   (≥24 reps/arm); sessions plain-route failure; upstream 3b/3c and the 5060 Ti
-  SM-count A/B timings (PLAN §3.8).
+  SM-count A/B timings (tp2-plan.md §3.8).

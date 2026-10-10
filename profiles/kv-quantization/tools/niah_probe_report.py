@@ -29,8 +29,8 @@ ARMS = ("int8", "nvfp4")
 ARM_COLOR = {"int8": "#2f6fd0", "nvfp4": "#d0402f"}
 ARM_LABEL = {"int8": "int8-g64", "nvfp4": "nvfp4-g16"}
 SUBSETS = (
-    ("english", "英文 haystack (PaulGraham_Essays)"),
-    ("chinese", "中文 haystack (Journey_to_the_West)"),
+    ("english", "English haystack (PaulGraham_Essays)"),
+    ("chinese", "Chinese haystack (Journey_to_the_West)"),
 )
 ACCESS = "XK4Q9M2B7T1V8W3N6R5P2H9D4C8L1G7F"
 ACCESS_NORM = re.sub(r"[^A-Za-z0-9]", "", ACCESS).upper()
@@ -204,15 +204,15 @@ def soft_section(data: dict) -> tuple[str, list]:
             rows.append(cells)
         body.append(f"<h2>{esc(label)}</h2>")
         body.append('<div class="card">' + chart(
-            series_acc, f"检索命中数 vs 可见上下文长度 — {label}", "prompt tokens (log)",
-            "命中的 needle 数 (共 8)", ymin=0, ymax=8,
+            series_acc, f"retrieval hits vs visible context length — {label}", "prompt tokens (log)",
+            "number of needles hit (of 8)", ymin=0, ymax=8,
             yticks=[0, 1, 2, 3, 4, 5, 6, 7, 8],
-            note="needle 位于文档最前，提问在最后") + "</div>")
+            note="needles are at the very front of the document, the question is at the end") + "</div>")
         body.append('<div class="card">' + chart(
-            series_lat, f"单次请求耗时 — {label}", "prompt tokens (log)", "latency (s)",
-            ymin=0, fmt="{:,.0f}", note="上升 = 前缀复用生效（只付增量）") + "</div>")
-        body.append(table(["prompt tokens", "int8-g64", "nvfp4-g16", "int8 耗时",
-                           "nvfp4 耗时", "nvfp4 &minus; int8"], rows))
+            series_lat, f"latency of a single request — {label}", "prompt tokens (log)", "latency (s)",
+            ymin=0, fmt="{:,.0f}", note="rising = prefix reuse taking effect (only the increment is paid)") + "</div>")
+        body.append(table(["prompt tokens", "int8-g64", "nvfp4-g16", "int8 latency",
+                           "nvfp4 latency", "nvfp4 &minus; int8"], rows))
     return "".join(body), summary
 
 
@@ -261,28 +261,28 @@ def hard_section(data: dict) -> tuple[str, list, list]:
             cells.append(f'<span class="num">{r["latency_s"]:.0f}s</span>' if r else "&ndash;")
         rows.append(cells)
 
-    body.append(f"<h2>难点探针：32 条 needle + 39 字符随机 token（英文 haystack）</h2>")
+    body.append(f"<h2>Hard probe: 32 needles + a 39-character random token (English haystack)</h2>")
     body.append('<div class="card">' + chart(
-        series_acc, "32 条 needle 的命中数 vs 可见上下文长度", "prompt tokens (log)",
-        "命中的 needle 数 (共 32)", ymin=0, ymax=32,
-        yticks=[0, 8, 16, 24, 32], note="needle 位于文档最前") + "</div>")
+        series_acc, "hits of the 32 needles vs visible context length", "prompt tokens (log)",
+        "number of needles hit (of 32)", ymin=0, ymax=32,
+        yticks=[0, 8, 16, 24, 32], note="needles are at the very front of the document") + "</div>")
     body.append('<div class="card">' + chart(
-        series_tok, "39 字符 access token 的逐字符复现率", "prompt tokens (log)",
-        "字符正确率 (%)", ymin=0, ymax=100, yticks=[0, 25, 50, 75, 100], fmt="{:,.0f}",
-        hlines=(100,), note="逐字符比对，归一化后取最优对齐窗口") + "</div>")
+        series_tok, "character-level reproduction rate of the 39-character access token", "prompt tokens (log)",
+        "character accuracy (%)", ymin=0, ymax=100, yticks=[0, 25, 50, 75, 100], fmt="{:,.0f}",
+        hlines=(100,), note="character-by-character comparison, taking the best alignment window after normalization") + "</div>")
     body.append('<div class="card">' + chart(
-        series_lat, "单次请求耗时（难点探针）", "prompt tokens (log)", "latency (s)",
-        ymin=0, fmt="{:,.0f}", note="上升 = 前缀复用生效（只付增量）") + "</div>")
-    body.append(table(["prompt tokens", "int8 命中", "nvfp4 命中", "int8 token 字符",
-                       "nvfp4 token 字符", "int8 耗时", "nvfp4 耗时"], rows))
+        series_lat, "latency of a single request (hard probe)", "prompt tokens (log)", "latency (s)",
+        ymin=0, fmt="{:,.0f}", note="rising = prefix reuse taking effect (only the increment is paid)") + "</div>")
+    body.append(table(["prompt tokens", "int8 hits", "nvfp4 hits", "int8 token chars",
+                       "nvfp4 token chars", "int8 latency", "nvfp4 latency"], rows))
     if bad:
-        items = "；".join(
-            f"{ARM_LABEL[a]} @ {r['prompt_tokens']:,} tok 只输出 {r['hits']}/{r['total']}"
+        items = "; ".join(
+            f"{ARM_LABEL[a]} @ {r['prompt_tokens']:,} tok output only {r['hits']}/{r['total']}"
             for a, r in bad)
-        body.append(f'<div class="note"><b>被上下文预算截断、已从曲线剔除的点</b>：{esc(items)}。'
-                    f'完整答案需要 352 个输出 token，而 <code>max_context</code>=262,144 是'
-                    f'「prompt + 输出」的总预算，所以 prompt 一旦超过约 261,790 就放不下答案，'
-                    f'模型会在数字中间被硬切（实测 <code>Lagos = 3</code>）。这是测量伪影，不是检索失败。</div>')
+        body.append(f'<div class="note"><b>Points cut off by the context budget and dropped from the curves</b>: {esc(items)}. '
+                    f'A complete answer needs 352 output tokens, while <code>max_context</code>=262,144 is '
+                    f'the total budget of "prompt + output", so once the prompt exceeds about 261,790 the answer no longer fits and '
+                    f'the model is hard-cut in the middle of a number (measured <code>Lagos = 3</code>). This is a measurement artifact, not a retrieval failure.</div>')
     return "".join(body), summary, bad
 
 
@@ -293,8 +293,8 @@ def main() -> int:
     hard_body, hard_summary, _ = hard_section(hard)
 
     doc = f"""<!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<title>KV 量化：长上下文检索精度随可见长度变化</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>KV quantization: long-context retrieval accuracy vs visible context length</title>
 <style>
  body {{ font-family: "Segoe UI",Helvetica,Arial,sans-serif; margin:0; padding:28px 34px 60px;
         background:#fafafa; color:#1a1a1a; }}
@@ -316,34 +316,34 @@ def main() -> int:
  .neg {{ color:#b3261e; font-weight:600; }}
  code {{ background:#f2f2f4; padding:1px 5px; border-radius:4px; font-size:12.5px; }}
 </style></head><body>
-<h1>KV 量化：长上下文检索精度随可见上下文长度变化</h1>
-<div class="sub">模型 Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision · TP-2 (<code>--devices 0,1</code>)
- · 贪心解码 · 每条 (臂, 语料) 是一条 11 点的<b>严格前缀链</b>，整条链只付一次最长 prefill</div>
+<h1>KV quantization: long-context retrieval accuracy vs visible context length</h1>
+<div class="sub">model Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision · TP-2 (<code>--devices 0,1</code>)
+ · greedy decoding · each (arm, corpus) is an 11-point <b>strict prefix chain</b>, and the whole chain costs one longest prefill</div>
 
 <div class="note">
-<b>设计</b>：请求体 = <code>[needle 备忘录] + haystack[0:K] + [提问]</code>。K 从 16,384 递增到约 262,000，
-每个请求都是上一个的严格前缀延长，因此 ninfer-serve 的前缀复用把 11 次 prefill 合并成一次最长 prefill
-（实测：精确重发 0.9s vs 冷启动 127.6s，即 139×；服务端日志也报 <code>cache 228,352 (91.4%)</code>）。
-needle 全部钉在文档最前面，所以"needle 到提问的距离"恰好等于 K —— 这是 stock NIAH 网格里最难、最敏感的
-0% 深度档。
+<b>Design</b>: request body = <code>[needle memo] + haystack[0:K] + [question]</code>. K increases from 16,384 to about 262,000,
+and every request is a strictly prefixed extension of the previous one, so prefix reuse in ninfer-serve merges the 11 prefills into one longest prefill
+(measured: exact re-send 0.9s vs 127.6s cold, i.e. 139×; the server log also reports <code>cache 228,352 (91.4%)</code>).
+All needles are pinned at the very front of the document, so "the distance from a needle to the question" is exactly K — this is the hardest and most sensitive
+0% depth tier in the stock NIAH grid.
 <br><br>
-<b>为什么这比逐深度网格便宜一个数量级</b>：深度网格里每个样本的 needle 位置不同 ⇒ haystack 的 token 序列
-不同 ⇒ 完全没有前缀复用，88 个样本每个都要付一次完整的 128K/260K prefill（约 5.5 小时）。前缀链把成本压到
-一次最长 prefill（约 25 分钟），代价是丢掉"深度"这一维。
+<b>Why this is an order of magnitude cheaper than a depth-by-depth grid</b>: in the depth grid each sample has its needles at a different position ⇒ the haystack token sequence
+differs ⇒ there is no prefix reuse at all, and each of the 88 samples has to pay for a full 128K/260K prefill (about 5.5 hours). The prefix chain pushes the cost down to
+one longest prefill (about 25 minutes), at the cost of dropping the "depth" dimension.
 <br><br>
-<b>注意</b>：needle 与提问都是英文，中文档只是换 haystack —— 与 stock NIAH 适配器的做法一致。
+<b>Note</b>: the needles and the question are both in English; the Chinese document only swaps the haystack — consistent with what the stock NIAH adapter does.
 </div>
 
 <div class="note">
-<b>汇总</b><br>
-{'<br>'.join(f'8-needle 探针 · {s} · {a}: {h}/{t}' for s, a, h, t in soft_summary)}<br>
-{'<br>'.join(f'32-needle 探针 · {a}: 城市码 {h}/{t} · access token 字符 {th}/{tt}' for a, h, t, th, tt in hard_summary)}
+<b>Summary</b><br>
+{'<br>'.join(f'8-needle probe · {s} · {a}: {h}/{t}' for s, a, h, t in soft_summary)}<br>
+{'<br>'.join(f'32-needle probe · {a}: city codes {h}/{t} · access token chars {th}/{tt}' for a, h, t, th, tt in hard_summary)}
 </div>
 
-<h1 style="font-size:20px;margin-top:34px">探针 1：8 条 needle</h1>
+<h1 style="font-size:20px;margin-top:34px">Probe 1: 8 needles</h1>
 {soft_body}
 
-<h1 style="font-size:20px;margin-top:34px">探针 2：32 条 needle + 逐字复现</h1>
+<h1 style="font-size:20px;margin-top:34px">Probe 2: 32 needles + verbatim reproduction</h1>
 {hard_body}
 </body></html>
 """

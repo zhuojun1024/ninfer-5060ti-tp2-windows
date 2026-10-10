@@ -578,7 +578,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
                                " prompt tokens, expected " + std::to_string(shared_c_first_reuse));
     }
     // The recalled walk has to agree with the oracle token for token. This is the case that used to
-    // split inside its generated tail (PLAN.md 3.6, "B6 result"): the host-slab recall lands on the
+    // split inside its generated tail (tp2-plan.md 3.6, "B6"): the host-slab recall lands on the
     // prefill grid, so its masked draft stays licensed and its verify windows have to reproduce a
     // from-scratch walk exactly.
     if (const int status = compare_recall(
@@ -940,7 +940,7 @@ int check_transport_failure_keeps_prefix(const char* artifact, int device_a, int
 // it was sampled replays token for token, and the separation between the two is what decides whether
 // anything is replaced at all; the case where a replacement would shorten the prompt needs the
 // template's own framing around a turn whose bytes it owns, and that case is left to the served
-// replay recorded in PLAN.md 4.9.
+// replay recorded in tp2-plan.md 4.9.
 int check_replayed_answer_keeps_prompt_end(const char* artifact, int device_a, int device_b,
                                            Route route) {
     const std::string label = std::string("replayed answer (") + route_name(route) + ")";

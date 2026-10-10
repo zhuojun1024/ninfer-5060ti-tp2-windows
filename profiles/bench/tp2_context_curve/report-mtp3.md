@@ -1,34 +1,34 @@
-# TP-2 上下文档位曲线(原始启动脚本配置:K=3 MTP + vision)
+# TP-2 context-length curve (original startup-script configuration: K=3 MTP + vision)
 
-本地测量,2026-09-20。同目录:`mtp3.json`(全部记录)、`mtp3_summary.csv`(汇总)、`mtp0.json`/报告(对照基线)。
+Local measurement, 2026-09-20. Same directory: `mtp3.json` (all records), `mtp3_summary.csv` (summary), `mtp0.json`/report (the comparison baseline).
 
-## 与基线报告的口径差别
+## How the accounting differs from the baseline report
 
-这份跑的是**你 `C:/Users/zhuojun/start-ninfer-tp2.ps1` 的默认配方**,即生产配置;
-`mtp0.json` 那份是关闭投机的基线(`--no-prefix-reuse`、无 vision)。两者唯一的方法差异是
-本配置**开启了前缀复用**(`context cache` 非 root-only),prefill 期间会写 host checkpoint,
-因此小档位更容易出现模板前导(约 49 token)的缓存命中。
+This run uses the **default recipe of your `$HOME/start-ninfer-tp2.ps1`**, i.e. the production configuration;
+the `mtp0.json` run is the speculation-disabled baseline (`--no-prefix-reuse`, no vision). The only methodological difference between the two is that
+this configuration **enables prefix reuse** (`context cache` is not root-only), which writes host checkpoints during prefill,
+so small sizes are more likely to hit a cache for the template preamble (about 49 tokens).
 
-## 运行配方(原始脚本默认值)
+## Run recipe (defaults of the original script)
 
-| 项 | 值 |
+| item | value |
 |---|---|
-| 硬件 | 2x RTX 5060 Ti 16 GiB(`--devices 0,1`,TP-2) |
-| artifact | `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer` |
-| KV | fp8,capacity 204,800 token |
-| 投机解码 | `--spec mtp --draft-tokens 3 --lm-head-draft`(K=3) |
-| 视觉塔 | 开启(shard 1 arena 826.5 MiB) |
-| 采样/思考 | `--temperature 0.7 --top-k 20 --top-p 0.80 --reasoning-effort medium --preserve-thinking` |
-| 前缀复用 | 开启(`--host-state-slots 32`) |
-| 服务 | 直接运行 `start-ninfer-tp2.ps1`(端口 3456);engine ready 31.9 s |
-| 驱动 | `pwsh -File tools/win_port/context_curve.ps1 -BaseUrl http://127.0.0.1:3456/v1 -Label tp2-mtp3 -OutFile profiles/bench/tp2_context_curve/mtp3.json -Sizes '128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,196608' -Repetitions 3 -DecodeTokens 256` |
+| hardware | 2x RTX 5060 Ti 16 GiB (`--devices 0,1`, TP-2) |
+| artifact | `<models-dir>/qwen3_8_27b_w4a4_w8a8.ninfer` |
+| KV | fp8, capacity 204,800 tokens |
+| speculative decoding | `--spec mtp --draft-tokens 3 --lm-head-draft` (K=3) |
+| vision tower | on (shard 1 arena 826.5 MiB) |
+| sampling/thinking | `--temperature 0.7 --top-k 20 --top-p 0.80 --reasoning-effort medium --preserve-thinking` |
+| prefix reuse | on (`--host-state-slots 32`) |
+| serving | run `start-ninfer-tp2.ps1` directly (port 3456); engine ready 31.9 s |
+| driver | `pwsh -File tools/win_port/context_curve.ps1 -BaseUrl http://127.0.0.1:3456/v1 -Label tp2-mtp3 -OutFile profiles/bench/tp2_context_curve/mtp3.json -Sizes '128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,196608' -Repetitions 3 -DecodeTokens 256` |
 
-方法同 `docs/performance/methodology.md` 的单请求法:prefill = `prompt_n/prompt_ms`,
-decode = `(predicted_n-1)/predicted_ms`,解码预算 256 tok(全部打满),横轴为 `usage.prompt_tokens`。
+The method is the single-request method of `docs/performance/methodology.md`: prefill = `prompt_n/prompt_ms`,
+decode = `(predicted_n-1)/predicted_ms`, decode budget 256 tok (all ran to the limit), x-axis `usage.prompt_tokens`.
 
-## 结果(K=3)
+## Results (K=3)
 
-| context tokens | prefill tok/s | sd | reps | 平均缓存 tok | decode tok/s | sd | ms/token | prefill wall (s) |
+| context tokens | prefill tok/s | sd | reps | avg cached tok | decode tok/s | sd | ms/token | prefill wall (s) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 118 | 787.9 | 0.0 | 1 | 33 | 71.03 | 2.95 | 14.08 | 0.15 |
 | 268 | *1417.2 | 54.2 | 3 | 49 | 93.62 | 3.86 | 10.68 | 0.15 |
@@ -43,12 +43,12 @@ decode = `(predicted_n-1)/predicted_ms`,解码预算 256 tok(全部打满),横�
 | 131,068 | 1111.2 | 0.5 | 3 | 0 | 54.91 | 6.95 | 18.21 | 117.96 |
 | 196,618 | 946.7 | 0.1 | 3 | 0 | 53.68 | 2.85 | 18.63 | 207.69 |
 
-\* = 该档 3 次重复全部命中缓存,prefill 一列只能用"含缓存"的平均值(相对全量 prefill 偏高 4-12%)。
-其余档位取 `cache_n == 0` 的记录;≥8,193 全部 3 次无缓存。
+\* = all 3 repetitions at that size hit the cache, so the prefill column can only use the "cached" mean (4-12% higher than a full prefill).
+The remaining sizes use records with `cache_n == 0`; ≥8,193 all have 3 cache-free runs.
 
-## 与 MTP0 基线对比(prefill 用两边的"全记录"均值,口径一致)
+## Comparison with the MTP0 baseline (prefill uses the "all records" mean on both sides, same accounting)
 
-| context tokens | MTP0 prefill | MTP3 prefill | Δ | MTP0 decode | MTP3 decode | 加速比 |
+| context tokens | MTP0 prefill | MTP3 prefill | Δ | MTP0 decode | MTP3 decode | speedup |
 |---:|---:|---:|---:|---:|---:|---:|
 | 118 | 891.1 | 862.2 | -3.2% | 31.09 | 71.03 ± 2.95 | **2.28x** |
 | 268 | 1392.4 | 1417.2 | +1.8% | 31.11 | 93.62 ± 3.86 | **3.01x** |
@@ -63,34 +63,34 @@ decode = `(predicted_n-1)/predicted_ms`,解码预算 256 tok(全部打满),横�
 | 131,068 | 1117.9 | 1111.2 | -0.6% | 26.65 | 54.91 ± 6.95 | **2.06x** |
 | 196,618 | 951.4 | 946.7 | -0.5% | 24.98 | 53.68 ± 2.85 | **2.15x** |
 
-## 观察
+## Observations
 
-- **decode**:K=3 相对 MTP0 加速 2.15x(200K)到 3.01x
-  (峰值在 268 token);全程 53.7-93.6 tok/s,
-  200K 仍有 53.7 tok/s。低上下文段(268 token)是投机收益最高点,
-  之后随上下文增长,verify 成本上升,加速比回落到 ~2x。
-- **投机方差显著大于 MTP0**:同一档 3 次重复的 decode sd 最大 7.08 tok/s
-  (MTP0 最大仅 0.04)。这是投机解码的固有性质 —— 每轮接受数取决于内容,不是测量噪声;
-  单点比较应看均值和区间,不要拿单次数字。
-- **prefill 与 MTP0 几乎一致但系统性低 0.5-2%**(大档位):投机不影响 prefill,
-  这点差异来自本配置开启前缀复用后 prefill 期间的 host checkpoint 写入(32 槽 × 73.4 MiB/卡 pinned),
-  以及常驻的 vision arena。
-- **小档位(<4K)由固定开销 + 模板缓存主导**:118 token 时 prefill 只有 ~790-860 tok/s,
-  到 4K 才到平台 ~1.65k tok/s。
+- **decode**: K=3 speeds up over MTP0 by 2.15x (200K) to 3.01x
+  (peak at 268 tokens); throughput is 53.7-93.6 tok/s throughout,
+  and 200K still reaches 53.7 tok/s. The low-context stretch (268 tokens) is where speculative gains peak;
+  after that, as context grows, verify cost rises and the speedup falls back to ~2x.
+- **speculative variance is markedly larger than for MTP0**: the decode sd across 3 repetitions at the same size reaches 7.08 tok/s
+  (MTP0 is at most 0.04). This is inherent to speculative decoding — the acceptance count per round depends on the content, not on measurement noise;
+  single-point comparisons should look at means and intervals, not one-off numbers.
+- **prefill is nearly identical to MTP0 but systematically 0.5-2% lower** (large sizes): speculation does not affect prefill;
+  this difference comes from the host checkpoint writes during prefill after this configuration enabled prefix reuse (32 slots × 73.4 MiB/GPU pinned),
+  plus the resident vision arena.
+- **small sizes (<4K) are dominated by fixed overhead + template cache**: at 118 tokens prefill is only ~790-860 tok/s,
+  and the plateau of ~1.65k tok/s is only reached at 4K.
 
-## 已知缺口:这条路线不暴露投机接受率
+## Known gap: this route does not expose the speculative acceptance rate
 
-响应 `timings` 块里没有 `draft_n`/`draft_n_accepted`(表里 accept% 因此为空),日志也只有
-prefill/decode 两相。原因在源码:`src/serve/openai_chat_response.cpp:247` 走
-`outcome_timings()`,它读取的 `result.speculative.*` 由单卡路线(`engine_core.h:864`)填充,
-而 `src/runtime/engine/tp2_generation_core.cpp` 从不写 `result.speculative`(它只在内部
-`timing.committed += decision.accepted_tokens` 里统计,供 `NINFER_TP2_TIMING=1` 的每轮调试输出)。
-所以 `docs/performance/methodology.md` 定义的 **Spec acceptance / tokens-per-round 在 TP-2 服务路线上目前拿不到**。
-两种补法:① 让 TP-2 core 回填 `result.speculative`(推荐,单卡路线已有同一结构体);
-② 临时用 `NINFER_TP2_TIMING=1` 重启并解析每轮日志(粗糙,需重启服务)。
+The response `timings` block has no `draft_n`/`draft_n_accepted` (which is why accept% in the table is empty), and the logs have only the
+prefill/decode phases. The reason is in the source: `src/serve/openai_chat_response.cpp:247` goes through
+`outcome_timings()`, and the `result.speculative.*` it reads is populated by the single-GPU route (`engine_core.h:864`),
+whereas `src/runtime/engine/tp2_generation_core.cpp` never writes `result.speculative` (it only counts internally in
+`timing.committed += decision.accepted_tokens`, for the per-round debug output of `NINFER_TP2_TIMING=1`).
+So **Spec acceptance / tokens-per-round as defined in `docs/performance/methodology.md` is currently unavailable on the TP-2 serving route**.
+Two ways to fill it: ① have the TP-2 core write back `result.speculative` (recommended; the single-GPU route already has the same struct);
+② temporarily restart with `NINFER_TP2_TIMING=1` and parse the per-round logs (crude, requires restarting the service).
 
-## 局限
+## Limitations
 
-- 仅 C=1 单请求;并发曲线另测。
-- `* ` 标记的 4 个档位 prefill 含缓存,不能与 MTP0 的清洁点直接比。
-- 未测 DFlash/DFlash2,也未测视觉输入。
+- C=1 single requests only; the concurrency curve is measured separately.
+- The 4 sizes marked with `* ` include caching in prefill and cannot be compared directly with the clean MTP0 points.
+- DFlash/DFlash2 were not measured, nor were vision inputs.

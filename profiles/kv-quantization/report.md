@@ -1,104 +1,115 @@
-# KV cache 量化对模型质量的影响
+# Effect of KV cache quantization on model quality
 
-实测报告。回答两个问题：**KV cache 量化在长上下文下会不会失效？各量化档的代价到底多大？**
+An empirical report. It answers two questions: **does KV cache quantization break down at long context? and how large is the cost of each quantization tier?**
 
-测量对象是 `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer`（21.14 GiB，
-TP-2 `--devices 0,1`）与 `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`（13.99 GiB，单卡）。
-两者都是 **16 层 `full_attention` + 48 层 `linear_attention`**：只有 16/64 层带 KV cache，
-另外 48 层 GDN 的 recurrent state 是 FP32，完全不受 `--kv-dtype` 影响。这是端到端效应量
-偏小的结构性原因。
+The measured artifacts are `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer` (21.14 GiB,
+TP-2 `--devices 0,1`) and `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (13.99 GiB, single GPU).
+Both are **16 layers of `full_attention` + 48 layers of `linear_attention`**: only 16/64 layers carry a KV
+cache, while the recurrent state of the other 48 GDN layers is FP32 and entirely unaffected by `--kv-dtype`.
+This is the structural reason the end-to-end effect size is small.
 
-## 结论
+## Conclusions
 
-1. **误差不随上下文长度放大。** 固定文本配对对照（同一段 1024 token 被打分，只改它前面能看到
-   多少历史）五臂的 ΔNLL 对 log10(历史) 斜率只有 ~1e-3 nats/十倍程，|t| < 1.2；算子层的相对
-   注意力误差从长度 6 到 16,384 是平的。**没有"短上下文无损、长上下文崩溃"的拐点。**
-2. **长上下文没有灾难性失效。** 8-needle 探针在 261,912 token 上 88/88；32-needle + 32 字符
-   逐字复现在 261,712 token 上 32/32、字符全对。更早的五格式 122K 探针逐字节相同。
-3. **但误差本身不小。** 算子层量到 nvfp4 的相对注意力误差 **9.57%**，int8 只有 **0.42%**——
-   差 23 倍。端到端困惑度对 9.6% 的注意力误差几乎不敏感，这既说明任务容忍度高，也说明
-   **困惑度和检索这两把尺子对 4-bit 的失效模式不敏感**。
+1. **The error does not grow with context length.** In the fixed-text paired control (the same 1024 tokens are
+   scored, only the amount of history visible ahead of them changes), the slope of ΔNLL against log10(history)
+   across the five arms is only ~1e-3 nats/decade, |t| < 1.2; the operator-level relative
+   attention error is flat from length 6 to 16,384. **There is no knee where "short context is lossless and
+   long context collapses".**
+2. **There is no catastrophic failure at long context.** The 8-needle probe scores 88/88 at 261,912 tokens; the
+   32-needle + 32-character verbatim reproduction scores 32/32 at 261,712 tokens with every character correct.
+   The earlier 122K five-format probe was byte-identical.
+3. **But the error itself is not small.** At the operator level nvfp4 measures a relative attention error of
+   **9.57%**, while int8 is only **0.42%** — a factor of 23. End-to-end perplexity is nearly insensitive to that
+   9.6% attention error, which says both that the task is tolerant and that
+   **perplexity and retrieval are two rulers that are insensitive to the 4-bit failure mode**.
 
-**推荐**：默认 `--kv-dtype int8`。它是唯一在两把独立尺子上都"测不出代价"的档，且显存只比
-`fp8` 多 2.3%。显存紧张时退回 `fp8`；只有需要 2 倍以上余量跑并发时才用 `nvfp4`，代价按
-**+0.2~0.3% PPL** 记账。`k8v4` 被 `nvfp4` 完全支配（精度相同、多花 40% 显存），不用。
+**Recommendation**: default to `--kv-dtype int8`. It is the only tier on which neither of the two independent
+rulers measures a cost, and it uses only 2.3% more VRAM than
+`fp8`. Fall back to `fp8` when VRAM is tight; use `nvfp4` only when more than 2× headroom is needed to run
+concurrency, charged at **+0.2~0.3% PPL**. `k8v4` is completely dominated by `nvfp4` (same accuracy, 40% more
+VRAM), so do not use it.
 
-**前提**：这个模型开 262,144 上下文时 **bf16 装不下**（每 shard 需 8192 MiB KV，实际只剩约
-5.1 GiB，上限约 163,840）。所以"要不要量化"不是选择题，"用哪档"才是。
+**Precondition**: at a 262,144 context this model **does not fit** in bf16 (each shard would need 8192 MiB of KV,
+but only about 5.1 GiB is actually left, capping it at about 163,840). So "whether to quantize" is not a choice —
+"which tier to use" is.
 
-## 1. 测量方法
+## 1. Measurement method
 
-四层，从便宜到贵，互为交叉验证：
+Four layers, from cheap to expensive, cross-validating each other:
 
-| 层 | 手段 | 成本 | 测的是什么 |
+| layer | instrument | cost | what it measures |
 |---|---|---|---|
-| L0 | `ninfer_softmax_attention_test --quant-sweep` | 分钟级 | codec 本身的注意力输出误差 |
-| L1 | `ninfer-perplexity --corpus ... --quick` | ~8 min/臂 | 端到端困惑度（语料平均） |
-| L2 | `ninfer-perplexity --text ... --dump-token-nll` | ~7 min/臂 | 逐 token NLL 随可见历史深度 |
-| L3 | 固定文本块 + 扫历史长度（配对） | 数小时 | 唯一能把"历史长度"和"历史内容"分开的设计 |
-| L4 | 前缀链检索探针 | ~25 min | 长上下文检索精度（生成侧） |
+| L0 | `ninfer_softmax_attention_test --quant-sweep` | minutes | the attention output error of the codec itself |
+| L1 | `ninfer-perplexity --corpus ... --quick` | ~8 min/arm | end-to-end perplexity (corpus average) |
+| L2 | `ninfer-perplexity --text ... --dump-token-nll` | ~7 min/arm | per-token NLL against visible history depth |
+| L3 | fixed text block + swept history length (paired) | hours | the only design that separates "history length" from "history content" |
+| L4 | prefix-chain retrieval probe | ~25 min | long-context retrieval accuracy (generation side) |
 
-L0 的关键性质：它把 codec 从模型里隔离出来。同一份 K/V 分别按目标格式与 BF16 存进 paged KV，
-用 FP64 理想注意力比较输出，`rel_rmse` 是相对参考输出的 RMS。**注意其 fixture 用均匀随机 K，
-softmax 近似均匀，属于"误差最容易被平均掉"的区间**——它给的是下界参考，不是真实长上下文的
-误差。
+The key property of L0: it isolates the codec from the model. The same K/V is stored into the paged KV in the
+target format and in BF16, and the outputs are compared with an FP64 ideal attention; `rel_rmse` is the RMS
+relative to the reference output. **Note that its fixture uses uniform random K, so softmax is nearly uniform,
+which is the regime where "the error is most easily averaged away"** — it gives a lower bound, not the error of a
+real long context.
 
-L2 的关键性质：`token_nll.<stream>.tsv` 给出每个 target 的 NLL，而 token `t` 由 `[0,t)` 预测，
-所以 `target_index` 就是该 token 实际看到的历史深度（当 `--context >= 流长` 时只有 1 个窗口）。
-两个只差 KV 格式的运行的逐 token NLL 相减，文本项抵消，剩下表示法的贡献。
+The key property of L2: `token_nll.<stream>.tsv` gives the NLL of each target, and token `t` is predicted from
+`[0,t)`, so `target_index` is exactly the history depth that token actually saw (with `--context >= stream length`
+there is only 1 window). Subtracting the per-token NLL of two runs that differ only in KV format cancels the text
+term and leaves the contribution of the representation.
 
-L4 的关键性质：`ninfer-serve` 的前缀复用让 `[备忘录] + haystack[0:K] + [提问]` 这种严格前缀链
-的 11 次 prefill 合并成一次最长 prefill（实测精确重发 **0.9s vs 冷启动 127.6s，139×**；
-服务端日志 `cache 228,352 (91.4%, long anchor)`）。这把 88 样本的逐深度网格从 5.5 h 压到 25 min，
-代价是丢掉"深度"这一维。
+The key property of L4: prefix reuse in `ninfer-serve` merges the 11 prefills of a strictly prefix-chained
+`[memo] + haystack[0:K] + [question]` into one longest prefill (measured exact re-send **0.9s vs 127.6s cold,
+139×**; server log `cache 228,352 (91.4%, long anchor)`). This compresses the 88-sample depth grid from 5.5 h to
+25 min, at the cost of dropping the "depth" dimension.
 
-## 2. KV 格式的物理字节
+## 2. The physical bytes of each KV format
 
-`docs/maintainer/paged-kv-cache.md`，D256 单 token 单 head：
+`docs/maintainer/paged-kv-cache.md`, D256, one token, one head:
 
-| 格式 | 字节 | 说明 |
+| format | bytes | notes |
 |---|---|---|
-| BF16 | 1024 B | 物理上是 BF16 K + **FP16** V |
-| INT8-G64 | 528 B | 64 元素一组 scale |
-| FP8-E4M3FN-row256 | 516 B | 每 256 元素一行 scale |
-| NVFP4-G16 | 288 B | 16 元素一组，4-bit |
-| K8V4 | 402 B | K 固定 FP8-row256、V 固定 NVFP4-G16（封闭非对称） |
+| BF16 | 1024 B | physically BF16 K + **FP16** V |
+| INT8-G64 | 528 B | one scale per 64 elements |
+| FP8-E4M3FN-row256 | 516 B | one scale per 256-element row |
+| NVFP4-G16 | 288 B | groups of 16 elements, 4-bit |
+| K8V4 | 402 B | K fixed to FP8-row256, V fixed to NVFP4-G16 (closed asymmetric) |
 
-× 16 层 × 4 KV heads ⇒ 每 token 全模型：bf16 64 KiB、int8 33 KiB、fp8 32.25 KiB、
-nvfp4 18 KiB、k8v4 25.125 KiB。
+× 16 layers × 4 KV heads ⇒ whole model per token: bf16 64 KiB, int8 33 KiB, fp8 32.25 KiB,
+nvfp4 18 KiB, k8v4 25.125 KiB.
 
-## 3. 算子层（L0）
+## 3. Operator level (L0)
 
-`rel_rmse`（相对 BF16 输出的 RMS），固定长度 oracle（6 token）：
+`rel_rmse` (RMS relative to the BF16 output), fixed-length oracle (6 tokens):
 
-| 格式 | mae | rmse | **rel_rmse** | max_abs |
+| format | mae | rmse | **rel_rmse** | max_abs |
 |---|---|---|---|---|
 | int8-g64 | 0.000231766 | 0.000288207 | **0.00417072** | 0.00101571 |
 | fp8-e4m3fn-row256 | 0.00141165 | 0.00177748 | **0.0249171** | 0.00655441 |
 | nvfp4-g16 | 0.00536884 | 0.00664607 | **0.0957072** | 0.0218758 |
 | k8v4 | 0.0053744 | 0.00671739 | **0.0965646** | 0.0243407 |
 
-长度扫描（同一份 K/V 的前缀，长度 6 / 64 / 256 / 1024 / 4096 / 16384）：
+Length sweep (prefixes of the same K/V, lengths 6 / 64 / 256 / 1024 / 4096 / 16384):
 
-| 格式 | rel_rmse @ 6 → 16384 | 结论 |
+| format | rel_rmse @ 6 → 16384 | conclusion |
 |---|---|---|
-| int8-g64 | 0.00393 / 0.00408 / 0.00398 / 0.00413 / 0.00434 / 0.00395 | 平 |
-| fp8-e4m3fn-row256 | 0.02565 / 0.02639 / 0.02525 / 0.02595 / 0.02623 / 0.02380 | 平 |
-| nvfp4-g16 | 0.09771 / 0.09631 / 0.09186 / 0.09906 / 0.09930 / 0.09280 | 平 |
-| k8v4 | 0.09768 / 0.09630 / 0.09184 / 0.09904 / 0.09929 / 0.09277 | 平 |
+| int8-g64 | 0.00393 / 0.00408 / 0.00398 / 0.00413 / 0.00434 / 0.00395 | flat |
+| fp8-e4m3fn-row256 | 0.02565 / 0.02639 / 0.02525 / 0.02595 / 0.02623 / 0.02380 | flat |
+| nvfp4-g16 | 0.09771 / 0.09631 / 0.09186 / 0.09906 / 0.09930 / 0.09280 | flat |
+| k8v4 | 0.09768 / 0.09630 / 0.09184 / 0.09904 / 0.09929 / 0.09277 | flat |
 
-**相对误差与 KV 长度无关**；绝对误差（mae/rmse）随长度按 1/√N 下降，正好抵消参考幅度的下降。
+**The relative error is independent of KV length**; the absolute error (mae/rmse) falls as 1/√N with length,
+exactly canceling the fall in the reference magnitude.
 
-一个副产品：**V 的量化主导注意力输出误差。** nvfp4（K/V 都 4-bit）0.0957 vs k8v4（K 提到 fp8）
-0.0966——把 K 精度提高，误差没变。caveat 同上：fixture 是均匀随机 K。
+A by-product: **the quantization of V dominates the attention output error.** nvfp4 (both K and V 4-bit) 0.0957
+vs k8v4 (K promoted to fp8) 0.0966 — raising the K precision did not change the error. Same caveat as above: the
+fixture is uniform random K.
 
-## 4. 端到端困惑度（L1）
+## 4. End-to-end perplexity (L1)
 
-### 4.1 单卡 27B，`--quick`，261,223 scored tokens
+### 4.1 Single GPU 27B, `--quick`, 261,223 scored tokens
 
-`--context 4096 --stride 2048`（124 windows），baseline bf16 = 1.508191 / 4.518551：
+`--context 4096 --stride 2048` (124 windows), baseline bf16 = 1.508191 / 4.518551:
 
-| 格式 | mean_nll | Δnll | Δppl% | t (n=4 domain) |
+| format | mean_nll | Δnll | Δppl% | t (n=4 domain) |
 |---|---|---|---|---|
 | bf16 | 1.508191 | 0 | 0 | — |
 | int8-g64 | 1.510395 | +0.002204 | +0.221% | 1.25 |
@@ -106,9 +117,9 @@ nvfp4 18 KiB、k8v4 25.125 KiB。
 | nvfp4 | 1.505517 | −0.002675 | −0.267% | −0.49 |
 | k8v4 | 1.508828 | +0.000636 | +0.064% | 0.46 |
 
-`--context 16384 --stride 8192`（28 windows），baseline bf16 = 1.461332 / 4.311698：
+`--context 16384 --stride 8192` (28 windows), baseline bf16 = 1.461332 / 4.311698:
 
-| 格式 | mean_nll | Δnll | Δppl% | t (n=4 domain) |
+| format | mean_nll | Δnll | Δppl% | t (n=4 domain) |
 |---|---|---|---|---|
 | bf16 | 1.461332 | 0 | 0 | — |
 | int8-g64 | 1.461336 | **+0.000004** | **+0.0004%** | 0.01 |
@@ -116,16 +127,17 @@ nvfp4 18 KiB、k8v4 25.125 KiB。
 | nvfp4 | 1.463646 | **+0.002314** | **+0.232%** | **3.81** |
 | k8v4 | 1.461741 | +0.000409 | +0.041% | — |
 
-**4K 与 16K 的排序互相矛盾**，而且都与 L0 的精度排序反相关：4K 说 int8 最差（+0.221%）、
-nvfp4 最好（−0.267%，由 chinese_reference 单条流支配）；16K 说 int8 无损、nvfp4 与 fp8 最差。
-**4K 的排名是短上下文的假象**，16K 才与 codec 精度方向一致。这也说明语料平均的困惑度需要
-n≥4 的 domain 级 t 统计才有意义。
+**The 4K and 16K rankings contradict each other**, and both are anticorrelated with the L0 accuracy ordering: 4K
+says int8 is worst (+0.221%) and nvfp4 best (−0.267%, dominated by the single chinese_reference stream); 16K says
+int8 is lossless and nvfp4 and fp8 are worst.
+**The 4K ranking is an artifact of short context**; only 16K agrees with the direction of codec accuracy. This
+also shows that corpus-average perplexity needs domain-level t statistics with n≥4 to be meaningful.
 
-### 4.2 TP-2 vision artifact，`--quick`，261,223 scored tokens
+### 4.2 TP-2 vision artifact, `--quick`, 261,223 scored tokens
 
-`--context 65536 --stride 32768`，baseline bf16 = 1.413411 / 4.109949：
+`--context 65536 --stride 32768`, baseline bf16 = 1.413411 / 4.109949:
 
-| 格式 | mean_nll | Δnll | Δppl% |
+| format | mean_nll | Δnll | Δppl% |
 |---|---|---|---|
 | bf16 | 1.413411 | 0 | 0 |
 | int8-g64 | 1.413121 | −0.000290 | −0.029% |
@@ -133,19 +145,19 @@ n≥4 的 domain 级 t 统计才有意义。
 | k8v4 | 1.414427 | +0.001016 | +0.102% |
 | nvfp4 | 1.415843 | +0.002432 | +0.244% |
 
-这里 nvfp4 最差，与 L0 一致。
+Here nvfp4 is worst, consistent with L0.
 
-**注意 `--quick` 语料的每条流只有约 65,513 token**，所以 `--context` 取 65536、131072、262144
-得到**完全相同**的结果（实测 bf16 三档都是 1.413411，fp8 两档都是 1.413703）。也就是说
-"256K 上下文的困惑度"在这个语料上是空比较——KV 里从未超过 65K 个位置。要测长上下文必须换
-长语料（见 §5）。
+**Note that each stream in the `--quick` corpus is only about 65,513 tokens long**, so `--context` of 65536,
+131072, 262144 gives **exactly the same** result (measured: bf16 is 1.413411 at all three, fp8 is 1.413703 at
+both). In other words "perplexity at 256K context" is an empty comparison on this corpus — the KV never holds
+more than 65K positions. To measure long context you must switch to a long corpus (see §5).
 
-## 5. 逐 token NLL 深度曲线（L2）
+## 5. Per-token NLL depth curve (L2)
 
-一条 **257,438 scored token 的单流**（`--text`，`--context 262144 --stride 131072` ⇒ 1 个窗口），
-TP-2，逐 token NLL：
+A **single stream of 257,438 scored tokens** (`--text`, `--context 262144 --stride 131072` ⇒ 1 window), TP-2,
+per-token NLL:
 
-| 格式 | context | 窗口 | mean_nll | PPL | KV MiB/shard | tok/s |
+| format | context | windows | mean_nll | PPL | KV MiB/shard | tok/s |
 |---|---|---|---|---|---|---|
 | fp8-e4m3-r256 | 262144 | 1 | 2.029775 | 7.612376 | 4128.0 | 608.6 |
 | int8-g64 | 262144 | 1 | 2.030409 | 7.617202 | 4224.0 | 575.7 |
@@ -153,31 +165,34 @@ TP-2，逐 token NLL：
 | k8v4 | 262144 | 1 | 2.030734 | 7.619677 | 3216.0 | 610.3 |
 | bf16 | 131072 | 2 | — | — | 4096.0 | 755.9 |
 
-绝对 PPL 7.61 远高于 64K `--quick` 的 4.11，因为语料不同（单条 pg19+wikitext 混合流 vs
-4 条 `--quick` 流）——**只能做同流跨臂比较**。
+The absolute PPL of 7.61 is far above the 4.11 of the 64K `--quick`, because the corpus differs (a single mixed
+pg19+wikitext stream vs 4 `--quick` streams) — **only same-stream cross-arm comparisons are valid**.
 
-bf16 在 262,144 下 OOM，只能在 131072 下跑，且它的窗口 1（targets 131072..257437）只有
-126,366 token 历史，不可用于深度比较。**"bf16 在 131072 下测得的值可以当作 262144 运行的参考臂"
-这一点已单独验证**：fp8 在 `--context 131072` 与 `262144` 两次运行，targets 1..131,008 逐位
-相同，只有 131,009–131,071 这 63 个深度（窗口末尾的不完整 KV 页）不同，`max|delta| = 0.455872`、
-对 1–131,071 区间的平均 NLL 影响 **4.7e-6**。
+bf16 OOMs at 262,144 and can only run at 131072, and its window 1 (targets 131072..257437) has only 126,366 tokens
+of history, so it cannot be used for the depth comparison. **The claim that "the value measured for bf16 at 131072
+can serve as the reference arm for the 262144 runs" was verified separately**: with fp8 run at `--context 131072`
+and at `262144`, targets 1..131,008 are bit-identical, and only the 63 depths 131,009–131,071 (the incomplete KV
+page at the end of the window) differ, with `max|delta| = 0.455872`, affecting the mean NLL over 1–131,071 by
+**4.7e-6**.
 
-深度曲线的结论：**所有臂的 NLL 随可见历史深度单调下降**（历史越长越好预测），没有任何一臂
-出现随深度上升的拐点。逐 token NLL 数据本身没有入库（约 22 MB），曲线与分桶统计见
-`kv-depth-curve.html`。
+Conclusion from the depth curves: **the NLL of every arm falls monotonically with visible history depth** (longer
+history is more predictable), and no arm shows a knee where it rises with depth. The per-token NLL data itself is
+not committed (about 22 MB); the curves and bucketed statistics are in `kv-depth-curve.html`.
 
-## 6. 固定文本金标准配对（L3）
+## 6. Fixed-text gold-standard pairing (L3)
 
-设计：把被打分的文本钉死——目标块恒为源流最后 1024 个 token，第 K 次运行只暴露它前面 K 个
-token（K 取 13 档：0, 256, 1024, 4096, 16384, 32768, 65536, 98304, 130048, 163840, 196608,
-229376, 256415）。K ≥ 1 时目标块的紧邻前文每次都是同一段文字，**连拼接接缝都不存在**，唯一
-变量是历史能看到多远；同一横轴位置各条臂打的是同一个 token。已校验 13 条输入的末尾 3000 字符
-逐字节相同。
+Design: pin down the text being scored — the target block is always the last 1024 tokens of the source stream, and
+run K exposes only the K tokens preceding it (K takes 13 values: 0, 256, 1024, 4096, 16384, 32768, 65536, 98304,
+130048, 163840, 196608, 229376, 256415). For K ≥ 1 the immediate preceding text of the target block is the same
+passage every time, **so not even a concatenation seam exists**, and the only variable is how far back the history
+can see; at the same x-axis position every arm scores the same token. It has been verified that the last 3000
+characters of the 13 inputs are byte-identical.
 
-**问题一：同一段文本，历史越长，模型是变好还是变差？**
-把被打分的文本钉死之后，所有臂的 NLL 随可见历史的斜率都是**负的**（深区 ≥16384）：
+**Question one: for the same passage, does a longer history make the model better or worse?**
+Once the scored text is pinned down, the slope of NLL against visible history is **negative** for every arm (deep
+regime ≥16384):
 
-| 臂 | slope (nats/十倍程) | se | t |
+| arm | slope (nats/decade) | se | t |
 |---|---|---|---|
 | bf16 | −0.168795 | ±0.032161 | −5.25 |
 | int8-g64 | −0.109210 | ±0.021811 | −5.01 |
@@ -185,14 +200,16 @@ token（K 取 13 档：0, 256, 1024, 4096, 16384, 32768, 65536, 98304, 130048, 1
 | nvfp4-g16 | −0.119770 | ±0.023345 | −5.13 |
 | k8v4 | −0.116536 | ±0.022157 | −5.26 |
 
-相邻深度配对差里只有 6 个区间为正（历史变长后该文本略难），最大的 int8 也只有
-+0.0081 ± 0.0056（t=+1.46）。⇒ **"上下文越长模型越差"在本模型 + 本语料上不成立。** 把一条
-257K 自然流一次跑完看到的深层 PPL 升高，是**文本内容**造成的（越深的 token 越属于后面那本书），
-不是深度本身。
+Only 6 intervals among the adjacent-depth paired differences are positive (the text becomes slightly harder as
+history lengthens), and the largest, int8, is only +0.0081 ± 0.0056 (t=+1.46). ⇒ **"the longer the context the
+worse the model" does not hold for this model + this corpus.** The rise in deep PPL seen when running one 257K
+natural stream straight through is caused by **text content** (deeper tokens belong to the later book), not by
+depth itself.
 
-**问题二：KV 量化的代价会不会随上下文增长而放大？** 配对差值本身的斜率：
+**Question two: does the cost of KV quantization grow with context?** The slope of the paired differences
+themselves:
 
-| 对比 | slope (nats/十倍程) | se | t |
+| comparison | slope (nats/decade) | se | t |
 |---|---|---|---|
 | fp8 − bf16 | +0.005919 | ±0.007586 | +0.78 |
 | int8 − bf16 | −0.002955 | ±0.008596 | −0.34 |
@@ -202,138 +219,149 @@ token（K 取 13 档：0, 256, 1024, 4096, 16384, 32768, 65536, 98304, 130048, 1
 | nvfp4 − fp8 | +0.004786 | ±0.005693 | +0.84 |
 | k8v4 − fp8 | +0.004298 | ±0.004798 | +0.52 |
 
-这些斜率即使为正也只有 ~1e-3~1e-2 nats/十倍程，而绝对值本身在 1e-2 nats 量级。⇒ **量化代价
-基本是一个与上下文长度无关的常数。**
+Even when positive these slopes are only ~1e-3~1e-2 nats/decade, while the absolute differences themselves are on
+the order of 1e-2 nats. ⇒ **The quantization cost is essentially a constant independent of context length.**
 
-保留的混淆：历史**内容**随 K 变化（源流是 pg19 四本书顺序拼接，可见窗口跨过书边界时前文就
-换了另一本书）。所以相邻深度配对差同时混了"更多历史"与"不同历史"两个因素，逐点因果下不了，
-能下的是长期趋势。曲线在约 60,517 token 处有一次大台阶，那就是窗口第一次够到目标块所属那本
-书的开头。
+Remaining confound: the **content** of the history changes with K (the source stream is four pg19 books
+concatenated in order, and when the visible window crosses a book boundary the preceding text switches to another
+book). So the adjacent-depth paired difference mixes "more history" and "different history" at once, and
+point-wise causality cannot be established; what can be established is the long-term trend. The curve has one
+large step at about 60,517 tokens, which is where the window first reaches the beginning of the book that the
+target block belongs to.
 
-完整曲线、逐深度表与斜率表见 `goldstandard-paired.html`。
+The full curves, the per-depth table and the slope table are in `goldstandard-paired.html`.
 
-## 7. 长上下文检索精度（L4）
+## 7. Long-context retrieval accuracy (L4)
 
-两个探针，int8 与 nvfp4，贪心解码，`temperature 0`。请求体 = `[备忘录] + haystack[0:K] + [提问]`，
-K 从 16,384 递增到约 262,144，每条都是上一条的严格前缀延长。
+Two probes, int8 and nvfp4, greedy decoding, `temperature 0`. Request body = `[memo] + haystack[0:K] + [question]`,
+K increasing from 16,384 to about 262,144, each one a strictly prefixed extension of the previous.
 
-**软探针**：8 条 needle 钉在文档最前（= stock NIAH 网格里最难、最敏感的 0% 深度档），
-要求逐行给出 `City = Code`。
+**Soft probe**: 8 needles pinned at the very front of the document (= the hardest, most sensitive 0% depth tier in
+the stock NIAH grid), requiring `City = Code` line by line.
 
-| 语料 | int8-g64 | nvfp4-g16 |
+| corpus | int8-g64 | nvfp4-g16 |
 |---|---|---|
-| `PaulGraham_Essays`（英文） | 88/88 | 88/88 |
-| `Journey_to_the_West`（中文） | 88/88 | 88/88 |
+| `PaulGraham_Essays` (English) | 88/88 | 88/88 |
+| `Journey_to_the_West` (Chinese) | 88/88 | 88/88 |
 
-11 个长度点（16,396 → 261,912）**每一格都是满分**。
+All 11 length points (16,396 → 261,912) **score full marks in every cell**.
 
-**难点探针**：32 条 needle + 32 字符随机 access token 逐字复现（难点全在共享 preamble 里，
-零额外 prefill 成本）。
+**Hard probe**: 32 needles + a 32-character random access token reproduced verbatim (all the difficulty lives in
+the shared preamble, at zero extra prefill cost).
 
-| 长度 | int8 城市码 | nvfp4 城市码 | int8 字符 | nvfp4 字符 |
+| length | int8 city code | nvfp4 city code | int8 chars | nvfp4 chars |
 |---|---|---|---|---|
 | 16,396 → 249,868 | 32/32 | 32/32 | 32/32 | 32/32 |
 | 261,712 | 32/32 | 32/32 | 32/32 | 32/32 |
 
-**结果完全饱和，零分辨率。** 唯一一次"失败"是测量伪影：prompt 261,912 时 `max_context` 是
-**「prompt + 输出」的总预算**，只剩 232 token，而完整答案需要 352 个输出 token，模型在数字
-中间被硬切（`...Kyoto = 17850\nLagos = 3`）。把该点挪到 261,712（余 432）后恢复 32/32。
-**这是本次顺带挖出的实操约束：上下文开到 260K 时几乎没有空间留给输出。**
+**The result is completely saturated, zero resolution.** The only "failure" is a measurement artifact: at prompt
+261,912 the `max_context` is the **total budget of "prompt + output"**, leaving only 232 tokens, while the complete
+answer needs 352 output tokens, so the model was hard-cut in the middle of a number (`...Kyoto = 17850\nLagos = 3`).
+Moving that point to 261,712 (432 left) restored 32/32.
+**This is an operational constraint discovered along the way: with the context opened to 260K there is almost no
+room left for output.**
 
-更早的自建探针（122,277 token，64 needle）在五种格式上**逐字节相同**，也确认了 TP-2 路径本身
-逐位可复现（同进程重发、新进程重跑都与冷启动一致）。
+The earlier in-house probe (122,277 tokens, 64 needles) was **byte-identical** across five formats, which also
+confirms that the TP-2 path itself is bit-reproducible (re-sending in the same process and re-running in a new
+process both agree with a cold start).
 
-⇒ 正确表述是「≤262K、int8/nvfp4 下无灾难性解码分歧」，**不是**「KV 量化无影响」。检索类任务
-的 logit 余量太大，把注意力输出扰动 9.6% 也翻不动 argmax。
+⇒ The correct statement is "≤262K, no catastrophic decoding divergence under int8/nvfp4", **not** "KV
+quantization has no effect". Retrieval-style tasks have too much logit margin for a 9.6% perturbation of the
+attention output to flip the argmax.
 
-曲线见 `niah-probe.html`。
+Curves are in `niah-probe.html`.
 
-## 8. 显存与容量（TP-2，vision artifact）
+## 8. VRAM and capacity (TP-2, vision artifact)
 
-`--devices 0,1 --max-context 262144 --kv-capacity auto`，每 shard 权重+ctx 固定 10894.6 MiB，
-卡总容量 16310.6 MiB：
+`--devices 0,1 --max-context 262144 --kv-capacity auto`, each shard has weights+ctx fixed at 10894.6 MiB, total
+card capacity 16310.6 MiB:
 
 | kv-dtype | KV MiB/shard | free MiB/shard | KiB/token/shard | 262,144 |
 |---|---|---|---|---|
-| bf16 | 需 8192 | — | 32.0 | **✗ OOM** |
+| bf16 | needs 8192 | — | 32.0 | **✗ OOM** |
 | int8 | 4224.0 | 924.0 | 16.5 | ✓ |
 | fp8 | 4128.0 | 1020.0 | 16.125 | ✓ |
 | nvfp4 | 2304.0 | 2844.0 | 9.0 | ✓ |
 | k8v4 | 3216.0 | 1932.0 | 12.5625 | ✓ |
 
-bf16 上限二分：131072 → KV 4096.0、free 1052；163840 → KV 5120.0、**free 仅 28**；262144 → OOM
-（`cudaMalloc failed: cudaErrorMemoryAllocation`）。⇒ **bf16 KV 天花板约 163,840 token。**
+bf16 ceiling by bisection: 131072 → KV 4096.0, free 1052; 163840 → KV 5120.0, **free only 28**; 262144 → OOM
+(`cudaMalloc failed: cudaErrorMemoryAllocation`). ⇒ **The bf16 KV ceiling is about 163,840 tokens.**
 
-`int8` 比 `fp8` 多占 96 MiB/shard（+2.3%）——这是"最准的量化档"的全部代价。
+`int8` uses 96 MiB/shard more than `fp8` (+2.3%) — that is the entire cost of "the most accurate quantization
+tier".
 
-## 9. 已知限制
+## 9. Known limitations
 
-1. **困惑度和检索对 4-bit 的失效模式不敏感。** nvfp4 把注意力输出扰动 9.57%，PPL 只掉 0.24%。
-   如果下游任务依赖的是稀有高影响 token（长链推理、精确数值、代码标识符），上面的保证不成立
-   ——这些负载没有测。
-2. **没有 open-ended 生成的评测。** 全部是 teacher-forced NLL 或贪心检索。
-3. **只在一个模型族上测过**，而且两个 artifact 都是 `W4A4-W8A8` 或 IQ3_S，**权重本来就重度
-   量化了**。bf16 权重的模型未必有同样的容忍度。
-4. **L0 的 fixture 用均匀随机 K**，softmax 近似均匀，是"误差最容易被平均掉"的区间。真实长
-   上下文 logits 更尖，L0 的结论不能直接外推。
-5. **L1 的语料只有约 65K token/流**，所以 `--context` 取 64K 以上得到相同结果。
-6. **L3 的历史内容随深度变化**（见 §6 末）。
+1. **Perplexity and retrieval are insensitive to the 4-bit failure mode.** nvfp4 perturbs the attention output by
+   9.57% while PPL drops only 0.24%. If the downstream task depends on rare high-impact tokens (long-chain
+   reasoning, exact numerics, code identifiers), the guarantees above do not hold — those workloads were not
+   measured.
+2. **No open-ended generation evaluation.** Everything is teacher-forced NLL or greedy retrieval.
+3. **Measured on only one model family**, and both artifacts are `W4A4-W8A8` or IQ3_S, so **the weights are
+   already heavily quantized**. Models with bf16 weights may not have the same tolerance.
+4. **L0's fixture uses uniform random K**, so softmax is nearly uniform, the regime where "the error is most
+   easily averaged away". Real long-context logits are sharper, and L0's conclusion cannot be extrapolated
+   directly.
+5. **L1's corpus is only about 65K tokens per stream**, so `--context` of 64K or above gives identical results.
+6. **L3's history content varies with depth** (see the end of §6).
 
-要补的、按性价比排：
+What to add, ordered by value for money:
 
-| 想补的 | 成本 | 价值 |
+| what to add | cost | value |
 |---|---|---|
-| L0 长度推到 262,144 | ~1 h 改常量与内存 + 分钟级运行 | 现在只到 16,384 |
-| L1/L2 统计功效 0.5% → 0.1% PPL | 2.5–3 h GPU（4 条独立长流 × 5 臂） | 唯一能把"没测出"变成"测出上界"的路 |
-| L0 改用真实长上下文的 K/V | 2–3 h 开发 | 补掉限制 4，是 L0 最大的软肋 |
-| bf16 参考臂到 262K | 不可能 | OOM |
+| push L0 length to 262,144 | ~1 h changing constants and memory + minutes to run | currently only reaches 16,384 |
+| L1/L2 statistical power 0.5% → 0.1% PPL | 2.5–3 h GPU (4 independent long streams × 5 arms) | the only way to turn "not detected" into a "detected upper bound" |
+| switch L0 to real long-context K/V | 2–3 h of development | closes limitation 4, L0's biggest weakness |
+| bf16 reference arm out to 262K | impossible | OOM |
 
-## 10. 复现方式
+## 10. How to reproduce
 
 ```bash
-# L0 算子层长度扫描（4 种格式 × 6 个长度）
+# L0 operator-level length sweep (4 formats × 6 lengths)
 ./build/tests/ninfer_softmax_attention_test --quant-sweep
 
-# L1 端到端困惑度，逐臂
+# L1 end-to-end perplexity, arm by arm
 ./build/apps/ninfer-perplexity <model>.ninfer \
   --corpus eval/corpora/perplexity-1m/manifest.json --quick \
   --context 16384 --stride 8192 --kv-dtype int8
 
-# L2 逐 token NLL（--context >= 流长 ⇒ 单窗口，target_index 即历史深度）
+# L2 per-token NLL (--context >= stream length ⇒ single window, target_index is the history depth)
 ./build/apps/ninfer-perplexity <model>.ninfer \
   --text long_document.txt --context 262144 --stride 131072 \
   --devices 0,1 --kv-dtype int8 --dump-token-nll --output <dir>
 
-# L4 前缀链检索探针（tools/）
+# L4 prefix-chain retrieval probe (tools/)
 python tools/niah_chain_sweep.py --port 18080 --arm int8 \
   --out data/niah_chain_int8.json
 python tools/niah_hard_chain.py --port 18080 --arm int8 \
   --out data/niah_chain_hard_int8.json
 python tools/niah_probe_report.py
 
-# L2/L3 曲线与金标准报告（tools/，读取 _temp/ 下的扫描产物）
+# L2/L3 curves and the gold-standard report (tools/, reads the sweep products under _temp/)
 python tools/build_tail_streams.py
 python tools/goldstandard_report.py
 python tools/kv_depth_report.py
 ```
 
-两个 `niah_*_chain_*.py` 需要 evalscope NIAH 数据集的 haystack 文本（`--corpus-dir`，本仓库不
-vendor 这两份文本）；`goldstandard_report.py` / `kv_depth_report.py` 读取 `_temp/` 下约 100 MB 的
-逐 token NLL 转储，那些转储未入库，所以这两个脚本要先重跑扫描才能用。三份 HTML 报告本身已入库。
+The two `niah_*_chain_*.py` scripts need the haystack text of the evalscope NIAH dataset (`--corpus-dir`; this
+repository does not vendor those two texts); `goldstandard_report.py` / `kv_depth_report.py` read the ~100 MB
+per-token NLL dumps under `_temp/`, and those dumps are not committed, so these two scripts require re-running the
+sweep first. The three HTML reports themselves are committed.
 
-NIAH 的 evalscope 配置见 `eval/configs/qwen3_8_27b_needle_haystack.yaml`。
+The evalscope configuration for NIAH is in `eval/configs/qwen3_8_27b_needle_haystack.yaml`.
 
-## 11. 顺带完成的引擎改动
+## 11. Incidental engine changes
 
-`ninfer-perplexity` 原本只有单 `--device`，装不下单卡的 artifact 无法评测。本次给引擎加了
-TP-2 评分路径（`TP2GenerationCore::score`，与单 device 的 `Program::causal_score` 同一对外合同），
-并给 `ninfer-perplexity` 加了 `--devices A,B` 与 `--dump-token-nll`。A/B 对拍
-（`tests/models/qwen3_5/test_engine_score_tp2_ab.cpp`，1537 token 重复段落）：
-`delta mean_nll = 0.000402097`，`max|logprob delta| = 0.329137`，容差 5e-3。
+`ninfer-perplexity` originally had only a single `--device`, so artifacts that do not fit on one GPU could not be
+evaluated. This work added a TP-2 scoring path to the engine (`TP2GenerationCore::score`, the same public contract
+as the single-device `Program::causal_score`) and added `--devices A,B` and `--dump-token-nll` to
+`ninfer-perplexity`. A/B cross-check (`tests/models/qwen3_5/test_engine_score_tp2_ab.cpp`, 1537-token repeated
+passage): `delta mean_nll = 0.000402097`, `max|logprob delta| = 0.329137`, tolerance 5e-3.
 
-**两条评分路线不是逐位一致的**：TP-2 的 head 把词表切到两块卡上，每个 logit 是两个半 K 部分和
-的和。同一 artifact、同一 KV 格式、`bf16`、`--quick`、`--context 4096`：单 device 1.508191 /
-4.518551，双 device 1.506711 / 4.511865，差约 1.5e-3 —— **与 KV 格式效应同量级**。所以 KV 格式
-只在同一路线内比较，跨路线那个量级的差要归给路线而不是格式。
+**The two scoring routes are not bit-identical**: the TP-2 head splits the vocabulary across two GPUs, and each
+logit is the sum of two half-K partial sums. Same artifact, same KV format, `bf16`, `--quick`, `--context 4096`:
+single device 1.508191 / 4.518551, dual device 1.506711 / 4.511865, a difference of about 1.5e-3 — **the same
+order as the KV format effect**. So KV formats should only be compared within one route; a difference of that
+order across routes must be attributed to the route, not the format.
 
-细节见 `docs/perplexity.md` 与 `docs/maintainer/engine-architecture.md`。
+Details in `docs/perplexity.md` and `docs/maintainer/engine-architecture.md`.

@@ -1,37 +1,37 @@
-# TP-2 上下文档位曲线(prefill / decode,MTP0)
+# TP-2 context-length curve (prefill / decode, MTP0)
 
-本地测量,2026-09-20。同目录数据:`mtp0.json`(全部记录)、`mtp0_summary.csv`(汇总)。
+Local measurement, 2026-09-20. Data in the same directory: `mtp0.json` (all records), `mtp0_summary.csv` (summary).
 
-## 运行环境与配方
+## Environment and recipe
 
-| 项 | 值 |
+| item | value |
 |---|---|
-| 硬件 | 2x NVIDIA GeForce RTX 5060 Ti 16 GiB(TP-2,engine `--devices 0,1`) |
-| artifact | `D:/LLM/qwen3_8_27b_w4a4_w8a8.ninfer`(Qwen3.8-27B,w4a4 + w8a8) |
-| KV | fp8,capacity 204,800 token |
-| 投机解码 | 关闭(MTP0,未传 `--spec`) |
-| 视觉塔 | 关闭(未传 `--vision`,纯文本曲线) |
-| 前缀复用 | `--no-prefix-reuse`(日志 `context cache | root only`) |
-| 服务命令 | `ninfer-serve.exe <artifact> --devices 0,1 --max-context 204800 --port 3457 --host 127.0.0.1 --kv-dtype fp8 --log-level info --no-prefix-reuse` |
-| 驱动命令 | `pwsh -File tools/win_port/context_curve.ps1 -BaseUrl http://127.0.0.1:3457/v1 -Label tp2-mtp0 -OutFile profiles/bench/tp2_context_curve/mtp0.json -Sizes '128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,196608' -Repetitions 3 -DecodeTokens 256` |
+| hardware | 2x NVIDIA GeForce RTX 5060 Ti 16 GiB (TP-2, engine `--devices 0,1`) |
+| artifact | `<models-dir>/qwen3_8_27b_w4a4_w8a8.ninfer` (Qwen3.8-27B, w4a4 + w8a8) |
+| KV | fp8, capacity 204,800 tokens |
+| speculative decoding | off (MTP0, no `--spec` passed) |
+| vision tower | off (no `--vision` passed, text-only curve) |
+| prefix reuse | `--no-prefix-reuse` (log `context cache | root only`) |
+| serve command | `ninfer-serve.exe <artifact> --devices 0,1 --max-context 204800 --port 3457 --host 127.0.0.1 --kv-dtype fp8 --log-level info --no-prefix-reuse` |
+| driver command | `pwsh -File tools/win_port/context_curve.ps1 -BaseUrl http://127.0.0.1:3457/v1 -Label tp2-mtp0 -OutFile profiles/bench/tp2_context_curve/mtp0.json -Sizes '128,256,512,1024,2048,4096,8192,16384,32768,65536,131072,196608' -Repetitions 3 -DecodeTokens 256` |
 
-engine ready 29.7 s;加载后每卡空闲 1184 MiB(capacity 204,800、无 vision、无 host checkpoint 环)。
+engine ready 29.7 s; after loading, 1184 MiB idle per GPU (capacity 204,800, no vision, no host checkpoint ring).
 
-## 方法
+## Method
 
-单请求法(同 `docs/performance/methodology.md`):每个档位一次 chat 请求同时给出两个相位,数字全部取自响应的 `timings` 块。
+Single-request method (same as `docs/performance/methodology.md`): one chat request per size yields both phases at once, and every number is taken from the `timings` block of the response.
 
-- prefill = `prompt_n / prompt_ms`;`prompt_ms` 是 prefill 墙钟区间(tokenize/prepare 单独计,不含在内)。
-- decode = `(predicted_n - 1) / predicted_ms`;解码预算 256 token,36 次请求全部以 `length` 打满。
-- 横轴 = `usage.prompt_tokens`(真实上下文 token 数)。
-- 每个请求带唯一 system/user nonce 以打断前缀复用。
+- prefill = `prompt_n / prompt_ms`; `prompt_ms` is the prefill wall-clock interval (tokenize/prepare is accounted separately and not included).
+- decode = `(predicted_n - 1) / predicted_ms`; the decode budget is 256 tokens and all 36 requests ran to the `length` limit.
+- x-axis = `usage.prompt_tokens` (the real context token count).
+- Each request carries a unique system/user nonce to break prefix reuse.
 
-**缓存口径**:`root only` 缓存仍可能命中 Qwen 模板前导的约 49 个 token(与内容无关),
-所以 prefill 只统计 `cache_n == 0` 的记录(≥8,193 全部 3 次无缓存;≤4,093 每档 1 次无缓存);
-decode 不受缓存影响,按全部 3 次重复统计。带缓存记录的 prefill 速率平均高 1-10%(小档位最明显),
-全部记录都保留在 `mtp0.json`。
+**Cache accounting**: a `root only` cache can still hit about 49 tokens of the Qwen template preamble (independent of content),
+so prefill counts only records with `cache_n == 0` (≥8,193 all have 3 cache-free runs; ≤4,093 has 1 cache-free run per size);
+decode is unaffected by caching and is counted over all 3 repetitions. Records with caching have prefill rates 1-10% higher on average (most visible at small sizes),
+and all records are kept in `mtp0.json`.
 
-## 结果
+## Results
 
 | context tokens | prefill tok/s | sd | reps | decode tok/s | sd | reps | decode ms/token | prefill wall (s) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -48,18 +48,18 @@ decode 不受缓存影响,按全部 3 次重复统计。带缓存记录的 prefi
 | 131,068 | 1117.9 ± 0.2 | 3 | 26.65 ± 0.01 | 3 | 37.52 | 117.24 |
 | 196,618 | 951.4 ± 0.2 | 3 | 24.98 ± 0.02 | 3 | 40.03 | 206.65 |
 
-## 观察
+## Observations
 
-- **prefill**:4K-8K 是平台(1649 tok/s);之后随上下文单调下降,200K 为 951 tok/s,
-  相对平台下降 42%。33K 以上基本是接近线性的慢降,没有台阶
-  (TP-2 chunked prefill 步长固定 1024)。
-- **decode**:1K 为 31.09 tok/s,200K 为 24.98 tok/s,相对下降 20%;
-  每 token 延迟从 32.17 ms 升到 40.03 ms。KV 读取随上下文线性增长是主因。
-- **小档位由固定开销主导**:118 token 只有 860 tok/s,到 4K 才接近平台;decode 在 <2K 区间几乎不变。
-- **稳定性**:≥8K 的逐次重复 sd ≤ 0.2%(prefill)、≤ 0.1%(decode);小档位的 sd 来自固定开销,不是热噪声。
+- **prefill**: 4K-8K is the plateau (1649 tok/s); after that it decreases monotonically with context, reaching 951 tok/s at 200K,
+  a 42% drop from the plateau. Above 33K it is essentially a near-linear slow decline with no steps
+  (TP-2 chunked prefill uses a fixed step of 1024).
+- **decode**: 31.09 tok/s at 1K and 24.98 tok/s at 200K, a 20% relative drop;
+  per-token latency rises from 32.17 ms to 40.03 ms. Linear growth of KV reads with context is the main cause.
+- **small sizes are dominated by fixed overhead**: 118 tokens give only 860 tok/s, and the plateau is only approached at 4K; decode is nearly flat below 2K.
+- **stability**: at ≥8K the run-to-run sd is ≤ 0.2% (prefill) and ≤ 0.1% (decode); the sd at small sizes comes from fixed overhead, not thermal noise.
 
-## 局限
+## Limitations
 
-- 仅 C=1 单请求;并发下的 prefill/decode 是另一条曲线。
-- MTP0(无投机);MTP3/DFlash 的 decode 曲线需另跑。
-- 未开视觉塔,多模态 prefill 未覆盖。
+- C=1 single requests only; prefill/decode under concurrency is a separate curve.
+- MTP0 (no speculation); the MTP3/DFlash decode curves need a separate run.
+- The vision tower was off, so multimodal prefill is not covered.

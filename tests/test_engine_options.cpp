@@ -51,7 +51,7 @@ int main() {
                           "TP-2 route dropped the host KV arena its retention needs");
     }
     {
-        // The MTP and DFlash2 rounds both carry a batch (docs/PLAN-tp2-concurrency.md P2.1b/P2.1c): their
+        // The MTP and DFlash2 rounds both carry a batch (tp2-plan-concurrency.md P2.1b/P2.1c): their
         // TP-2 routes keep their lanes, clamped to the core's ceiling, while `--spec dflash` - the
         // masked draft with no batched TP-2 round - collapses to one lane rather than failing
         // startup.

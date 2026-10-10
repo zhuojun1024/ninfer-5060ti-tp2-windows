@@ -1,4 +1,4 @@
-// Single-instance determinism acceptance for the TP-2 DFlash2 route (PLAN.md section 3.6).
+// Single-instance determinism acceptance for the TP-2 DFlash2 route (tp2-plan.md section 3.6).
 //
 // The route's clamped verify windows once let their duplicated columns race the position owner's KV
 // slot and flipped a near tie about one run in four. This case builds ONE Engine, replays a request

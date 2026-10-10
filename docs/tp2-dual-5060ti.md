@@ -3,7 +3,8 @@
 This note records the tensor-parallel-2 (TP-2) adaptation of this engine for two RTX 5060 Ti
 (16 GiB) cards running `Qwen3.8-27B` NVFP4. Numbers were measured on this machine with
 `ninfer-serve` on `--devices 0,1`, greedy sampling. The serving numbers below are single-request
-unless a concurrency is named. The routines live in `tools/tp_bootstrap/`.
+unless a concurrency is named. The retained measurement routines live in
+[`tools/tp_bootstrap/`](../tools/tp_bootstrap/README.md).
 
 ## Recommended configuration
 
@@ -93,7 +94,7 @@ numbers above.
 
 Its own tensor-parallel implementation — graph-level sharding, the allreduce transports, and why
 neither `-sm row` nor NCCL applies on this host — is analysed source by source in
-[llama.cpp TP notes](tp2-dual-5060ti-llamacpp-notes.md).
+[llama.cpp TP notes](maintainer/tp2-llamacpp-notes.md).
 
 The reference engine on this machine is a tuned llama.cpp build (`C:\llama_ar3-opt`, source branch
 `ar3-opt` at `C:\llama.cpp`), so both engines were measured back to back on the same two cards with
@@ -731,7 +732,7 @@ comparison meaningful; the served configuration samples (`0.7 / 20 / 0.80`).
 
 ## Work log
 
-[TP-2 adaptation work log](tp2-dual-5060ti-worklog.md) is the chronological round-by-round record:
+[TP-2 adaptation work log](maintainer/tp2-adaptation-worklog.md) is the chronological round-by-round record:
 design decisions, failed attempts, and the evidence behind the measurements above. It is a
 historical log, not an active reference; the current state and the open item are as described in
 this note.

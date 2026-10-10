@@ -622,8 +622,8 @@ def main():
                                    f"{sample[0][0]:,}", _fmt(sample[-1][3], 4), f"{sample[-1][0]:,}"))
 
     doc = """<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8">
-<title>KV cache 量化误差 vs 上下文深度</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>KV cache quantization error vs context depth</title>
 <style>
 :root {{ color-scheme: light; }}
 body {{ margin:0; padding:32px 40px 80px; background:#f7f8fa; color:#16181d;
@@ -665,81 +665,81 @@ td.bad {{ background:#fef2f2; font-weight:600; }}
 code {{ background:#f2f4f8; padding:1px 5px; border-radius:4px; font-size:12.5px; }}
 </style></head><body>
 
-<h1>KV cache 量化误差是否随上下文深度放大</h1>
-<p class="sub">模型 <code>{model}</code> · TP-2 (<code>--devices 0,1</code>) · 单条 {tokens} token 流
-· 逐 token NLL · 参考臂 <code>{ref}</code>（深度 1&ndash;{refmax}）</p>
+<h1>Does the KV cache quantization error grow with context depth</h1>
+<p class="sub">model <code>{model}</code> · TP-2 (<code>--devices 0,1</code>) · a single {tokens}-token stream
+· per-token NLL · reference arm <code>{ref}</code> (depths 1&ndash;{refmax})</p>
 
 <div class="card">
-<h3 style="margin-top:0">结论</h3>
-<p style="margin:6px 0 2px"><b>误差随深度增长的斜率</b>（深度每十倍程的 &Delta;NLL 变化，按桶内 token 数加权的
-最小二乘拟合；t 值接近 0 就表示"不随深度增长"）：</p>
+<h3 style="margin-top:0">Conclusions</h3>
+<p style="margin:6px 0 2px"><b>Slope of the error against depth</b> (&Delta;NLL change per decade of depth, from a
+least-squares fit weighted by the token count in each bucket; a t value near 0 means "does not grow with depth"):</p>
 <ul>{trend}</ul>
-<p style="margin:14px 0 2px">低深度桶与高深度桶的平均值对比：</p>
+<p style="margin:14px 0 2px">Low-depth buckets vs high-depth buckets:</p>
 <ul>{verdict}</ul>
 <p style="margin:12px 0 0">{l0note}</p>
 </div>
 
-<h2>1. 算子层（L0 oracle）：量化误差与 KV 长度无关</h2>
-<p>同一份 K/V，分别以目标格式与 bf16 存进 paged KV，用 FP64 理想注意力比较输出。
-<code>rel_rmse</code> 是相对参考输出的 RMS；<code>rmse</code> 是绝对误差。</p>
+<h2>1. Operator level (L0 oracle): the quantization error is independent of KV length</h2>
+<p>The same K/V is stored into the paged KV in the target format and in bf16, and the outputs are compared with an FP64 ideal attention.
+<code>rel_rmse</code> is the RMS relative to the reference output; <code>rmse</code> is the absolute error.</p>
 <div class="card">{l0rel}</div>
 <div class="card">{l0abs}</div>
-<p><b>读法：</b>相对误差（上图）在长度 6 &rarr; 16,384 上几乎是一条水平线，说明"KV 里存的 token 越多，
-单次注意力的相对失真并不变大"。绝对误差（下图）随长度按 1/&radic;N 下降——因为 softmax 输出的幅度
-本身也在按 1/&radic;N 收缩（更多项参与平均）。</p>
-<p><b>为什么 nvfp4 与 k8v4 两条曲线重合？</b>不是漏测——两者在这份 fixture 上的最大差只有
-<b>3.2e-5</b>（相对 0.03%），画在 0.09 量程的图上完全叠在一起。原因在存储格式本身：
-<code>k8v4</code> = K 用 FP8-row256 + V 用 <b>NVFP4-G16</b>，<code>nvfp4</code> = K 用 NVFP4 + V 用
-<b>NVFP4-G16</b>，即两者的 <b>V 编解码器完全相同</b>，只有 K 不同。而这份 fixture 的 K/V 是均匀随机数
-&rArr; 注意力 logits 很小、softmax 接近均匀 &rArr; 输出近似 V 的平均 &rArr; 误差由 V 主导，K 的编解码器
-几乎不起作用。真实长上下文的 logits 更尖，K 的影响会更大，所以这张图是"最有利区间"的下界。</p>
+<p><b>Reading it:</b> the relative error (top chart) is almost a flat line from length 6 &rarr; 16,384, meaning "the more tokens are stored in the KV,
+the relative distortion of a single attention does not grow". The absolute error (bottom chart) falls as 1/&radic;N with length — because the magnitude of the softmax output
+itself shrinks as 1/&radic;N too (more terms take part in the average).</p>
+<p><b>Why do the nvfp4 and k8v4 curves coincide?</b> Not an omitted measurement — on this fixture the two differ by at most
+<b>3.2e-5</b> (0.03% relative), so on a chart with a 0.09 range they overlap completely. The reason is the storage format itself:
+<code>k8v4</code> = K in FP8-row256 + V in <b>NVFP4-G16</b>, <code>nvfp4</code> = K in NVFP4 + V in
+<b>NVFP4-G16</b>, i.e. the two have <b>identical V codecs</b> and differ only in K. And this fixture's K/V are uniform random numbers
+&rArr; the attention logits are small and softmax is nearly uniform &rArr; the output is approximately the mean of V &rArr; the error is dominated by V and K's codec
+barely matters. Real long-context logits are sharper and K matters more, so this chart is the lower bound of the "most favourable regime".</p>
 
-<h2>2. 端到端：PPL 随深度</h2>
-<p>同一条流，同一 token 集合，每个臂从空 KV 开始跑 <code>--context 262144</code>（bf16 因显存只能到
-<code>--context 131072</code>）。曲线是累积量：
-<code>PPL(p) = exp( (1/p) &sum;<sub>q&le;p</sub> NLL(q) )</code>。</p>
+<h2>2. End to end: PPL vs depth</h2>
+<p>The same stream, the same token set, each arm run from an empty KV with <code>--context 262144</code> (bf16 can only reach
+<code>--context 131072</code> because of VRAM). The curve is cumulative:
+<code>PPL(p) = exp( (1/p) &sum;<sub>q&le;p</sub> NLL(q) )</code>.</p>
 <div class="card">{ppl}</div>
 <div class="card">{table}</div>
-<p>若干整数深度上的读数（每格上排是相对参考臂的 &Delta;PPL%，下排是 &Delta;NLL；参考臂本身给出绝对 PPL）。
-深度 &le; {refmax} 时参考臂是 bf16，更深处改用 fp8。</p>
+<p>Readings at a few round depths (the upper line in each cell is &Delta;PPL% relative to the reference arm, the lower line is &Delta;NLL; the reference arm itself gives the absolute PPL).
+For depth &le; {refmax} the reference arm is bf16; deeper than that it switches to fp8.</p>
 <div class="card">{checkpoint}</div>
 
-<h2>3. 相对 PPL 差距随深度 &mdash; 关键图</h2>
-<p>把每个臂的累积 PPL 除以参考臂的累积 PPL。<b>如果 KV 量化在长上下文下会"放大"，这条线应当随深度持续上升；
-如果量化只是带来一个固定的代价，这条线就是水平的。</b>左图用 bf16 作参考（1&ndash;{refmax}），
-右图用 fp8 作参考（1&ndash;{widemax}，因为 bf16 到不了 262K）。</p>
+<h2>3. Relative PPL gap vs depth &mdash; the key chart</h2>
+<p>Divide the cumulative PPL of each arm by the cumulative PPL of the reference arm. <b>If KV quantization were to "amplify" at long context, this line should keep rising with depth;
+if quantization only brings a fixed cost, this line is horizontal.</b> The left chart uses bf16 as reference (1&ndash;{refmax}),
+the right chart uses fp8 as reference (1&ndash;{widemax}, because bf16 cannot reach 262K).</p>
 <div class="card">{rel}</div>
 <div class="card">{relwide}</div>
 
-<h2>4. 累积 &Delta;NLL 随深度</h2>
-<p>与参考臂逐 token 相减再累积平均（绝对量，不是百分比）。<b>如果量化误差随上下文放大，这些曲线应当向右上倾斜。</b></p>
+<h2>4. Cumulative &Delta;NLL vs depth</h2>
+<p>Subtract the reference arm token by token, then take the cumulative mean (an absolute quantity, not a percentage). <b>If the quantization error grew with context, these curves should slope up to the right.</b></p>
 <div class="card">{delta}</div>
 
-<h2>5. 分段 &Delta;NLL（对数深度桶）</h2>
-<p>每个几何分桶内 <code>NLL(arm) - NLL(ref)</code> 的均值。误差棒是标准误；桶越宽样本越多，
-标准误越小。这张图能看出"惩罚是否随深度单调增长"，而不是被平均掩盖。</p>
+<h2>5. Bucketed &Delta;NLL (logarithmic depth buckets)</h2>
+<p>The mean of <code>NLL(arm) - NLL(ref)</code> inside each geometric bucket. The error bars are standard errors; the wider the bucket the more samples,
+the smaller the standard error. This chart reveals "whether the penalty grows monotonically with depth" instead of having it hidden by averaging.</p>
 <div class="card">{bucket}</div>
 <div class="card">{bucket_table}</div>
 
-<h2>6. 长深度区间（1&ndash;{widemax}）：量化臂之间互比</h2>
-<p>bf16 到不了 262K，所以在全深度区间改用 fp8 作参考，比较其余量化格式相对它的偏移。</p>
+<h2>6. Full depth range (1&ndash;{widemax}): quantized arms against each other</h2>
+<p>bf16 cannot reach 262K, so over the full depth range fp8 is used as the reference and the other quantized formats are compared by their offset from it.</p>
 <div class="card">{wide}</div>
 <div class="card">{wide_table}</div>
 
-<h2>7. 复现方式</h2>
+<h2>7. How to reproduce</h2>
 <pre class="kv">ninfer-perplexity &lt;model.ninfer&gt; --text _temp/20261008-0920_stream.txt \\
   --context 262144 --stride 131072 --devices 0,1 \\
   --kv-dtype &lt;bf16|int8|fp8|nvfp4|k8v4&gt; --dump-token-nll --output _temp/ppl_curve/&lt;arm&gt;
 
-ninfer_softmax_attention_test --quant-sweep        # L0 长度扫描</pre>
-<p>逐 token NLL 落在 <code>token_nll.&lt;stream&gt;.tsv</code>（<code>target_index&nbsp;nll</code>）；
-<code>target_index = t</code> 意味着该 token 由 <code>tokens[0,t)</code> 预测，历史深度恰好是 <code>t</code>。</p>
-<p><b>上下文无关性校验（bf16 参考臂是否可用）：</b>fp8 在 <code>--context 131072</code>（窗口 0 即全历史）
-与 <code>--context 262144</code> 各跑一次同一条流，深度 <b>1&ndash;131,008 逐位相同</b>；只有最后 63 个深度
-（131,009&ndash;131,071，即 131,072 窗口的最后一个不完整 KV 页）出现差异，最大单 token 差 0.456，
-对 1&ndash;131,071 区间平均 NLL 的影响为 <b>4.7e-6</b>、对最后一个深度桶均值的影響为 2.1e-5，
-远小于本报告要分辨的 1e-3&ndash;3e-3 量级信号。因此 bf16@131072 测得的深度 1&ndash;131,071 可以直接
-当作 262144 运行的参考臂。</p>
+ninfer_softmax_attention_test --quant-sweep        # L0 length sweep</pre>
+<p>The per-token NLL lands in <code>token_nll.&lt;stream&gt;.tsv</code> (<code>target_index&nbsp;nll</code>);
+<code>target_index = t</code> means that token is predicted from <code>tokens[0,t)</code>, so the history depth is exactly <code>t</code>.</p>
+<p><b>Context-independence check (is the bf16 reference arm usable):</b> fp8 run once at <code>--context 131072</code> (window 0 is the full history)
+and once at <code>--context 262144</code> on the same stream gives depths <b>1&ndash;131,008 bit-identical</b>; only the last 63 depths
+(131,009&ndash;131,071, i.e. the final incomplete KV page of the 131,072 window) differ, with a maximum single-token difference of 0.456,
+an effect of <b>4.7e-6</b> on the mean NLL over 1&ndash;131,071 and 2.1e-5 on the mean of the last depth bucket,
+far below the 1e-3&ndash;3e-3 signal this report needs to resolve. So the depths 1&ndash;131,071 measured by bf16@131072 can be used directly
+as the reference arm for the 262144 run.</p>
 
 </body></html>
 """.format(

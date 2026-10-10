@@ -240,7 +240,7 @@ private:
         // One KV execution row per lane (P1.2c). lanes == 1 reproduces the original single row,
         // which covers the whole pool and is published once at startup. On a multi-lane route the
         // pool is shared and handed out per request, so a lane's row is (re)published with the pages
-        // of whichever request currently holds that lane (S1 of docs/PLAN-tp2-kv-sharing.md).
+        // of whichever request currently holds that lane (S1 of tp2-plan-kv-sharing.md).
         // Cross-session retention is per lane as well (P2.3), so the export and import paths address
         // this lane's own handle list.
         std::vector<std::vector<DeviceKVPageLease>> kv_lane_pages;
@@ -405,7 +405,7 @@ private:
     [[nodiscard]] GenerationResult execute_walk(Request& request, OutputSink* sink,
                                                 const CancellationView& cancellation);
 
-    // Multi-lane admission (docs/PLAN-tp2-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
+    // Multi-lane admission (tp2-plan-concurrency.md P1.4). Only reachable when lanes_ > 1, which the
     // constructor keeps for every backend but DFlash v1 (that one collapses to one lane). A submission
     // never touches the device itself: it appends a PendingRequest to the FIFO and waits for the
     // core's own driver thread to retire it. The driver forms batches of at most lanes_ from the
@@ -446,7 +446,7 @@ private:
     // The executors call this while the driver holds `execution_mutex_`, which is the order
     // execution_mutex_ -> lane_queue_mutex_ the rest of the core keeps.
     std::shared_ptr<PendingRequest> try_pop_lane_queue();
-    // S1 (docs/PLAN-tp2-kv-sharing.md): the shared-pool allocation path. A multi-lane request
+    // S1 (tp2-plan-kv-sharing.md): the shared-pool allocation path. A multi-lane request
     // reserves exactly the pages its own prompt plus output budget need, on both shards and on
     // shard 0's MTP cache when that route is live, and publishes them into its lane's execution row.
     // The reservation is all-or-nothing and happens before the request is admitted, so a pool that
@@ -980,7 +980,7 @@ private:
     // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
     enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
 
-    // Per-lane retention state (docs/PLAN-tp2-concurrency.md P2.3). The single-lane walk drives slot 0;
+    // Per-lane retention state (tp2-plan-concurrency.md P2.3). The single-lane walk drives slot 0;
     // the batched executors drive one slot per active lane. Everything a lane needs in order to know
     // what prefix it may reuse lives here, because a lane's device state is its own slot in the
     // shared pools and two lanes must never share a cached lineage.
@@ -1062,7 +1062,7 @@ private:
     // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
     // what a zero host state-image budget selects), and the next id to hand out. Which checkpoints
     // are usable is decided per request by Shard::HostCheckpoint::valid, not by the id.
-    // Decode width this core was provisioned for (docs/PLAN-tp2-concurrency.md P1.2).
+    // Decode width this core was provisioned for (tp2-plan-concurrency.md P1.2).
     std::uint32_t lanes_                      = 1;
     std::uint32_t host_checkpoint_stride_     = 0;
     std::uint32_t host_checkpoint_tail_slots_ = 0;
@@ -1070,7 +1070,7 @@ private:
     std::uint32_t host_checkpoint_grid_slots_ = 0;
     // Each lane owns this many ring slots, and a slot holds one compact single-lane state image, so
     // the pinned footprint is the lanes=1 budget whatever the lane count
-    // (docs/PLAN-tp2-concurrency.md 12.6).
+    // (tp2-plan-concurrency.md 12.6).
     std::uint32_t host_checkpoint_slots_per_lane_ = 0;
     std::uint64_t host_checkpoint_next_id_    = 1;
     // Host-ring writes of the request being served, reported by the NINFER_TP2_TIMING trace.

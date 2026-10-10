@@ -28,8 +28,7 @@ def _assign(recipe, name, format, *, source=None):
 # 178.09 MiB but measured about 2 pp less long-context acceptance (33k-token prompt, K=7), and those
 # bytes land on the TP-2 shard that holds the selector rather than on the masked draft's shard, which
 # is the shard that bounds context capacity, so the saving does not buy context. A recipe that wants
-# the quantized codebook back can still assign Q4 itself
-# (tools/tp_bootstrap/r68_draft_codebook_q4.py).
+# the quantized codebook back can still assign Q4 itself.
 DFLASH2_Q4_NAMES = ("dflash2/feature_projection",)
 DFLASH2_Q4_ROLES = (
     "/attention/query",

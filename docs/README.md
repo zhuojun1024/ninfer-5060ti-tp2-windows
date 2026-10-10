@@ -63,6 +63,27 @@ other references own narrower contracts:
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
 
+### TP-2 campaign records
+
+The 2x RTX 5060 Ti TP-2 fork added the records below. They are the planning authority and campaign
+history for that route, not contracts for the single-GPU product: the references above still own
+the shared machinery.
+
+| Document | Responsibility |
+|---|---|
+| [TP-2 plan](maintainer/tp2-plan.md) | remaining work, closed items, environment notes, and the architecture-level risks still open |
+| [TP-2 design](maintainer/tp2-design.md) | early TP-2 execution design: the shard split table and execution flow |
+| [TP-2 concurrency plan](maintainer/tp2-plan-concurrency.md) | multi-lane concurrency plan: batching, admission, and the interfaces it introduced |
+| [TP-2 concurrency review remediation](maintainer/tp2-plan-concurrency-review-remediation.md) | review findings on the multi-lane work and their remediation |
+| [TP-2 KV sharing plan](maintainer/tp2-plan-kv-sharing.md) | shared KV pool semantics behind multi-lane admission |
+| [TP-2 headroom execution plan](maintainer/tp2-plan-headroom-execution.md) | execution steps of the concurrency headroom campaign |
+| [TP-2 concurrency headroom](maintainer/tp2-concurrency-headroom.md) | headroom measurements and what remains |
+| [TP-2 GGUF plan](maintainer/tp2-plan-gguf.md) | GGUF block formats on the TP-2 route |
+| [TP-2 fix plan](maintainer/tp2-plan-fixes.md) | review defect fixes and their verification record |
+| [TP-2 DFlash2 draft NVFP4 feasibility](maintainer/tp2-dflash2-draft-nvfp4-feasibility.md) | why an all-draft NVFP4 artifact was rejected |
+| [llama.cpp TP notes](maintainer/tp2-llamacpp-notes.md) | comparison notes against a local llama.cpp TP build |
+| [TP-2 adaptation worklog](maintainer/tp2-adaptation-worklog.md) | chronological round-by-round record, including five verbatim plan snapshots |
+
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from

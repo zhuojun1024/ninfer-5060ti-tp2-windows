@@ -152,7 +152,7 @@ RTX 5060 Ti cards but not one.
   the DFlash v1 masked draft, is rejected at construction), and `--vision` is supported. The DFlash2
   masked draft keeps its local context ring on shard 0; its budget-clamped verify columns are masked
   out of the KV append, so a recalled conversation reproduces a from-scratch prefill token for token
-  (PLAN.md section 3.6).
+  ([tp2-plan.md](maintainer/tp2-plan.md) §3.6).
 - KV capacity is page-aligned to `--max-context` (the core builds its own paged cache), and the
   context cache is disabled (the core owns its prefix-reuse snapshots).
 - The single-request CLI and the perplexity evaluator are single-GPU; only `ninfer-serve` accepts

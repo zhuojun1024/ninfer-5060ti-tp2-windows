@@ -1,6 +1,6 @@
 #pragma once
 
-// One shard-local masked-draft (DFlash2) round for the TP-2 route (PLAN.md section 3.6, stage B4).
+// One shard-local masked-draft (DFlash2) round for the TP-2 route (tp2-plan.md 3.6, stage B4).
 //
 // The single-device route sequences the same three steps inside ProgramImpl: the target prefill taps
 // its residual blocks into the draft's feature sink, the commit appends the captured window into the

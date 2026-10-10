@@ -137,7 +137,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // The TP-2 core drives its own single-request round loop. MTP proposes from the artifact's
         // own nextn head. DFlash2 also owns a draft component the shard split materializes whole on
         // shard 0, and the core implements its masked proposal, target verify, sparse acceptance and
-        // GDN fold (PLAN.md section 3.6, stages B3-B6). Its verify window masks the budget-clamped
+        // GDN fold (tp2-plan.md 3.6, stages B3-B6). Its verify window masks the budget-clamped
         // columns out of the KV append, so the route reproduces a from-scratch walk token for token.
         // DFlash v1 still has no TP-2 context layout, and its draft state would go through the
         // per-layer path this core does not own.

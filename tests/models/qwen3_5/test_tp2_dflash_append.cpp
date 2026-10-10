@@ -1,4 +1,4 @@
-// TP-2 DFlash2 masked-draft round (PLAN.md section 3.6, stage B4).
+// TP-2 DFlash2 masked-draft round (tp2-plan.md section 3.6, stage B4).
 //
 // The engine gate keeps --spec dflash2 off the TP-2 route until the masked draft has its own verify
 // wiring (src/runtime/engine/model_instance.cpp:101-104, deliberately kept), so this test drives the

@@ -200,7 +200,7 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            const Tensor& commit_counts, const Tensor& lanes,
                            const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
-// The masked draft's proposal forward alone (PLAN.md section 3.6, stage B3): the five sliding
+// The masked draft's proposal forward alone (tp2-plan.md section 3.6, stage B3): the five sliding
 // draft layers, the dynamic grouped convolutions and the reduced-head selector, without the
 // append/verify chain that dflash_decode_batch bundles around them. The caller owns the frame,
 // the draft state and a transient workspace the proposal may reset.

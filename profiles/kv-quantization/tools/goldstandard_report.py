@@ -402,8 +402,8 @@ def main():
 
     # ------------------------------------------------------------------ HTML
     P = []
-    P.append("""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
-<title>KV 量化与上下文深度 — 固定文本金标准对照</title><style>
+    P.append("""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>KV quantization vs context depth — fixed-text gold-standard control</title><style>
 body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f9fafb;color:#111827}
 .wrap{max-width:1120px;margin:0 auto;padding:28px 20px 60px}
 h1{font-size:24px;margin:0 0 6px}h2{font-size:18px;margin:34px 0 10px;padding-bottom:6px;border-bottom:1px solid #e5e7eb}
@@ -417,20 +417,20 @@ th{background:#f3f4f6;font-weight:600}td:first-child,th:first-child{text-align:l
 .good{color:#059669;font-weight:600}.bad{color:#dc2626;font-weight:600}.nodata{color:#dc2626}
 svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
 </style></head><body><div class="wrap">""")
-    P.append('<h1>KV cache 量化与上下文深度：固定文本金标准对照</h1>')
+    P.append('<h1>KV cache quantization vs context depth: fixed-text gold-standard control</h1>')
     P.append('<div class="sub">Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision · TP-2 <span class="mono">--devices 0,1</span> · '
-             '被打分的文本固定为源流最后 %d 个 token · 每次运行只改"能看到多长的前文"</div>' % BLOCK_TOKENS)
-    P.append('<div class="card"><h3 style="margin-top:0">为什么这个设计能回答"上下文变长会不会变差"</h3>'
-             '<p>上一版把一条 257K 的自然流一次跑完，逐 token 看 NLL —— 深度和文本内容是绑死的（越深的 token 越属于后面的书），'
-             '所以"模型随上下文变差"分不清是深度还是文本。</p>'
-             '<p>这一版把<b>被打分的文本钉死</b>：目标块恒为源流最后 1024 个 token，第 K 次运行只暴露它前面 K 个 token。'
-             'K ≥ 1 时目标块的紧邻前文每次都是同一段文字，<b>连拼接接缝都不存在</b>，唯一变量是历史能看到多远。'
-             '横轴是某个 token 的实际历史长度；同一横轴位置各条臂打的是<b>同一个 token</b>，所以臂间差与深度间差都是严格配对的。</p>'
-             '<p>已校验：13 条输入流的末尾 3000 字符逐字节相同（每条都是源流的字符后缀），'
-             '所以被打分的 1008 个 token 在每次运行里严格是同一段文本。</p>'
-             '<p><b>唯一的残留混淆</b>：历史的<b>内容</b>随 K 变化 —— 源流是 pg19 四本书顺序拼接，'
-             '可见窗口跨过书边界时，前文换成了另一本书。所以"相邻深度配对差"同时混了'
-             '"更多历史"与"不同历史"两个因素，逐点因果不能下；能下的是<b>长期趋势</b>。</p></div>')
+             'the scored text is fixed to the last %d tokens of the source stream · each run only changes "how much preceding text is visible"</div>' % BLOCK_TOKENS)
+    P.append('<div class="card"><h3 style="margin-top:0">Why this design can answer "does a longer context make things worse"</h3>'
+             '<p>The previous version ran one 257K natural stream straight through and looked at the per-token NLL — depth and text content are '
+             'locked together (deeper tokens belong to the later book), so "the model gets worse with context" cannot be split into depth or text.</p>'
+             '<p>This version <b>pins down the scored text</b>: the target block is always the last 1024 tokens of the source stream, and run K exposes only the K tokens before it. '
+             'For K ≥ 1 the immediate preceding text of the target block is the same passage every time, <b>so not even a concatenation seam exists</b>, and the only variable is how far back the history can see. '
+             'The x-axis is the actual history length of a given token; at the same x-axis position every arm scores <b>the same token</b>, so arm-vs-arm differences and depth-vs-depth differences are strictly paired.</p>'
+             '<p>Verified: the last 3000 characters of the 13 input streams are byte-identical (each is a character suffix of the source stream), '
+             'so the 1008 scored tokens are strictly the same passage in every run.</p>'
+             '<p><b>The only remaining confound</b>: the history <b>content</b> changes with K — the source stream is four pg19 books concatenated in order, so when the '
+             'visible window crosses a book boundary the preceding text becomes another book. The "adjacent-depth paired difference" therefore mixes '
+             '"more history" and "different history" at once, and point-wise causality cannot be established; what can be established is the <b>long-term trend</b>.</p></div>')
 
     # ------------------------------------------------------------- verdict
     verdict = []
@@ -438,54 +438,54 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
         f = panel_fit.get(arm, {}).get("deep") or panel_fit.get(arm, {}).get("whole")
         if f:
             verdict.append((arm, f["slope"], f["se"], f["t"]))
-    P.append('<h2>结论</h2><div class="card">')
-    P.append('<h3 style="margin-top:0">问题一：同一段文本，历史越长，模型是变好还是变差？</h3>')
+    P.append('<h2>Conclusions</h2><div class="card">')
+    P.append('<h3 style="margin-top:0">Question one: for the same passage, does a longer history make the model better or worse?</h3>')
     if verdict:
         steepest = min(verdict, key=lambda v: v[1])
         flattest = max(verdict, key=lambda v: v[1])
-        P.append('<p>把被打分的文本钉死之后，<b>所有臂</b>的 NLL 随可见历史的斜率都是<b>负</b>的：'
-                 '%s。最平的一条（%s）也达到 t=%s，'
-                 '也就是说"历史越长，这段固定的文本越好预测"是统计上确定的，方向与"随上下文劣化"相反。</p>'
-                 % ("；".join("%s %s ± %s nats/十倍程（t=%s）"
+        P.append('<p>Once the scored text is pinned down, the slope of NLL against visible history is <b>negative</b> for <b>all arms</b>: '
+                 '%s. Even the flattest one (%s) reaches t=%s, '
+                 'so "the longer the history, the better this fixed passage is predicted" is statistically certain, and its direction is opposite to "degradation with context".</p>'
+                 % ("; ".join("%s %s ± %s nats/decade (t=%s)"
                               % (esc(a), _signed(s), _signed(se, 6), _signed(t, 2))
                               for a, s, se, t in verdict),
                     esc(flattest[0]), _signed(flattest[3], 2)))
         pos = [(a, g) for a in arms for _, _, g in adj.get(a, []) if g["delta"] > 0]
         if pos:
             worst = max(pos, key=lambda p: p[1]["delta"])
-            P.append('<p>相邻深度配对差里只有 %d 个区间为正（历史变长后该文本略难），'
-                     '最大的是 %s 的 %s ± %s（t=%s）—— <b>测不出与零的差别</b>。'
-                     '其余全部为负且多数显著。</p>'
+            P.append('<p>Only %d intervals among the adjacent-depth paired differences are positive (the text becomes slightly harder as history lengthens), '
+                     'the largest being %s at %s ± %s (t=%s) — <b>indistinguishable from zero</b>. '
+                     'All the rest are negative and mostly significant.</p>'
                      % (len(pos), esc(worst[0]), _signed(worst[1]["delta"]),
                         _signed(worst[1]["se"], 6), _signed(worst[1]["delta"] / worst[1]["se"], 2)))
-        P.append('<p><b>所以"上下文越长模型越差"在本模型 + 本语料上不成立。</b>'
-                 '上一版把一条 257K 的自然流一次跑完、看到深层 PPL 升高，那是'
-                 '<b>文本内容</b>造成的（越深的 token 越属于后面那本书），不是深度本身。</p>')
-        P.append('<p>注意这条曲线的形状：从 0 到 ~1K 历史收益极陡，之后趋缓；'
-                 '在约 %s 个 token 处有一次大的台阶（紫线"book 02|03"），'
-                 '那是可见窗口第一次够到目标块所属那本书的开头。'
-                 '此后继续加长历史（包括加进完全不相关的书 01、00）都没有让结果变差。</p>'
+        P.append('<p><b>So "the longer the context the worse the model" does not hold for this model + this corpus.</b>'
+                 'The previous version ran one 257K natural stream straight through and saw deep PPL rise; that was'
+                 'caused by <b>text content</b> (deeper tokens belong to the later book), not by depth itself.</p>')
+        P.append('<p>Note the shape of this curve: the gain from 0 to ~1K of history is very steep, then it flattens out;'
+                 'at about %s tokens there is one large step (the purple line "book 02|03"),'
+                 'which is where the visible window first reaches the beginning of the book the target block belongs to.'
+                 'After that, lengthening the history further (including pulling in the completely unrelated books 01 and 00) never made the result worse.</p>'
                  % "{:,}".format(BOOK_BOUNDARIES[0][0]))
-    P.append('<h3>问题二：KV 量化的代价会不会随上下文增长而放大？</h3>')
+    P.append('<h3>Question two: does the cost of KV quantization grow with context?</h3>')
     if panel_delta:
         lines = []
         for (arm, reference), fits in sorted(panel_delta.items()):
             f = fits.get("deep") or fits.get("whole")
             if f:
-                lines.append("%s − %s：%s ± %s nats/十倍程（t=%s）"
+                lines.append("%s − %s: %s ± %s nats/decade (t=%s)"
                              % (esc(arm), esc(reference), _signed(f["slope"]), _signed(f["se"], 6), _signed(f["t"], 2)))
-        P.append('<p>配对差值本身随历史的斜率（正 = 量化代价随上下文放大）：</p><ul>'
+        P.append('<p>The slope of the paired differences themselves against history (positive = the quantization cost grows with context):</p><ul>'
                  + "".join("<li>%s</li>" % line for line in lines) + "</ul>")
-        P.append('<p>这些斜率即使为正也只有 ~1e-3 nats/十倍程量级，而绝对差值本身在 1e-2 nats 量级 —— '
-                 '<b>量化代价基本上是一个与上下文长度无关的常数</b>，'
-                 '没有出现"短上下文无损、长上下文崩溃"的拐点。</p>')
+        P.append('<p>Even when positive, these slopes are only of order ~1e-3 nats/decade, while the absolute differences themselves are of order 1e-2 nats — '
+                 '<b>the quantization cost is essentially a constant independent of context length</b>, and no '
+                 'knee of "short context lossless, long context collapsing" appears.</p>')
     P.append('</div>')
 
-    P.append('<h2>1. 固定文本的 NLL 随可见历史长度变化</h2>')
-    P.append('<p>每个点是一次运行：该次运行中目标块 %d 个 token 的 NLL 均值（丢掉块首 %d 个 token 以避开分词边界），'
-             '误差棒为块内标准误。内容完全固定。</p>' % (BLOCK_TOKENS - DROP_HEAD, DROP_HEAD))
-    P.append('<p class="sub">紫色虚线是源流里的书边界（pg19 的 00/01/02/03 顺序拼接），'
-             '横轴从右往左读：点越靠右，历史越短。跨过一条紫线表示可见窗口已经伸进更早的那本书。</p>')
+    P.append('<h2>1. NLL of the fixed text vs visible history length</h2>')
+    P.append('<p>Each point is one run: the mean NLL of the %d tokens of the target block in that run (the first %d tokens of the block are dropped to avoid tokenization boundaries), '
+             'with error bars at the within-block standard error. The content is completely fixed.</p>' % (BLOCK_TOKENS - DROP_HEAD, DROP_HEAD))
+    P.append('<p class="sub">The purple dashed lines are the book boundaries in the source stream (pg19 00/01/02/03 concatenated in order); '
+             'read the x-axis from right to left: the further right a point is, the shorter the history. Crossing a purple line means the visible window has reached into an earlier book.</p>')
     series = []
     for arm in arms:
         pts, ses = [], []
@@ -502,10 +502,10 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
              errorbars=True, vlines=BOOK_BOUNDARIES,
              note="same 1008 tokens scored in every run") + '</div>')
 
-    P.append('<h2>2. 相邻深度之间的配对 ΔNLL —— 最直接的答案</h2>')
-    P.append('<p>每一行取相邻两次运行，对<b>同一个 token</b> 求 NLL 之差再平均。'
-             '<b>正值 = 历史变长以后这个 token 变得更难预测</b>，负值 = 变得更容易。'
-             '这是没有函数形式假设的检验。</p>')
+    P.append('<h2>2. Paired ΔNLL between neighbouring depths — the most direct answer</h2>')
+    P.append('<p>Each row takes two neighbouring runs and averages the NLL difference for <b>the same token</b>. '
+             '<b>Positive = this token becomes harder to predict once the history is longer</b>, negative = it becomes easier. '
+             'This is a test with no functional-form assumption.</p>')
     adj_series = []
     for arm in arms:
         entries = adj.get(arm)
@@ -529,9 +529,9 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
                          _t(g["delta"] / g["se"] if g["se"] else None)])
     P.append('<div class="card">' + table(["arm", "history lo -> hi", "delta NLL", "se", "t"], rows) + '</div>')
 
-    P.append('<h2>3. 斜率：历史每长 10 倍，NLL 变多少</h2>')
-    P.append('<p><b>全区</b>用全部深度，会被"历史从 0 到 1K"的剧烈改善主导；'
-             '<b>深区</b>只用历史 ≥ %s 的运行，才是"长上下文"这个问题的适用区间。</p>' % "{:,}".format(DEEP_FROM))
+    P.append('<h2>3. Slope: how much NLL changes per 10x of history</h2>')
+    P.append('<p>The <b>whole range</b> uses every depth and is dominated by the steep improvement from "0 to 1K of history"; '
+             'the <b>deep range</b> uses only runs with history ≥ %s, which is the regime where the "long context" question applies.</p>' % "{:,}".format(DEEP_FROM))
     rows = []
     for arm in arms:
         rf, pf = run_fit.get(arm, {}), panel_fit.get(arm, {})
@@ -547,11 +547,11 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
                          _t(f["t"] if f else None), str(f["tokens"]) if f else "-"])
     P.append('<div class="card">' + table(
         ["arm", "estimator", "slope (nats / decade)", "se", "t", "points"], rows) +
-        '<p class="sub" style="margin-bottom:0">负 = 历史越长越好，正 = 历史越长越差。|t| &lt; 2 表示测不出与零斜率的差别。</p></div>')
+        '<p class="sub" style="margin-bottom:0">Negative = better with longer history, positive = worse with longer history. |t| &lt; 2 means indistinguishable from a zero slope.</p></div>')
 
-    P.append('<h2>4. 臂间配对差值随历史长度变化</h2>')
-    P.append('<p>ΔNLL 是同一个 token 在两条臂上的差值，再对块内 1008 个 token 取平均。'
-             '这是"量化代价是否随上下文放大"的直接答案。</p>')
+    P.append('<h2>4. Cross-arm paired differences vs history length</h2>')
+    P.append('<p>ΔNLL is the difference for the same token between two arms, averaged over the 1008 tokens of the block. '
+             'This is the direct answer to "does the quantization cost grow with context".</p>')
     for reference, store, limit in (("bf16", delta_bf16, 131072), ("fp8", delta_fp8, 257439)):
         ds = []
         for arm, entries in store.items():
@@ -569,14 +569,14 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
         for e in entries:
             rows.append([esc(arm) + " - bf16", "{:,}".format(round(e["history_mid"])), _signed(e["delta"]),
                          _fmt(e["se"], 6), _t(e["delta"] / e["se"] if e["se"] else None)])
-    P.append('<h3>vs bf16（无损参考，最多到 131,072）</h3><div class="card">' + table(
+    P.append('<h3>vs bf16 (lossless reference, out to 131,072)</h3><div class="card">' + table(
         ["comparison", "visible history", "delta NLL", "se", "t"], rows) + '</div>')
     rows = []
     for arm, entries in sorted(delta_fp8.items()):
         for e in entries:
             rows.append([esc(arm) + " - fp8", "{:,}".format(round(e["history_mid"])), _signed(e["delta"]),
                          _fmt(e["se"], 6), _t(e["delta"] / e["se"] if e["se"] else None)])
-    P.append('<h3>vs fp8（全深度）</h3><div class="card">' + table(
+    P.append('<h3>vs fp8 (all depths)</h3><div class="card">' + table(
         ["comparison", "visible history", "delta NLL", "se", "t"], rows) + '</div>')
 
     rows = []
@@ -586,11 +586,11 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
             rows.append([esc(arm) + " - " + esc(reference), label, _signed(f["slope"]) if f else "-",
                          _signed(f["se"], 6) if f else "-", _t(f["t"] if f else None),
                          str(f["tokens"]) if f else "-"])
-    P.append('<h3>配对差值的面板回归</h3><div class="card">' + table(
+    P.append('<h3>Panel regression of the paired differences</h3><div class="card">' + table(
         ["comparison", "range", "slope (nats / decade)", "se", "t", "tokens"], rows) +
-        '<p class="sub" style="margin-bottom:0">斜率显著为正才说明"上下文越长，量化代价越大"。</p></div>')
+        '<p class="sub" style="margin-bottom:0">Only a significantly positive slope shows "the longer the context, the larger the quantization cost".</p></div>')
 
-    P.append('<h3>长上下文区的平均量化代价（把所有深度 ≥ %s 的 token 汇总）</h3>' % "{:,}".format(DEEP_FROM))
+    P.append('<h3>Mean quantization cost in the long-context regime (pooling every token at depth ≥ %s)</h3>' % "{:,}".format(DEEP_FROM))
     rows = []
     for reference, store in (("bf16", delta_bf16), ("fp8", delta_fp8)):
         for arm, entries in sorted(store.items()):
@@ -602,10 +602,10 @@ svg{display:block;max-width:100%}ul{margin:8px 0 8px 18px;padding:0}
                              str(got["runs"]), "{:,}".format(got["n"])])
     P.append('<div class="card">' + table(
         ["comparison", "mean delta NLL", "se", "t", "equivalent PPL", "runs", "tokens"], rows) +
-        '<p class="sub" style="margin-bottom:0">这就是"长上下文下的量化代价"这一个数字；'
-        '它的 se 只有 1e-3 量级，而随深度的斜率项只有 1e-3/十倍程 —— 代价是常数。</p></div>')
+        '<p class="sub" style="margin-bottom:0">This is the single number for "the quantization cost at long context"; '
+        'its se is only of order 1e-3, while the depth-slope term is only 1e-3/decade — the cost is a constant.</p></div>')
 
-    P.append('<h2>5. 每次运行的原始数字</h2>')
+    P.append('<h2>5. Raw numbers for every run</h2>')
     P.append('<div class="card">' + table(
         ["nominal k", "visible history"] + arms,
         [[r[0], esc(r[1])] + [esc(c) for c in r[2:]] for r in run_rows]) + '</div>')
