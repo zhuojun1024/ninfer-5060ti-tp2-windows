@@ -22,16 +22,21 @@ pair is what makes the model fit: the 27B NVFP4 artifact needs about 20.2 GiB of
 10.1 GiB per TP-2 shard. The build rejects CUDA architectures other than `sm_120a`, and the TP-2
 core fails fast when the two devices are not identical.
 
-Five official artifacts are available. The recipes below use Qwen3.8-27B NVFP4, the artifact
-verified on this pair; another artifact fits the same pair only if one TP-2 shard fits in 16 GiB.
+Six artifacts are listed below: five official upstream artifacts and one community merge. The
+recipes below use Qwen3.8-27B NVFP4, the artifact verified on this pair; another artifact fits the
+same pair only if one TP-2 shard fits in 16 GiB.
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
-| Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
-| Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
+| Qwen3.8-27B Coder390 (community merge) | `nvfp4` W4A4-W8A8 | `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer` | [Qwen3.8-27B-Coder390 NVFP4](https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-NVFP4-NInfer) |
 | Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
 | Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
-| Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+| Qwen3.6-27B † | `groupwise-int` | `qwen3_6_27b.ninfer` | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
+| Qwen3.6-27B † | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
+| Qwen3.6-35B-A3B † | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+
+† Not tested on the dual RTX 5060 Ti pair; the Qwen3.6 series artifacts are listed for
+completeness.
 
 Each v3 `.ninfer` artifact carries model configuration, encoded weights, logical bindings and
 frontend resources. Runtime execution uses those facts with the implemented model and Op
