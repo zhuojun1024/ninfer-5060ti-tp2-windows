@@ -1,6 +1,8 @@
-# Run the reference llama.cpp build (C:\llama.cpp, branch ar3-opt) for engine-to-engine comparison.
+# Run a reference llama.cpp build for engine-to-engine comparison.
 #
-#   pwsh -File tools/win_port/serve_llama.ps1            # start on 8080 with the owner's tuned flags
+#   pwsh -File tools/win_port/serve_llama.ps1 -Root <llama.cpp build dir> -Model <gguf> `
+#        -Mmproj <mmproj.gguf> -ChatTemplate <template>.jinja
+#   pwsh -File tools/win_port/serve_llama.ps1            # start on 8080 with the tuned flags
 #   pwsh -File tools/win_port/serve_llama.ps1 -Status    # listeners, health, VRAM
 #   pwsh -File tools/win_port/serve_llama.ps1 -Stop      # stop every llama-server process
 #
@@ -12,10 +14,10 @@ param(
     [Parameter(ParameterSetName = "start")][switch] $Start,
     [Parameter(ParameterSetName = "stop")][switch] $Stop,
     [Parameter(ParameterSetName = "status")][switch] $Status,
-    [string] $Root = "C:/llama_ar3-opt",
-    [string] $Model = "D:/LLM/Qwen3.8-27B-iMatrix-NVFP4-MTP.gguf",
-    [string] $Mmproj = "D:/LLM/mmproj-Qwen3.8-27B-Q8_0.gguf",
-    [string] $ChatTemplate = "D:/LLM/chat_template.jinja",
+    [string] $Root = $env:NINFER_LLAMA_ROOT,
+    [string] $Model = $env:NINFER_LLAMA_MODEL,
+    [string] $Mmproj = $env:NINFER_LLAMA_MMPROJ,
+    [string] $ChatTemplate = $env:NINFER_LLAMA_CHAT_TEMPLATE,
     [int] $Port = 8080,
     [string] $LogFile = ""
 )
@@ -42,7 +44,9 @@ if ($Status) {
 }
 
 if ((Get-LlamaProcesses).Count -ne 0) { throw "a llama-server process is already running; stop it first (-Stop)" }
+if (-not $Root) { throw "no llama.cpp build directory given: pass -Root <dir> or set NINFER_LLAMA_ROOT" }
 foreach ($path in @($Model, $Mmproj, $ChatTemplate)) {
+    if (-not $path) { throw "missing input: pass the artifact paths or set the NINFER_LLAMA_* variables" }
     if (-not (Test-Path $path)) { throw "missing input: $path" }
 }
 $binary = Join-Path $Root "llama-server.exe"

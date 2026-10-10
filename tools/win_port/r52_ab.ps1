@@ -4,9 +4,8 @@ param(
   [string]$OutDir = "build-win/r52",
   [string]$CompareTo = ""
 )
-# Deterministic greedy golden probe (top_k=1 pins argmax) - Windows port of
-# tools/tp_bootstrap/r52_ab.sh. Five fixed prompts, 160 tokens each, hash of
-# content||reasoning_content. Compare two tags with -CompareTo.
+# Deterministic greedy golden probe (top_k=1 pins argmax). Five fixed prompts,
+# 160 tokens each, hash of content||reasoning_content. Compare two tags with -CompareTo.
 #
 # Capture goldens on a FRESH server that has served no other request: cached
 # prefix KV rows carry their producing prefill's reduction shape (ulp-level),

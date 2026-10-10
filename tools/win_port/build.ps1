@@ -30,8 +30,8 @@ param(
     [int] $Jobs = 12,
     [int] $TimeoutSec = 2700,
     [switch] $SkipProbe,
-    [string] $FfmpegRoot = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared",
-    [string] $LibcurlRoot = "D:/curl-dev/expanded/curl-8.22.0_1-win64-mingw",
+    [string] $FfmpegRoot = $env:NINFER_FFMPEG_ROOT,
+    [string] $LibcurlRoot = $env:NINFER_LIBCURL_ROOT,
     [string] $SourceDir = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
     [string] $BuildDir = ""
 )
@@ -40,7 +40,16 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot/vcvars.ps1"
 
 if (-not $BuildDir) { $BuildDir = Join-Path $SourceDir "build-win" }
+if (-not $FfmpegRoot) {
+    throw ("FFmpeg prefix not set: run tools/win_port/fetch_ffmpeg.ps1, then pass -FfmpegRoot <dir> " +
+           "or set NINFER_FFMPEG_ROOT")
+}
 if (-not (Test-Path $FfmpegRoot)) { throw "FFmpeg prefix not found: $FfmpegRoot" }
+if (-not $LibcurlRoot) {
+    throw ("libcurl prefix not set: run tools/win_port/fetch_curl.ps1, then pass -LibcurlRoot <dir> " +
+           "or set NINFER_LIBCURL_ROOT")
+}
+if (-not (Test-Path $LibcurlRoot)) { throw "libcurl prefix not found: $LibcurlRoot" }
 $log = Join-Path $BuildDir "build.log"
 $errLog = Join-Path $BuildDir "build.err.log"
 

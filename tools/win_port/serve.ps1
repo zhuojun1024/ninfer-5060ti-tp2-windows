@@ -5,7 +5,8 @@
 #   pwsh -File tools/win_port/serve.ps1 -Spec dflash2 -DraftTokens 7   # DFlash2 masked draft
 #   pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP/vision, plain decode
 #   pwsh -File tools/win_port/serve.ps1 -HostKvMiB 0     # no cross-session KV retention
-#   pwsh -File tools/win_port/serve.ps1 -ChatTemplate D:/LLM/chat_template.jinja   # custom chat template
+#   pwsh -File tools/win_port/serve.ps1 -Model <artifact>.ninfer   # or set NINFER_MODEL
+#   pwsh -File tools/win_port/serve.ps1 -ChatTemplate <template>.jinja   # custom chat template
 #   pwsh -File tools/win_port/serve.ps1 -VisionItemTokens 4096   # smaller Vision workspace
 #   pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
 #   pwsh -File tools/win_port/serve.ps1 -Stop            # stop every ninfer-serve process
@@ -18,7 +19,7 @@ param(
     [Parameter(ParameterSetName = "start")][switch] $Start,
     [Parameter(ParameterSetName = "stop")][switch] $Stop,
     [Parameter(ParameterSetName = "status")][switch] $Status,
-    [string] $Model = "D:/LLM/qwen3_8_27b_nvfp4.ninfer",
+    [string] $Model = $env:NINFER_MODEL,
     [string] $Binary = "",
     [int] $Port = 8099,
     [int] $Context = 131072,
@@ -29,8 +30,8 @@ param(
     [switch] $Plain,
     [switch] $Background,
     [string] $LogFile = "",
-    [string] $FfmpegRoot = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared",
-    [string] $LibcurlRoot = "D:/curl-dev/expanded/curl-8.22.0_1-win64-mingw",
+    [string] $FfmpegRoot = $env:NINFER_FFMPEG_ROOT,
+    [string] $LibcurlRoot = $env:NINFER_LIBCURL_ROOT,
     [string] $ChatTemplate = "",
     [int] $VisionItemTokens = 16384
 )
@@ -67,6 +68,7 @@ if ($Status) { Show-Status; exit 0 }
 if ((Get-ServeProcesses).Count -ne 0) {
     throw "a ninfer-serve process is already running; stop it first (-Stop) instead of holding two engines in VRAM"
 }
+if (-not $Model) { throw "no model artifact given: pass -Model <file.ninfer> or set NINFER_MODEL" }
 if (-not (Test-Path $Model)) { throw "model artifact not found: $Model" }
 if (-not $Binary) {
     $Binary = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "build-win/apps/ninfer-serve.exe"
@@ -77,6 +79,14 @@ if ($ChatTemplate -and -not (Test-Path $ChatTemplate)) { throw "chat template no
 if (-not $LogFile) { $LogFile = Join-Path (Split-Path -Parent $Binary) "serve-win.log" }
 
 # The server loads avcodec/swscale and libcurl at run time, so both DLL directories must be visible.
+if (-not (Test-Path $FfmpegRoot)) {
+    throw ("FFmpeg prefix not found: '$FfmpegRoot' (pass -FfmpegRoot <dir> or set NINFER_FFMPEG_ROOT; " +
+           "tools/win_port/fetch_ffmpeg.ps1 prints the value)")
+}
+if (-not (Test-Path $LibcurlRoot)) {
+    throw ("libcurl prefix not found: '$LibcurlRoot' (pass -LibcurlRoot <dir> or set " +
+           "NINFER_LIBCURL_ROOT; tools/win_port/fetch_curl.ps1 prints the value)")
+}
 $env:PATH = "$FfmpegRoot/bin;$LibcurlRoot/bin;$env:PATH"
 
 $arguments = @(
@@ -115,9 +125,10 @@ if ($Background) {
     # Foreground is the default: the shell that starts the server keeps ownership of it, the log streams
     # to the console, and Ctrl+C stops it.
     Write-Host "running $Binary (context $Context); Ctrl+C stops it"
-    # ninfer-serve 的诊断（含显存账本）全部走 stderr；2>&1 把它并进成功流后 PowerShell 会把每一行
-    # 包成 ErrorRecord，控制台就按错误流渲染成红色（与日志级别无关）。先转成字符串再做 Tee，颜色
-    # 才和内容相符。
+    # ninfer-serve diagnostics (including the memory ledger) all go to stderr. Merging them into the
+    # success stream with 2>&1 makes PowerShell wrap every line in an ErrorRecord, which the console
+    # then renders in red regardless of log level. Casting to string before Tee keeps the colour
+    # consistent with the content.
     & $Binary @arguments 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $LogFile
     exit $LASTEXITCODE
 }

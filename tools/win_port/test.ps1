@@ -13,8 +13,8 @@ param(
     [string] $Filter = "",
     [switch] $Build,
     [int] $Jobs = 1,
-    [string] $FfmpegRoot = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared",
-    [string] $LibcurlRoot = "D:/curl-dev/expanded/curl-8.22.0_1-win64-mingw"
+    [string] $FfmpegRoot = $env:NINFER_FFMPEG_ROOT,
+    [string] $LibcurlRoot = $env:NINFER_LIBCURL_ROOT
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +27,14 @@ if (-not (Test-Path (Join-Path $BuildDir "CTestTestfile.cmake"))) {
 
 if ($Build) { & (Join-Path $PSScriptRoot "build.ps1") -Tests 1 }
 
+if (-not (Test-Path $FfmpegRoot)) {
+    throw ("FFmpeg prefix not found: '$FfmpegRoot' (pass -FfmpegRoot <dir> or set NINFER_FFMPEG_ROOT; " +
+           "tools/win_port/fetch_ffmpeg.ps1 prints the value)")
+}
+if (-not (Test-Path $LibcurlRoot)) {
+    throw ("libcurl prefix not found: '$LibcurlRoot' (pass -LibcurlRoot <dir> or set " +
+           "NINFER_LIBCURL_ROOT; tools/win_port/fetch_curl.ps1 prints the value)")
+}
 $env:PATH = "$FfmpegRoot/bin;$LibcurlRoot/bin;$env:PATH"
 
 $arguments = @("--output-on-failure", "--timeout", "300")
