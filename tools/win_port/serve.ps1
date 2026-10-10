@@ -1,7 +1,8 @@
 # Run the native Windows TP-2 server, or inspect/stop it.
 #
 #   pwsh -File tools/win_port/serve.ps1                  # start with the shipped recipe
-#   pwsh -File tools/win_port/serve.ps1 -Context 32768   # larger KV capacity
+#   pwsh -File tools/win_port/serve.ps1 -MaxConcurrency 4   # batch up to four queued requests
+#   pwsh -File tools/win_port/serve.ps1 -Context 32768   # smaller KV capacity
 #   pwsh -File tools/win_port/serve.ps1 -Spec dflash2 -DraftTokens 7   # DFlash2 masked draft
 #   pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP/vision, plain decode
 #   pwsh -File tools/win_port/serve.ps1 -HostKvMiB 0     # no cross-session KV retention
@@ -23,6 +24,7 @@ param(
     [string] $Binary = "",
     [int] $Port = 8099,
     [int] $Context = 131072,
+    [int] $MaxConcurrency = 1,
     [ValidateSet("mtp", "dflash2")][string] $Spec = "mtp",
     [int] $DraftTokens = 2,
     [int] $HostKvMiB = 32768,
@@ -75,6 +77,7 @@ if (-not $Binary) {
 }
 if (-not (Test-Path $Binary)) { throw "server binary not found: $Binary (run tools/win_port/build.ps1 first)" }
 if ($VisionItemTokens -lt 2048 -or $VisionItemTokens -gt 16384) { throw "VisionItemTokens must be in [2048,16384]" }
+if ($MaxConcurrency -lt 1 -or $MaxConcurrency -gt 4) { throw "MaxConcurrency must be in [1,4] on the TP-2 route" }
 if ($ChatTemplate -and -not (Test-Path $ChatTemplate)) { throw "chat template not found: $ChatTemplate" }
 if (-not $LogFile) { $LogFile = Join-Path (Split-Path -Parent $Binary) "serve-win.log" }
 
@@ -93,6 +96,7 @@ $arguments = @(
     $Model,
     "--devices", "0,1",
     "--max-context", "$Context",
+    "--max-concurrency", "$MaxConcurrency",
     "--port", "$Port",
     "--host", "127.0.0.1",
     "--kv-dtype", "fp8",
