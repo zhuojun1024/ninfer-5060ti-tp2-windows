@@ -957,7 +957,8 @@ Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selec
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.
 
-Run `./build/apps/ninfer-serve --help` for the exact option contract.
+Run `./build/apps/ninfer-serve --help` for the exact option contract, and `--version` to print
+the release version the server was built from.
 
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,

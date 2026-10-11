@@ -252,7 +252,8 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
 generated token IDs in diagnostics.
 
-Run `./build/apps/ninfer --help` for the exact option contract.
+Run `./build/apps/ninfer --help` for the exact option contract, and `--version` to print the
+release version the binary was built from.
 
 ## Device selection
 

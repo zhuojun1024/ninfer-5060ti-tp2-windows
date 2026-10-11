@@ -53,6 +53,43 @@ Run it from a terminal you keep open. A `-Background` child belongs to the launc
 object, so an agent harness that starts the server inside one tool call will kill it as soon as the call
 returns (the engine then never reaches the GPU).
 
+## Release packaging
+
+The release version has one source of truth: `project(ninfer VERSION x.y.z ...)` in `CMakeLists.txt`,
+compiled into every executable as `NINFER_VERSION` and printed by `--version`:
+
+```powershell
+build-win/apps/ninfer-serve.exe --version    # ninfer-serve 0.1.0
+```
+
+`tools/win_port/package.ps1` turns a finished build into a self-contained archive:
+
+```powershell
+pwsh -File tools/win_port/build.ps1 -Configure          # the three executables
+pwsh -File tools/win_port/package.ps1                   # dist/ninfer-<version>-win-x64.zip
+pwsh -File tools/win_port/package.ps1 -RequireTag       # refuse unless HEAD carries v<version>
+```
+
+The script reads the version from the executables and refuses to package when the three disagree, so
+the archive cannot be labeled from anything but the binaries themselves. It walks the
+`dumpbin /dependents` closure of all three, copies every DLL it resolves into `bin/`, and adds
+`LICENSE`, a generated `README.txt`, `THIRD-PARTY-NOTICES.txt` and the bundled license texts.
+
+Vendor directories win over `System32` while resolving that closure: `msvcp140.dll` is in `System32`
+on a machine with the VC redist installed, but the archive has to carry the redistributable copy so it
+also runs where the redist is absent. `nvcuda.dll` always comes from the display driver and is never
+bundled, so a current NVIDIA driver is still required.
+
+The bundled cuBLAS libraries are what let the archive run without a local CUDA toolkit; Attachment A
+of the CUDA toolkit license lists them as redistributable. The FFmpeg libraries in the verified prefix
+are a GPL build (`--enable-gpl --enable-version3`), so `THIRD-PARTY-NOTICES.txt` records the exact
+build identifier from `ffmpeg -version` next to the GPL text that travels in `licenses/`.
+
+Publishing is manual and stays outside the script: build, package, tag the release commit `v<version>`,
+push the tag, and attach the archive to the GitHub release. `package.ps1` never tags, pushes or uploads.
+The archive is about 1.2 GiB: three ~280 MiB executables and 11 DLLs totaling 638 MiB, most of it
+cuBLAS (`cublasLt64_13.dll` alone is 442 MiB).
+
 ## Verified behavior on Windows
 
 These rows were recorded on an earlier build as a Linux/Windows parity check; the current four-route

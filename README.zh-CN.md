@@ -65,9 +65,14 @@ pwsh -File tools/win_port/build.ps1                # incremental build
 ```
 
 `build.ps1` 自己导入 `vcvars64` 环境，因此不需要 cmd 包装脚本。`-Apps 0` 只构建核心库，
-`-Tests 1 -Benchmarks 1` 加上测试套件与基准，而单纯 `-Configure` 会关闭它们。没有安装目标或
-打包好的二进制发行版；请从构建树里运行 NInfer。Python 工具独立于 CMake 运行；独立的 HBM
-探针有它自己的[构建命令](tools/README.md#standalone-hbm-probe)。
+`-Tests 1 -Benchmarks 1` 加上测试套件与基准，而单纯 `-Configure` 会关闭它们。
+`build-win/apps/*.exe --version` 会打印这些二进制构建自哪个发行版本。Python 工具独立于 CMake
+运行；独立的 HBM 探针有它自己的[构建命令](tools/README.md#standalone-hbm-probe)。
+
+发行版还会附带自包含的 `ninfer-<version>-win-x64.zip`：三个可执行文件加上它们加载的 CUDA、
+FFmpeg、curl 与 MSVC 运行时 DLL，因此不需要安装 CUDA 工具包或 FFmpeg 前缀；
+`tools/win_port/package.ps1` 可以从本地构建重新生成它（见
+[发行打包](docs/windows.md#release-packaging)）。
 
 下载工件并校验：
 

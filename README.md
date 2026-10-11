@@ -75,9 +75,14 @@ pwsh -File tools/win_port/build.ps1                # incremental build
 
 `build.ps1` imports the `vcvars64` environment itself, so no cmd wrapper is needed. `-Apps 0` builds
 the core libraries only, and `-Tests 1 -Benchmarks 1` add the suite and the benchmarks, which a
-plain `-Configure` turns off. There is no install target or packaged binary distribution; run NInfer
-from its build tree. Python tools run independently of CMake; the standalone HBM probe has its own
-[build command](tools/README.md#standalone-hbm-probe).
+plain `-Configure` turns off. `build-win/apps/*.exe --version` prints the release version the
+binaries were built from. Python tools run independently of CMake; the standalone HBM probe has its
+own [build command](tools/README.md#standalone-hbm-probe).
+
+Releases also carry a self-contained `ninfer-<version>-win-x64.zip` - the three executables plus the
+CUDA, FFmpeg, curl and MSVC runtime DLLs they load, so no CUDA toolkit or FFmpeg prefix is needed -
+and `tools/win_port/package.ps1` rebuilds it from a local build
+([release packaging](docs/windows.md#release-packaging)).
 
 Download the artifact and verify it:
 
