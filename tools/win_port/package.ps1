@@ -6,8 +6,10 @@
 #
 # The archive is <OutDir>/ninfer-<version>-win-x64.zip. It holds bin/ with the three executables and
 # every non-system DLL they load, so a user needs no CUDA toolkit, FFmpeg or curl installation - only
-# an NVIDIA display driver, which owns nvcuda.dll. LICENSE, a generated README.txt and the bundled
-# third-party license texts sit next to bin/.
+# an NVIDIA display driver, which owns nvcuda.dll. LICENSE, NOTICE, a generated README.txt and the
+# license texts of every bundled component sit next to bin/: licenses/ for the prefix licenses,
+# licenses/vendored/ for the sources linked into the executables, licenses/curl-deps/ for the
+# libraries linked into libcurl-x64.dll.
 #
 # Publishing stays manual, on purpose: this script never tags, pushes or uploads. Build, package,
 # tag the commit as v<version>, then attach the archive to the GitHub release.
@@ -185,6 +187,8 @@ $null = New-Item -ItemType Directory -Force -Path $binDir, $licenseDir
 foreach ($product in $products) { Copy-Item (Join-Path $AppsDir "$product.exe") $binDir }
 foreach ($entry in $bundled.GetEnumerator()) { Copy-Item $entry.Value $binDir }
 Copy-Item (Join-Path $SourceDir "LICENSE") (Join-Path $staging "LICENSE")
+# Apache-2.0 section 4(d): a redistribution has to carry the NOTICE file when the work has one.
+if (Test-Path (Join-Path $SourceDir "NOTICE")) { Copy-Item (Join-Path $SourceDir "NOTICE") $staging }
 
 # License texts travel with the binaries they cover. The MSVC runtime is deployed app-local under the
 # Visual Studio license terms and ships no redistributable text of its own.
@@ -201,6 +205,37 @@ foreach ($entry in $licenseFiles.GetEnumerator()) {
     }
 }
 
+# Two more sets of license texts have to travel with the binaries. The libraries vendored under
+# third_party/ are compiled into the executables, and libcurl-x64.dll is a self-contained build whose
+# TLS, compression and HTTP/2 and HTTP/3 libraries are linked into it; the curl prefix documents each
+# of them under dep/. Both sets are copied per component so the notices can point at them by name.
+$vendoredLicenses = [ordered]@{}
+$thirdPartyDir = Join-Path $SourceDir "third_party"
+if (Test-Path $thirdPartyDir) {
+    foreach ($component in Get-ChildItem $thirdPartyDir -Directory | Sort-Object Name) {
+        $text = Get-ChildItem $component.FullName -File |
+            Where-Object { $_.Name -match '^(LICENSE|COPYING)' } | Sort-Object Name | Select-Object -First 1
+        if ($text) { $vendoredLicenses["vendored/$($component.Name)-$($text.Name)"] = $text.FullName }
+    }
+    $unicodeText = Join-Path $thirdPartyDir "llama-jinja/UNICODE-LICENSE"
+    if (Test-Path $unicodeText) { $vendoredLicenses["vendored/llama-jinja-UNICODE-LICENSE"] = $unicodeText }
+}
+$curlDepDir = Join-Path $LibcurlRoot "dep"
+if (Test-Path $curlDepDir) {
+    foreach ($text in Get-ChildItem $curlDepDir -Recurse -File |
+            Where-Object { $_.Name -match '^(LICENSE|COPYING)' } | Sort-Object FullName) {
+        $relative = $text.FullName.Substring($curlDepDir.Length + 1) -replace '[\\/]', '-'
+        $vendoredLicenses["curl-deps/$relative"] = $text.FullName
+    }
+}
+foreach ($entry in $vendoredLicenses.GetEnumerator()) {
+    $target = Join-Path $licenseDir $entry.Key
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target)
+    Copy-Item $entry.Value $target
+}
+$copiedLicenses["vendored/ and curl-deps/"] = "$($vendoredLicenses.Count) texts"
+Write-Host ("package: {0} license texts bundled" -f $vendoredLicenses.Count)
+
 # The FFmpeg build identifies itself, and that identifier is what a GPL recipient needs in order to
 # fetch the corresponding source, so record it verbatim instead of hard-coding one distributor's build.
 $ffmpegBuild = "the FFmpeg build shipped in this archive"
@@ -210,6 +245,31 @@ if (Test-Path $ffmpegExe) {
     if ($probe.Lines.Count -ne 0 -and $probe.Lines[0] -match '^ffmpeg version (\S+)') {
         $ffmpegBuild = $Matches[1]
     }
+}
+
+# The FFmpeg license in the prefix decides how the notice has to describe the bundled libraries: a
+# GPL build carries a source-offer obligation, an LGPL build only has to stay replaceable, which
+# shipping the libraries as separate DLLs already satisfies.
+$ffmpegLicense = "GNU General Public License version 3"
+$ffmpegSource = "This build was configured with --enable-gpl --enable-version3. The libraries are " +
+"distributed`n  unmodified and are loaded at run time as separate shared objects. Corresponding " +
+"source: the`n  FFmpeg revision named above, available from https://ffmpeg.org/download.html`n  " +
+"(git https://git.ffmpeg.org/ffmpeg.git)."
+$ffmpegLicenseFile = Join-Path $FfmpegRoot "LICENSE.txt"
+if ((Test-Path $ffmpegLicenseFile) -and
+        ([System.IO.File]::ReadAllText($ffmpegLicenseFile) -match 'LESSER GENERAL PUBLIC LICENSE')) {
+    $ffmpegLicense = "GNU Lesser General Public License version 3"
+    $ffmpegSource = "The libraries are distributed unmodified and are loaded at run time as " +
+    "separate shared`n  objects, which is what the LGPL requires in order to keep them replaceable."
+}
+
+# curl reports the exact versions of everything linked into libcurl-x64.dll on its first line, which
+# is the authoritative list of what has to be attributed next to the curl license.
+$curlBuild = "the libraries documented for this libcurl build"
+$curlExe = Join-Path $LibcurlRoot "bin/curl.exe"
+if (Test-Path $curlExe) {
+    $probe = Invoke-Captured $curlExe @("-V") $AppsDir
+    if ($probe.Lines.Count -ne 0) { $curlBuild = $probe.Lines[0].Trim() }
 }
 
 # The notices are read by the people who receive the archive, so they list components and sizes
@@ -225,7 +285,7 @@ $notices = @'
 NInfer __VERSION__ for Windows x64 - bundled third-party components
 ===================================================================
 
-NInfer itself is licensed under the Apache License 2.0; see LICENSE.
+NInfer itself is licensed under the Apache License 2.0; see LICENSE and NOTICE.
 
 bin/ holds the NInfer executables and every non-system DLL they load:
 
@@ -239,19 +299,29 @@ NVIDIA CUDA Toolkit - cuBLAS (cublas64_13.dll, cublasLt64_13.dll)
   display driver, which provides nvcuda.dll, is still required.
 
 FFmpeg (avcodec-63.dll, avformat-63.dll, avutil-61.dll, swresample-7.dll, swscale-10.dll)
-  ffmpeg version __FFMPEG__ - licensed under the GNU General Public License version 3, because this
-  build was configured with --enable-gpl --enable-version3. The libraries are distributed unmodified
-  and are loaded at run time as separate shared objects. License text: licenses/ffmpeg-LICENSE.txt.
-  Corresponding source: the FFmpeg revision named above, available from https://ffmpeg.org/download.html
-  (git https://git.ffmpeg.org/ffmpeg.git).
+  ffmpeg version __FFMPEG__ - licensed under the __FFMPEGLICENSE__.
+  __FFMPEGSOURCE__
+  License text: licenses/ffmpeg-LICENSE.txt.
 
 curl (libcurl-x64.dll)
-  Licensed under the curl license; see licenses/curl-COPYING.txt.
+  Licensed under the curl license; see licenses/curl-COPYING.txt. This is a self-contained build:
+  its TLS, compression and HTTP/2 and HTTP/3 libraries are linked into the DLL. The build reports
+  __CURLBUILD__
+  License texts for those components: licenses/curl-deps/.
 
 Microsoft Visual C++ runtime (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll)
   Deployed app-local as permitted by the Microsoft Visual Studio license terms.
+
+Compiled into the executables
+  These libraries are vendored as source under third_party/ and linked into bin/*.exe, so their
+  licenses cover every copy of the executables as well:
+    cpp-httplib, ggml-quants and llama-jinja (both from llama.cpp), nlohmann/json, spdlog, utf8proc
+  All six are MIT licensed; utf8proc and the Unicode case tables of the llama-jinja engine also
+  carry the Unicode data license. License texts: licenses/vendored/.
 '@
-$notices = $notices.Replace("__VERSION__", $version).Replace("__DLLS__", $dllLines).Replace("__FFMPEG__", $ffmpegBuild)
+$notices = $notices.Replace("__VERSION__", $version).Replace("__DLLS__", $dllLines).
+    Replace("__FFMPEG__", $ffmpegBuild).Replace("__FFMPEGLICENSE__", $ffmpegLicense).
+    Replace("__FFMPEGSOURCE__", $ffmpegSource).Replace("__CURLBUILD__", $curlBuild)
 [System.IO.File]::WriteAllText((Join-Path $staging "THIRD-PARTY-NOTICES.txt"), $notices, [System.Text.UTF8Encoding]::new($false))
 
 $readme = @'
@@ -279,7 +349,7 @@ and long-context-reuse configurations:
 
   https://github.com/zhuojun1024/ninfer-5060ti-tp2-windows
 
-NInfer is Apache-2.0 (see LICENSE). The bundled libraries and their licenses are listed in
+NInfer is Apache-2.0 (see LICENSE and NOTICE). The bundled libraries and their licenses are listed in
 THIRD-PARTY-NOTICES.txt, with the license texts under licenses/.
 '@
 $readme = $readme.Replace("__VERSION__", $version)

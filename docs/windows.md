@@ -73,7 +73,10 @@ pwsh -File tools/win_port/package.ps1 -RequireTag       # refuse unless HEAD car
 The script reads the version from the executables and refuses to package when the three disagree, so
 the archive cannot be labeled from anything but the binaries themselves. It walks the
 `dumpbin /dependents` closure of all three, copies every DLL it resolves into `bin/`, and adds
-`LICENSE`, a generated `README.txt`, `THIRD-PARTY-NOTICES.txt` and the bundled license texts.
+`LICENSE`, `NOTICE`, a generated `README.txt`, `THIRD-PARTY-NOTICES.txt` and the license text of
+every component in the archive: `licenses/` for the CUDA, FFmpeg and curl prefixes,
+`licenses/vendored/` for the sources compiled into the executables, and `licenses/curl-deps/` for
+the libraries linked into `libcurl-x64.dll`.
 
 Vendor directories win over `System32` while resolving that closure: `msvcp140.dll` is in `System32`
 on a machine with the VC redist installed, but the archive has to carry the redistributable copy so it
@@ -81,9 +84,19 @@ also runs where the redist is absent. `nvcuda.dll` always comes from the display
 bundled, so a current NVIDIA driver is still required.
 
 The bundled cuBLAS libraries are what let the archive run without a local CUDA toolkit; Attachment A
-of the CUDA toolkit license lists them as redistributable. The FFmpeg libraries in the verified prefix
-are a GPL build (`--enable-gpl --enable-version3`), so `THIRD-PARTY-NOTICES.txt` records the exact
-build identifier from `ffmpeg -version` next to the GPL text that travels in `licenses/`.
+of the CUDA toolkit license lists them as redistributable. `THIRD-PARTY-NOTICES.txt` names every
+component and says where its license text sits, including components that are not separate DLLs: the
+six MIT sources vendored under `third_party/` and compiled into the executables, and the TLS,
+compression and HTTP/2 and HTTP/3 libraries that the curl prefix links into `libcurl-x64.dll` (the
+script records that list verbatim from `curl -V`).
+
+FFmpeg needs one decision per prefix. The verified prefix is a GPL build
+(`--enable-gpl --enable-version3`), so its notice entry records the build identifier from
+`ffmpeg -version` next to the GPL text and the source location. NInfer only calls the decoders in
+`avcodec`, `avformat`, `avutil`, `swscale` and `swresample` (`src/media/decode/decode.cpp`), so an
+LGPL FFmpeg prefix can replace it, which removes the GPL source-offer obligation from the archive;
+point `build.ps1` and `package.ps1` at that prefix with `-FfmpegRoot`, then re-verify decoding,
+because the notice and the archive would otherwise still describe a GPL build.
 
 Publishing is manual and stays outside the script: build, package, tag the release commit `v<version>`,
 push the tag, and attach the archive to the GitHub release. `package.ps1` never tags, pushes or uploads.
