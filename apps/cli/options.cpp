@@ -109,13 +109,18 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n";
+           "individual fields.\n"
+           "--version prints the release version and exits.\n";
 }
 
 Options parse_options(int argc, char** argv) {
     Options options;
     if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         options.help_requested = true;
+        return options;
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "--version") {
+        options.version_requested = true;
         return options;
     }
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }

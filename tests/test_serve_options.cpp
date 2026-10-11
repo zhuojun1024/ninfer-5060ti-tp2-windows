@@ -471,6 +471,13 @@ int main() {
     } catch (const std::invalid_argument&) { overlap_rejected = true; }
     failures += check(overlap_rejected, "a misaligned prefill overlap width was accepted");
 
+    // --version must report the release without an artifact path, exactly as --help does.
+    const ServeOptions version = parse({"ninfer-serve", "--version"});
+    failures += check(version.version_requested && !version.help_requested,
+                      "--version did not request the release version");
+    failures += check(serve_usage_text("ninfer-serve").find("--version") != std::string::npos,
+                      "serve help omits --version");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -43,6 +43,10 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
+    if (options.version_requested) {
+        std::cout << "ninfer-serve " << NINFER_VERSION << '\n';
+        return 0;
+    }
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer-serve",

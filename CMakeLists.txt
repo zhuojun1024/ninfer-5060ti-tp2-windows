@@ -12,7 +12,9 @@ if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
-project(ninfer LANGUAGES C CXX CUDA)
+# Single source for the release version: the tagged release vX.Y.Z carries exactly this version,
+# and tools/win_port/package.ps1 refuses to package a tree whose tag does not match.
+project(ninfer VERSION 0.1.0 LANGUAGES C CXX CUDA)
 
 # WSL2's virtualized driver (591.x) segfaults inside the driver JIT compiler
 # during CUDA initialization with the dynamically linked CUDA 13.1 runtime;

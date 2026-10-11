@@ -126,7 +126,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --version prints the release version and exits.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -147,6 +148,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
+        return options;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--version") {
+        options.version_requested = true;
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }

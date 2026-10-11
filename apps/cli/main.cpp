@@ -241,6 +241,10 @@ int main(int argc, char** argv) {
         std::cout << ninfer::cli::usage_text(argv[0]);
         return 0;
     }
+    if (cli.version_requested) {
+        std::cout << "ninfer " << NINFER_VERSION << '\n';
+        return 0;
+    }
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer",

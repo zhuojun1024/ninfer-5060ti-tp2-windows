@@ -21,7 +21,8 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
-    bool help_requested = false;
+    bool help_requested    = false;
+    bool version_requested = false;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";

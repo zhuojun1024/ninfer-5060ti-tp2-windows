@@ -18,3 +18,8 @@ add_executable(ninfer-perplexity
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+# Each product executable reports the release version through --version.
+foreach(product ninfer ninfer-serve ninfer-perplexity)
+  target_compile_definitions(${product} PRIVATE NINFER_VERSION="${PROJECT_VERSION}")
+endforeach()

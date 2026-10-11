@@ -119,5 +119,9 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    const ninfer::cli::Options version = parse({"ninfer-cli", "--version"});
+    failures += check(version.version_requested && !version.help_requested,
+                      "--version did not request the release version");
+    failures += check(help.find("--version") != std::string::npos, "CLI help omits --version");
     return failures == 0 ? 0 : 1;
 }
