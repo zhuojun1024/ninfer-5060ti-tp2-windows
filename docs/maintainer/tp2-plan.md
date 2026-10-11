@@ -84,7 +84,7 @@ profiles across the four: q4 88 / q8 7 / bf16 567): `<models-dir>/qwen3_8_27b_w4
   architectural hazards in §3.7.
 - **FP8 PV (2026-09-27)**: the implementation passed all quality gates (short prompt Δ=+0.29pp, deep context Δ=−0.88pp, both within noise, op-level
   output perturbation about 2×), but was only 1.176× at the op level (target ≥1.3×) ⇒ reverted per the user's pre-authorization rule, and the fp8
-  criterion restored to 1.2e-2; the patch is kept at the repository root as `PLAN-fp8pv-v1b.patch`. **Key output**: barrier stall 34.2% + math pipe throttle 25.2% ⇒
+  criterion restored to 1.2e-2; the patch is kept as `docs/maintainer/patches/fp8-pv-v1b.patch`. **Key output**: barrier stall 34.2% + math pipe throttle 25.2% ⇒
   the headroom is in the phase structure, not in the PV dtype.
 - **Cross-tile phase pipelining (2026-09-27)**: G0 confirmed that on the post-revert FP16-PV baseline the barrier is still the second stall (26.3%,
   of which 97% falls on two full-block `__syncthreads()`); but both resident-role implementations regressed to 0.71–0.80× — the full-block PV accumulator's

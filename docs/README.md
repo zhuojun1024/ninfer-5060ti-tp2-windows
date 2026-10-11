@@ -84,6 +84,15 @@ the shared machinery.
 | [llama.cpp TP notes](maintainer/tp2-llamacpp-notes.md) | comparison notes against a local llama.cpp TP build |
 | [TP-2 adaptation worklog](maintainer/tp2-adaptation-worklog.md) | chronological round-by-round record, including five verbatim plan snapshots |
 
+### Archived patches
+
+[`maintainer/patches/`](maintainer/patches/) keeps a reverted implementation as a patch when the
+record argues against re-deriving it. Each patch applies cleanly to the commit that cites it.
+
+| Patch | Covers |
+|---|---|
+| [FP8 PV v1b](maintainer/patches/fp8-pv-v1b.patch) | the reverted FP8 PV attention implementation and its P packing |
+
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from

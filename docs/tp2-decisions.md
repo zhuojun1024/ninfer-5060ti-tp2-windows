@@ -48,8 +48,8 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   within the 30-rep noise) but reached only **1.176×** at the op level against the
   ≥1.3× bar (end-to-end ≈+1.4%, single sample) while widening the fp8 op tolerance
   1.2e-2 → 3.2e-2 (~2× output perturbation). Per the user's pre-authorization it was
-  rolled back and the 1.2e-2 gate restored; the full implementation sits at the
-  repository root as `PLAN-fp8pv-v1b.patch`. The lasting result is the attribution:
+  rolled back and the 1.2e-2 gate restored; the full implementation sits at
+  `docs/maintainer/patches/fp8-pv-v1b.patch`. The lasting result is the attribution:
   **barrier stall 4.23 cyc/inst (34.2%) + math pipe throttle 3.12 (25.2%)** ⇒ the
   headroom is in the phase structure, not the PV dtype. (worklog 2026-09-27 archive
   §6; tp2-plan.md §2)
