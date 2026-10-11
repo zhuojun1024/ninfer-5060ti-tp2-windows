@@ -458,7 +458,8 @@ adaptation worklog](docs/maintainer/tp2-adaptation-worklog.md).
 
 ## License
 
-NInfer is licensed under the [Apache License 2.0](LICENSE).
+NInfer is licensed under the [Apache License 2.0](LICENSE); [NOTICE](NOTICE) records the upstream
+project this fork derives from and every component vendored under `third_party/`.
 
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
@@ -469,4 +470,5 @@ also uses the fixed packed weights from
 The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
 repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
-under `third_party/`.
+under `third_party/`. A release archive carries the license text of every component it bundles next
+to the binaries, listed in `THIRD-PARTY-NOTICES.txt`.

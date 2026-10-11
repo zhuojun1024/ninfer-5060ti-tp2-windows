@@ -424,7 +424,8 @@ GPU 驻留在进程启动时固定，因此 `--devices 0,1`、`--spec` 与 `--vi
 
 ## 许可证
 
-NInfer 采用 [Apache License 2.0](LICENSE) 许可。
+NInfer 采用 [Apache License 2.0](LICENSE) 许可；[NOTICE](NOTICE) 记录本 fork 所源自的上游项目，
+以及 `third_party/` 下每个 vendored 组件。
 
 已发布的工件派生自 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)、
 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) 与
@@ -433,4 +434,5 @@ NInfer 采用 [Apache License 2.0](LICENSE) 许可。
 的固定打包权重。Qwen3.8-27B NVFP4 工件还使用了
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) 的固定
 FP8/NVFP4 混合权重。这些源仓库以 Apache-2.0 分发。vendored 依赖保留各自在 `third_party/`
-下的许可证文件。
+下的许可证文件。发行归档在二进制旁附带其打包的每个组件的许可证文本，清单见
+`THIRD-PARTY-NOTICES.txt`。

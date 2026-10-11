@@ -1,0 +1,30 @@
+NInfer
+Copyright 2026 the NInfer authors
+
+This repository is a fork of Neroued/ninfer <https://github.com/Neroued/ninfer>, the upstream
+project created by Neroued. Both are licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Relative to that upstream project this fork adds the dual-GPU TP-2 execution route for a pair of
+GeForce RTX 5060 Ti cards, the native Windows build, serving and packaging scripts, and the TP-2
+documentation, and it changes the engine, serving and model code those routes touch. No file
+carries a per-file change notice; the difference from upstream is this fork's commit history, and
+the affected areas are named in README.md under "Relationship to upstream".
+
+Vendored third-party sources keep their own licenses:
+
+  third_party/cpp-httplib   MIT License (Copyright (c) 2017 yhirose)
+  third_party/ggml-quants   MIT License (from llama.cpp, Copyright (c) 2023-2026 The ggml authors)
+  third_party/llama-jinja   MIT License (from llama.cpp) and the Unicode data license in
+                            third_party/llama-jinja/UNICODE-LICENSE
+  third_party/nlohmann      MIT License (Copyright (c) 2013-2025 Niels Lohmann)
+  third_party/spdlog        MIT License (Copyright (c) 2016-present Gabi Melman and contributors)
+  third_party/utf8proc      MIT License and the Unicode data license, see
+                            third_party/utf8proc/LICENSE.md
+
+Chat templates in tools/chat_templates/ and the model cards in model-cards/ carry their own license
+files. Evaluation corpora and their attribution are documented in
+eval/corpora/perplexity-1m/THIRD_PARTY_NOTICES.md.
+
+A binary release archive lists the shared libraries it bundles, together with the license texts of
+those libraries and of the sources linked into the executables, in THIRD-PARTY-NOTICES.txt and
+under licenses/.
