@@ -2,6 +2,10 @@
 # A runtime-only FFmpeg tree has no include/ or lib/, so the core media decoder (src/media/decode)
 # cannot be compiled against it. BtbN's shared win64 build ships both.
 #
+# The LGPL build is fetched by default: NInfer only calls FFmpeg's decoders, so nothing here needs the
+# GPL-only parts, and a redistributed archive then carries no GPL source-offer obligation. A GPL
+# prefix still builds and packages (package.ps1 writes the notice entry that matches its LICENSE.txt).
+#
 #   pwsh -File tools/win_port/fetch_ffmpeg.ps1
 #   pwsh -File tools/win_port/fetch_ffmpeg.ps1 -Destination D:/deps -Proxy http://127.0.0.1:8080
 #
@@ -18,7 +22,7 @@ param(
 $ErrorActionPreference = "Stop"
 $dst = $Destination
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-$url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+$url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
 $out = Join-Path $dst "ffmpeg-win64-shared.zip"
 if (-not (Test-Path $out)) {
     try {

@@ -247,9 +247,10 @@ if (Test-Path $ffmpegExe) {
     }
 }
 
-# The FFmpeg license in the prefix decides how the notice has to describe the bundled libraries: a
-# GPL build carries a source-offer obligation, an LGPL build only has to stay replaceable, which
-# shipping the libraries as separate DLLs already satisfies.
+# The FFmpeg license in the prefix decides how the notice has to describe the bundled libraries: both
+# licenses want the corresponding source named, and a GPL build additionally carries the source-offer
+# obligation that the LGPL does not. Shipping the libraries as separate DLLs keeps them replaceable,
+# which is the LGPL's other requirement.
 $ffmpegLicense = "GNU General Public License version 3"
 $ffmpegSource = "This build was configured with --enable-gpl --enable-version3. The libraries are " +
 "distributed`n  unmodified and are loaded at run time as separate shared objects. Corresponding " +
@@ -260,7 +261,9 @@ if ((Test-Path $ffmpegLicenseFile) -and
         ([System.IO.File]::ReadAllText($ffmpegLicenseFile) -match 'LESSER GENERAL PUBLIC LICENSE')) {
     $ffmpegLicense = "GNU Lesser General Public License version 3"
     $ffmpegSource = "The libraries are distributed unmodified and are loaded at run time as " +
-    "separate shared`n  objects, which is what the LGPL requires in order to keep them replaceable."
+    "separate shared`n  objects, so a recipient can replace them with an interface-compatible " +
+    "build. Corresponding source:`n  the FFmpeg revision named above, available from " +
+    "https://ffmpeg.org/download.html (git`n  https://git.ffmpeg.org/ffmpeg.git)."
 }
 
 # curl reports the exact versions of everything linked into libcurl-x64.dll on its first line, which

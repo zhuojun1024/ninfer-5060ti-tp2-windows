@@ -90,7 +90,7 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer --local-dir models
 
 ```powershell
 $env:NINFER_MODEL        = "models\qwen3_8_27b_nvfp4.ninfer"
-$env:NINFER_FFMPEG_ROOT  = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared"
+$env:NINFER_FFMPEG_ROOT  = "D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-lgpl-shared"
 $env:NINFER_LIBCURL_ROOT = "C:/curl"     # fetch_curl.ps1 prints the prefix it unpacked
 
 pwsh -File tools/win_port/serve.ps1            # 127.0.0.1:8099, 131072-token KV, MTP K=2, vision

@@ -13,7 +13,7 @@ cards in a TP-2 pair (`--devices 0,1`), artifact `qwen3_8_27b_nvfp4.ninfer` (23.
 - CUDA toolkit 13.3 (`nvcc`); CMake and Ninja on `PATH`.
 - An FFmpeg **development** prefix (headers plus import libraries) for media decoding. The shared
   BtbN build works; extract it anywhere and pass the prefix:
-  `-DNINFER_FFMPEG_ROOT=D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-gpl-shared`.
+  `-DNINFER_FFMPEG_ROOT=D:/ffmpeg-dev/expanded/ffmpeg-master-latest-win64-lgpl-shared`.
 - A libcurl prefix for remote media acquisition (`tools/win_port/fetch_curl.ps1` downloads one). The
   import library is used, not the static archive: MSVC must link `libcurl.dll.a` and load
   `libcurl-x64.dll` at run time. Only the CLI/server targets need it.
@@ -90,13 +90,14 @@ six MIT sources vendored under `third_party/` and compiled into the executables,
 compression and HTTP/2 and HTTP/3 libraries that the curl prefix links into `libcurl-x64.dll` (the
 script records that list verbatim from `curl -V`).
 
-FFmpeg needs one decision per prefix. The verified prefix is a GPL build
-(`--enable-gpl --enable-version3`), so its notice entry records the build identifier from
-`ffmpeg -version` next to the GPL text and the source location. NInfer only calls the decoders in
-`avcodec`, `avformat`, `avutil`, `swscale` and `swresample` (`src/media/decode/decode.cpp`), so an
-LGPL FFmpeg prefix can replace it, which removes the GPL source-offer obligation from the archive;
-point `build.ps1` and `package.ps1` at that prefix with `-FfmpegRoot`, then re-verify decoding,
-because the notice and the archive would otherwise still describe a GPL build.
+FFmpeg needs one decision per prefix, and the verified prefix is the LGPL shared build
+(`ffmpeg-master-latest-win64-lgpl-shared`). LGPL is sufficient here because NInfer only calls the
+decoders in `avcodec`, `avformat`, `avutil`, `swscale` and `swresample`
+(`src/media/decode/decode.cpp`). The notice entry records the build identifier from
+`ffmpeg -version` next to the prefix's own `LICENSE.txt`, so an archive never claims a license the
+prefix does not carry; a GPL prefix still builds and packages, and its entry then also names the
+source location. Keep the prefix and the archive in step: changing `-FfmpegRoot` without
+re-packaging leaves the notice describing the previous build.
 
 Publishing is manual and stays outside the script: build, package, tag the release commit `v<version>`,
 push the tag, and attach the archive to the GitHub release. `package.ps1` never tags, pushes or uploads.
