@@ -40,6 +40,9 @@ same pair only if one TP-2 shard fits in 16 GiB.
 † Not tested on the dual RTX 5060 Ti pair; the Qwen3.6 series artifacts are listed for
 completeness.
 
+The community merge has a versioned card in this repository, which records the exact package this
+fork verifies: [model card](model-cards/Qwen3.8-27B-Coder390-NVFP4-NInfer/README.md).
+
 Each v3 `.ninfer` artifact carries model configuration, encoded weights, logical bindings and
 frontend resources. Runtime execution uses those facts with the implemented model and Op
 capabilities. You can also [convert your own weights](docs/weight-conversion.md), reuse an official

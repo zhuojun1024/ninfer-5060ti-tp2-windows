@@ -1,0 +1,92 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer",
+    "bytes": 23773675264,
+    "sha256": "cccfbf0ba3ec4e86837e8e6481ec32ee3e10636633e421429f19ea3ea97926e2",
+    "container_version": 3,
+    "architecture": "Qwen3_5ForCausalLM",
+    "name": "qwen3.8-27b-coder390-w4a4-w8a8-mtp-dflash2",
+    "artifact_id": "0d236ca0a8c5482d91d85306e5c691cb",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
+  },
+  "source": {
+    "base": {
+      "repo_id": "Qwen/Qwen3.8-27B",
+      "license": "Apache-2.0"
+    },
+    "post_trained": {
+      "repo_id": "nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2",
+      "license": "Apache-2.0"
+    },
+    "quantized": {
+      "repo_id": "nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-NVFP4-NInfer",
+      "path": "NVFP4/W4A4-W8A8",
+      "license": "Apache-2.0"
+    },
+    "dflash2": {
+      "path": "Qwen3.8-27B-DFlash2"
+    },
+    "vision": {
+      "path": "NVFP4/W4A4-W8A8/vision-bf16.safetensors"
+    }
+  },
+  "conversion": {
+    "recipe_id": "qwen3_8_27b_nvfp4",
+    "converter_repository": "https://github.com/Neroued/ninfer"
+  },
+  "runtime": {
+    "repository": "https://github.com/zhuojun1024/ninfer-5060ti-tp2-windows",
+    "cuda_architecture": "sm_120a",
+    "dflash2_draft_tokens": {
+      "recommended": 7,
+      "minimum": 1,
+      "maximum": 15
+    },
+    "mtp_draft_tokens": {
+      "recommended": 3,
+      "minimum": 1,
+      "maximum": 5
+    }
+  },
+  "inventory": {
+    "objects": 1256,
+    "tensors": 1250,
+    "resources": 6,
+    "bindings": 1513,
+    "uses": 844,
+    "formats": {
+      "bf16": 579,
+      "fp32": 264,
+      "fp8_e4m3fn_row_bf16": 146,
+      "int32": 1,
+      "nvfp4": 112,
+      "q4_g64_fp16": 55,
+      "q5_g64_fp16": 54,
+      "q6_g64_fp16": 1,
+      "q8_g32_fp16": 38
+    },
+    "layouts": {
+      "block_scale_k16_m128x4_v1": 112,
+      "contiguous_le_v1": 844,
+      "row_scale_v1": 146,
+      "row_split_k128_v1": 148
+    },
+    "encodings": {
+      "raw_bytes_v1": 6
+    },
+    "bytes": {
+      "tensor": 23762105856,
+      "resource": 11087353,
+      "object": 23773193209,
+      "payload_span": 23773277952,
+      "alignment": 84743
+    }
+  }
+}

@@ -29,6 +29,10 @@ The executable `--help` output is the exact source for command-line option spell
 | Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
 | Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+| Qwen3.8-27B Coder390 | `nvfp4` W4A4-W8A8 | [Hugging Face](https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-NVFP4-NInfer) | [model card](../model-cards/Qwen3.8-27B-Coder390-NVFP4-NInfer/README.md) |
+
+The last row is a community merge published by nerkyor rather than by the upstream author, and it is
+the artifact the dual-card TP-2 route is verified on; its card records the package this fork uses.
 
 ## Repository-local guides
 
