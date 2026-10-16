@@ -114,8 +114,14 @@ throughput table is in the [README](../README.md#single-request-serving).
 | TP-2 plain decode | 32.8 tok/s | 32.9 tok/s |
 | TP-2 MTP `--draft-tokens 2` decode | 56.8 tok/s | 56.9 tok/s |
 | Image turn decode | MTP kept active | 60.4 tok/s, MTP continued (`rate=106/174`) |
-| Engine load (23.7 GB artifact) | — | 35-42 s |
+| Engine load (23.7 GB artifact) | — | 36-39 s (`staging peak` 256 MiB: pinned ring) |
 | Real agent traffic (OpenAI chat, streaming, tools, images) | — | served, 41-73 tok/s |
+
+The loader starts the server faster than the old 45-47 s rows: `tp_materialize` stages every
+weight piece through a four-slot 256 MiB portable-pinned ring (one event per device per slot) and
+overlaps the artifact read with the shard uploads instead of staging pageable payloads at all.
+Six measured samples on the two builds (interleaved stash/rebuild, engine `ready` line, single
+resident instance): baseline 45.0/47.0/47.1 s, pipelined 29.8/37.9/38.3 s.
 
 KV capacity and memory headroom on the 16 GiB cards (`--vision` enabled):
 

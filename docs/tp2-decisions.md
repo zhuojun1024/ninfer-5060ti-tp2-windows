@@ -18,7 +18,15 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   selects by GPU name, not index. (worklog §0–§2)
 - **Load-time weight splitting; converter untouched.** Materialization reads the
   complete tensor, splits, and uploads per shard; reuses the official 23.7 GB
-  artifact. (worklog §2)
+  artifact. (worklog §2) Since 2026-10-17 the materialization overlaps the
+  artifact read with both shard uploads through a four-slot 64 MiB portable-pinned
+  ring (one event per device context per slot; events are context-affine so each
+  slot builds one under each shard's device), replacing the serial read → split →
+  per-upload-sync chain. Measured 2026-10-17, six interleaved A/B samples,
+  stash/rebuild arm switch, one instance at a time: engine `ready` median 47.0 s
+  (baseline 45.0/47.0/47.1) vs 37.9 s (pipelined 29.8/37.9/38.3), −19%; the load
+  summary reports `staging peak` 256 MiB as engagement proof. Details:
+  [windows.md](windows.md#verified-behavior-on-windows).
 - **DFlash2 and MTP are mutually exclusive backends.** Choosing DFlash2 frees
   shard 0's MTP weights (430 MiB) + KV (516 MiB). (worklog §3.6)
 - **Whole-copy draft is infeasible.** At full context (262,144 / fp8 / MTP K=2)
@@ -104,6 +112,49 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
 - **Overclock/power wall and P2P are infeasible** (already at full clock,
   93/85 W; the consumer driver masks P2P, `canAccessPeer=0`, SYS topology
   across root complexes). (worklog §11.7, §3.13)
+- **Prefill sequence parallelism (2026-10-16): falsified at the design stage, not
+  implemented.** Splitting tokens across the pair does not reduce the prefill AR
+  bottleneck: the RS+AG pairs a Megatron-SP layout needs are byte-equivalent to the
+  ARs they replace (per layer: RS(mixer-out)+AG(next QKV)+RS(FFN-out)+AG(gate_up)
+  = 4S ≡ 2×AR), so net PCIe bytes ≈ 0 while halving each payload (10→5 MiB) would
+  only lower mapped-pinned transfer efficiency. Compute savings are also capped:
+  attention/GDN stay head-sharded (each card must process all T tokens for its own
+  heads), so token splitting saves only FFN/norm/Q-projection FLOPs (~30–40% of a
+  layer) and 16 attention layers would need a cross-card KV gather (~8 KB/token).
+  The blocker is GDN ownership: 48 of 64 layers are GDN whose chunked state-passing
+  is a per-head serial chain across chunks (`src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu:19-24`)
+  with state owned by the head's card; token splitting forces either full-activation
+  cross-card handoff per layer (erasing the compute saving) or a mid-sequence
+  cross-card break of the serial chain (~1.6 MB state/conv handoff + per-layer
+  serialization). Do not re-investigate without a hidden-dimension or GDN-state
+  redesign. (feasibility analysis 2026-10-16; PLAN.md §A1)
+- **Adaptive speculative extent per request (2026-10-17): implemented, measured on the
+  production route, reverted.** The idea: replace the startup-fixed draft window with a
+  per-round extent chosen from measured per-position acceptance
+  (`E(k)=1+Σ_{i<k}q_i`, EWMA α=0.25 over rounds) divided by a per-envelope round-time model
+  (EWMA bucket per envelope size; linear prior 35+2.5k ms). Two policy shapes were measured on
+  the MTP K=5 route, 4-concurrent mixed batch (lane prompts 64/1536/6144/8192, 512 max tokens,
+  20 waves) with server-side equals (env `NINFER_TP2_ADAPTIVE_SPEC=1`); the interleaved A/B
+  campaign ran 4 cycles × 8 waves per arm, fresh server process per arm-half:
+  - *Per-lane selfish policy (v1): −6.5% aggregate* (57.3 vs 61.3 tok/s). The round costs what
+    its widest lane drafts, so a lane drafting short while others stay wide free-rides — fewer
+    expected tokens per round at identical round cost. Trace confirmed collapse toward
+    window 0/1. Per-lane extent optimization is structurally wrong under a shared envelope.
+  - *Batch-uniform window policy (v2), the corrected shape*: aggregate +2.6 ± 5.1 tok/s paired
+    (decode-only +2.4 ± 6.4) — not significant, below the ≥3.5% retention bar; measured
+    acceptance rose (0.43 vs 0.385 pooled) but the wider-window cost it saves is already small
+    (verify column marginal ≈1.85 ms).
+  - *Solo regression: −7.1 ± 1.0 tok/s (−9.7%), consistent in all 4 cycles.* A single request on
+    the 4-lane route still runs the batch executor (`columns=1`), where round cost is
+    substantially width-sensitive; the policy shrank the solo window below its optimum. A
+    columns≥2 gate would remove this but leaves the unproven ~+2.6 tok/s batch effect.
+  Reverted per the pre-set <3.5% rule. Do not re-open unless a workload with structurally
+  broader per-position acceptance spread (e.g. much larger K, or acceptance-collapsed batches)
+  is the actual serving profile. Interleaved A/B protocol: cold solo probe first (post-wave
+  solo runs sink ~10 tok/s from in-process batch state in a server-version-independent way),
+  fresh process per arm-half, paired-by-cycle analysis.
+  (PLAN.md §A2; measurement JSONs under `_temp/20261017-0115_a2_*`; bench driver
+  `_temp/20261017-0115_a2_interleaved_ab.ps1`)
 - **Device-plane divergence anchor (+73.4 MiB/card): abandoned.** Saves only
   ~9.9 ms per session; in real chat the reachability guard usually holds and
   the device path is taken. (worklog Round 17)

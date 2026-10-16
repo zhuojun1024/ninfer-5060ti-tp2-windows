@@ -2,23 +2,125 @@
 
 #include "artifact/framing.h"
 #include "artifact/reader.h"
+#include "core/arena.h"
 #include "core/startup.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::tp {
 namespace {
+
+// Pinned staging pipeline. The single-card materializer (artifact/materializer.cpp) already
+// proves the pattern: reads stage into ring slots while earlier pieces are still in flight
+// and nothing synchronizes per object. This port adds the TP twist: one ring serves both
+// shard streams, every slot carries one event per device, and a replicated piece enqueues
+// its copy on both devices from the same slot. The resident pinned occupancy stays at four
+// slots even for multi-GiB weights, and the producer only blocks when a slot has to wait
+// for its own copies — the ring goes as deep as the devices allow before it fights back.
+constexpr std::size_t kSlotBytes = 64ULL * 1024 * 1024;
+constexpr std::size_t kSlotCount = 4;
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
         throw artifact::ArtifactError(std::string(operation) + ": " + cudaGetErrorName(status) + ": " +
                                       cudaGetErrorString(status));
+    }
+}
+
+// One staging slot: exactly one ≤kSlotBytes piece, readable by both devices. Portable
+// pinned is mandatory — cudaMallocHost alone pins for the allocating context only, and the
+// same slot feeds a copy enqueued on the other device's stream (arena.h PinnedHostBuffer).
+// Events are context-affine: an event records only into a stream of the context that
+// created it, so each slot builds one event under each shard's device context explicitly,
+// and restores the caller's current device.
+struct Slot {
+    Slot(std::size_t bytes, const DeviceContext& device0, const DeviceContext& device1)
+        : buffer(bytes, /*portable=*/true) {
+        int restored_device = -1;
+        check_cuda(cudaGetDevice(&restored_device), "query current device for tp staging events");
+        check_cuda(cudaSetDevice(device0.device), "bind tp staging event device 0");
+        check_cuda(cudaEventCreateWithFlags(&events[0], cudaEventDisableTiming),
+                   "create tp staging completion event 0");
+        check_cuda(cudaSetDevice(device1.device), "bind tp staging event device 1");
+        check_cuda(cudaEventCreateWithFlags(&events[1], cudaEventDisableTiming),
+                   "create tp staging completion event 1");
+        check_cuda(cudaSetDevice(restored_device), "restore current device for tp staging");
+    }
+
+    ~Slot() {
+        // Drain before release: a slot destroyed while a copy is still in flight would free
+        // the pinned backing under that copy. The destructor must not throw, so the drain
+        // ignores the (already-failed) status here.
+        for (int stream = 0; stream < 2; ++stream) {
+            if (pending[stream]) {
+                (void)cudaEventSynchronize(events[stream]);
+                pending[stream] = false;
+            }
+            if (events[stream]) { (void)cudaEventDestroy(events[stream]); }
+        }
+    }
+
+    // The next producer may only overwrite a slot whose enqueued copies have completed on
+    // every device that reads from it.
+    void wait() {
+        for (int stream = 0; stream < 2; ++stream) {
+            if (pending[stream]) {
+                check_cuda(cudaEventSynchronize(events[stream]), "wait for tp staging transfer");
+                pending[stream] = false;
+            }
+        }
+    }
+
+    void issue(DeviceContext& device, int stream) {
+        check_cuda(cudaEventRecord(events[stream], device.transfer_stream),
+                   "record tp staging completion");
+        pending[stream] = true;
+    }
+
+    PinnedHostBuffer buffer;
+    cudaEvent_t events[2] = {nullptr, nullptr};
+    bool pending[2]       = {false, false};
+};
+
+// One opaque piece scheduled through the ring: copy the bytes out of the caller's payload
+// into the next slot, then enqueue the H2D copies into every target (shard destination +
+// owning device). Replication is a single stage_piece call with both shard targets; a split
+// weight stages one call per shard from its own shard payload.
+struct UploadTarget {
+    std::byte* data = nullptr;       // device arena address for this piece
+    DeviceContext* device = nullptr; // owning shard context (transfer stream + event slot)
+    int stream = 0;                  // shard index; selects the slot's event half
+    const char* operation = nullptr; // failure label for the cudaMemcpyAsync
+};
+
+void stage_piece(std::span<Slot> ring, std::size_t& cursor, const std::byte* source,
+                 std::size_t bytes, std::span<const UploadTarget> targets) {
+    if (bytes == 0 || targets.empty()) { return; }
+    // One slot holds at most one piece, so a payload larger than kSlotBytes walks the ring
+    // one piece at a time; every piece keeps its own offset in every destination, and a
+    // replicated piece still enqueues all shard copies from the same slot.
+    std::size_t offset = 0;
+    while (offset < bytes) {
+        const std::size_t piece = std::min(bytes - offset, kSlotBytes);
+        Slot& slot = ring[cursor++ % ring.size()];
+        slot.wait();
+        std::memcpy(slot.buffer.data(), source + offset, piece);
+        for (const auto& target : targets) {
+            check_cuda(cudaMemcpyAsync(target.data + offset, slot.buffer.data(), piece,
+                                       cudaMemcpyHostToDevice, target.device->transfer_stream),
+                       target.operation);
+            slot.issue(*target.device, target.stream);
+        }
+        offset += piece;
     }
 }
 
@@ -195,6 +297,22 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
     auto& a0_stats   = a0.tp_stats();
     auto& a1_stats   = a1.tp_stats();
 
+    // The staging ring outlives every object's pieces; a C array (not a vector — MSVC
+    // instantiates _Uninitialized_move for vector<T>::reserve and demands a move ctor the
+    // pinned slots cannot have) declares exactly kSlotCount portable slots, each readable by
+    // both device contexts and destroyed in reverse order at scope exit, draining any copy
+    // still in flight before its buffer is freed.
+    Slot staging[kSlotCount] = {Slot(kSlotBytes, device0, device1), Slot(kSlotBytes, device0, device1),
+                                Slot(kSlotBytes, device0, device1), Slot(kSlotBytes, device0, device1)};
+    std::span<Slot> ring = staging;
+    std::size_t staging_cursor = 0;
+    // The ring doubles as the pipeline's touchdown footprint: report its full size the way
+    // the single-card materializer reports its staging (materializer.cpp peak_staging_bytes)
+    // so the load summary proves the pinned path is actually engaged.
+    const std::uint64_t staged_bytes = kSlotBytes * kSlotCount;
+    a0.tp_stats().peak_staging_bytes = staged_bytes;
+    a1.tp_stats().peak_staging_bytes = staged_bytes;
+
     for (const auto& placement : plan.device_objects) {
         const auto& geometry = reader.geometry(placement.object);
         const std::uint64_t n = geometry.shape.size() >= 1 ? geometry.shape[0] : 1;
@@ -207,6 +325,9 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
 
         const auto kind = spec.kind(placement.object);
         if (kind == WeightSplitKind::Replicated) {
+            // Replication stages one piece and enqueues both shard copies from the same slot.
+            UploadTarget targets[2];
+            int target_count = 0;
             for (int shard = 0; shard < 2; ++shard) {
                 if (!spec.on_shard(placement.object, shard)) { continue; }
                 DeviceArena& arena  = shard == 0 ? a0_arena : a1_arena;
@@ -217,17 +338,15 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
                 DeviceContext& device                 = shard == 0 ? device0 : device1;
                 auto span = arena.alloc_bytes(static_cast<std::size_t>(geometry.bytes),
                                               static_cast<std::size_t>(geometry.alignment));
-                check_cuda(cudaMemcpyAsync(span.data, payload.data(),
-                                           static_cast<std::size_t>(geometry.bytes),
-                                           cudaMemcpyHostToDevice, device.transfer_stream),
-                           "upload tp replicated weight");
-                check_cuda(cudaStreamSynchronize(device.transfer_stream),
-                           "complete tp replicated upload");
+                targets[target_count++] = UploadTarget{
+                    static_cast<std::byte*>(span.data), &device, shard, "upload tp replicated weight"};
                 storage.device =
                     WeightParent{geometry, static_cast<const std::byte*>(span.data),
                                  divisor};
                 stats.h2d_bytes += geometry.bytes;
             }
+            stage_piece(staging, staging_cursor, payload.data(),
+                        static_cast<std::size_t>(geometry.bytes), std::span(targets, target_count));
             continue;
         }
 
@@ -273,19 +392,29 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
                            : a1_objects.at(placement.object.index);
             artifact::MaterializationStats& stats = shard == 0 ? a0_stats : a1_stats;
             DeviceContext& device                 = shard == 0 ? device0 : device1;
-            auto span = arena.alloc_bytes(shards[shard].payload.size(),
+            const std::size_t bytes = shards[shard].payload.size();
+            auto span = arena.alloc_bytes(bytes,
                                           static_cast<std::size_t>(shard_geo.alignment));
-            check_cuda(cudaMemcpyAsync(span.data, shards[shard].payload.data(),
-                                       shards[shard].payload.size(), cudaMemcpyHostToDevice,
-                                       device.transfer_stream),
-                       "upload tp shard");
-            check_cuda(cudaStreamSynchronize(device.transfer_stream), "complete tp shard upload");
+            // Each shard piece takes its own slot: the two payloads are disjoint host ranges,
+            // and staging them through one slot would serialize the ring for no reason.
+            const UploadTarget target{static_cast<std::byte*>(span.data), &device, shard,
+                                      "upload tp shard"};
+            stage_piece(staging, staging_cursor,
+                        reinterpret_cast<const std::byte*>(shards[shard].payload.data()), bytes,
+                        std::span(&target, 1));
             storage.device = WeightParent{shard_geo,
                                           static_cast<const std::byte*>(span.data),
                                           divisor};
-            stats.h2d_bytes += shards[shard].payload.size();
+            stats.h2d_bytes += bytes;
         }
     }
+
+    // The weights must be fully resident before the engine takes ownership: drain the ring
+    // and both transfer streams. Nothing above synchronized per object — a later object's
+    // reads already overlapped this one's transfers.
+    for (auto& slot : staging) { slot.wait(); }
+    check_cuda(cudaStreamSynchronize(device0.transfer_stream), "complete tp uploads");
+    check_cuda(cudaStreamSynchronize(device1.transfer_stream), "complete tp uploads");
     return {std::move(a0), std::move(a1)};
 }
 

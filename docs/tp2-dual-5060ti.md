@@ -66,6 +66,14 @@ comparable.
 The tables below keep the protocols and artifacts they were measured under; this section is the
 current reading.
 
+The loader staging overlaps the artifact read with both shard uploads instead of a serial
+read → split → per-upload-sync chain: 2026-10-17, six interleaved A/B samples on the same host
+(22.09 GB NVFP4 artifact, `--max-context 131072`, one instance at a time, engine `ready` line,
+stash/rebuild arm switch): baseline 45.0/47.0/47.1 s, pipelined 29.8/37.9/38.3 s (median 47.0 vs
+37.9 s), with the startup report showing `staging peak` 256 MiB (`four-slot portable-pinned ring`,
+[`docs/windows.md`](windows.md#verified-behavior-on-windows)). The `Load` column above predates
+this change.
+
 ## Benchmarks
 
 | Configuration | KV capacity | Memory per GPU | Prefill | Decode |
