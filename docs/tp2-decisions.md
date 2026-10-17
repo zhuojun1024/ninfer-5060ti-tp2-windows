@@ -446,6 +446,90 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   (−1.60 pp, proven cross-arm text drift); the promotion is done (r69,
   user-confirmed); 30-rep pooled sampling is the de facto method. Formalize in
   one place if/when. (worklog §8.6; tp2-plan.md §3.4)
+- **TP-2 -> PP-2 prefill pivot (2026-10-17): measured, not implemented.** A
+  prefill-only path that temporarily re-lays the resident weights from TP-2 to
+  PP-2 removes the per-layer allreduce entirely (PP has no cross-card GEMM split)
+  at zero change to the per-card compute (each card runs all of 32 layers vs half
+  of 64; both ~0.21-0.24 ms/token shallow), so it buys exactly the exposed AR
+  term dW ~ 0.33 ms/token, depth-independent. The swap is an in-place permutation
+  (TP-2 and PP-2 have the same per-card bytes: weights 9.51 GiB, and the KV/GDN
+  pools are byte-compatible), 4.755 GiB each direction per leg at the measured
+  6.5 GiB/s peer rate staged through the <=3 GiB free pool in waves: 2S ~ 1.5-2.9 s.
+  Measured TP-2 baseline (nvfp4, overlap 256): fresh 8k 0.531 ms/token, 32k 0.573,
+  64k 0.674, 100k 0.779; marginal at 100k depth (a cached prefix + 8.5k new)
+  **1.17-1.23 ms/token**. Expected end-to-end: fresh 32k-100k ~1.7x (79.3 s ->
+  47.8 s at 100k), break-even ~5-8.7k tokens, a wash for the ~10k-new-token-at-100k
+  case (1.03x). Amortized over a queue of prefills the break-even drops to
+  ~2k/request. Reopen when a long-document / fresh-prefill workload is the actual
+  serving profile; the effort is a full-weight PP binding, a 1F1B PP prefill
+  program, a KV/GDN swap-back permutation and a serving gate.
+  (docs/maintainer/tp2-pp-prefill-pivot.md)
+- **Conversation identity and one catalog entry per conversation (2026-10-17).** The
+  private-continuation catalog keyed slots only by token prefix: any perturbation of a conversation
+  - folding, a trimmed tail, a re-render - appended a new entry and merely demoted the old one to
+  weight 4, so variants of one conversation filled the `--max-private-continuations` slots and
+  evicted the other conversation, paying host memory for no reuse. The serve layer now extracts a
+  conversation identity (`x-session-id` > `x-claude-code-session-id` >
+  `x-bili-plugin-conversation` beside `x-bili-plugin` > body `prompt_cache_key`/`session_id`;
+  1..256 bytes) on all three routes and passes it as the existing LiveSession key. The engine keeps
+  one entry per name: a publish locates the entry the request continues by content - the entry,
+  carrying that identity or still anonymous, whose stored history shares the longest prefix with the
+  incoming history, covering all but a short rewritten tail - and rewrites that entry in place (the
+  resident case simply extends it) instead of dropping and re-appending it. That distinction is the
+  whole reuse benefit: the entry's host slabs hold the prefix KV and the divergence image this
+  request's own prefill just snapshotted, so replacing the record threw the fresh image away and the
+  next turn had to re-prefill the full prompt. The rewrite folds the new history over the old record
+  and clamps the host bookkeeping to the shared prefix (`host_kv_end`, plus every offered boundary
+  above it reset), so a boundary the engine can no longer reach is never offered again. A related
+  correctness fix gives the frontier state image its own position (`SessionEntry::host_frontier_end`):
+  an entry's `frontier` moves when the entry is recalled or extended while its `host_state` image
+  stays where it was captured, so offering that image at the entry's current frontier would have
+  restored a deeper state onto a shallower boundary. A request that carries the name but continues
+  none of that history (a review or sub-agent
+  call) publishes anonymously and leaves the entry alone; a conversation whose slot was taken that
+  way takes it back on its next turn, replacing the one-off entry. Eviction gained a publisher-weight
+  gate, so an anonymous request cannot displace a named conversation. Deterministic harness (three
+  alternating conversations, one folded rewrite, one unrelated request carrying a session's header,
+  one title call that opens a name before the conversation does, chat route): catalog size stayed at
+  the 3-entry capacity with one entry per conversation, the folded rewrite reported `replaces=1`, the
+  unrelated request `bind=0` with no eviction, and the title call's entry was replaced by the
+  conversation's own turn and extended afterwards. Route probes confirmed the header precedence, the
+  `x-bili-plugin` marker guard, the body fallback, and that the Responses route keeps its response-ID
+  key when no header is present.
+  - Live check (2026-10-17; DSH + bili, Claude Code + bili, Claude Code alone, all against a traced
+    3456 instance): the header contract held - DSH arrives under `x-session-id` with bili's
+    `session-<uuid>` (with `x-bili-plugin-conversation` and `prompt_cache_key` carrying the same
+    value), Claude Code under `x-claude-code-session-id`, and no `x-bili-session-id` appeared, so no
+    billion-context change is needed. DSH also exposed the failure the first design left: its session
+    spends the name on a two-message title call first, and the agent turns that follow continue a
+    different history. Guarding the name by `--session-retention-floor` alone let that title call
+    keep the slot, so the real turns published anonymously and the conversation still accumulated
+    variants - the original symptom. Matching the continued history instead of trusting the floor is
+    what fixed it.
+  - Interleaved live check (same traced 3456 instance, two Claude Code conversations alternating):
+    the slot discipline held - one entry each, four `rewrite` lines, never more than two entries -
+    but **every returning turn re-prefilled the entire prompt (cache 0)**. The trace showed that the
+    returning history shares all but the engine's one-token generation opener, so none of the three
+    boundaries the entry offered (frontier image 7,471, prompt-end image 7,470, divergence image 0)
+    lay at or below the shared prefix 7,463, and the divergence image the prefill itself captured at
+    6,144 was destroyed by the very publish that replaced the entry. Rewriting in place keeps it.
+    Re-measured after the fix: each conversation's third turn reuses 9,216 of 12,930 tokens (71.3%,
+    `private endpoint`) at TTFT 2.5 s, against 6.4 s for the same 12,930-token prompt one turn
+    earlier; the deterministic harness reports 10/10 assertions with the rewrite path exercised
+    seven times and 3,072-7,168 tokens reused after each rewrite.
+  - Three-agent live confirmation (2026-10-17, same 3456 instance): DSH+bili (`/v1/responses`,
+    `x-session-id`), Claude Code+bili and Claude Code alone (`/v1/messages`,
+    `x-claude-code-session-id`) each opened (~2.7k/14.6k, 26.7k, 24.6k tokens) and then took turns
+    in the same order twice more. Each conversation kept exactly one entry (entries reached 5 of 6,
+    including two leftovers from the earlier probe, and **no eviction ran at all**), and after its
+    opening turn **every return reused 96.5-99.9% of its prompt** - 14,807/15,117 (97.9%),
+    26,813/27,115 (98.9%), 25,231/25,271 (99.8%) on the first return, then 96.9-99.9% through the
+    second and third rounds. TTFT fell from 7.9-15.5 s on the cold turn to 0.16-1.3 s on the
+    returning ones. DSH's title call still opens the name first and the real turn still takes it
+    back (`bind=0` then `replaces=1`, `rewrite entry=2 shared=0`), which now costs nothing because
+    the entry that could not help is the one being rewritten.
+  (docs/serving.md §Conversation identity, docs/tp2-dual-5060ti.md §Cross-session KV pool;
+  _temp/20261017-1700_partA_harness.mjs, _temp/20261017-1925_partA_interleave_reuse.mjs)
 - **Genuinely open items** (tracked in tp2-plan.md §3, not settled): bf16 KV + MTP
   first-prefill crash; MTP I32 sNaN risk; MTP3 ≥70 tok/s; perplexity on TP-2;
   trigger source of the low-frequency transport failures; B7 settling

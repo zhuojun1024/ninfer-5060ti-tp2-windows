@@ -5359,6 +5359,34 @@ bool session_trace_enabled() {
     return env != nullptr && env[0] == '1';
 }
 
+// A session key is the client's own text and can be long: the trace keeps a bounded label so a line
+// stays readable and two lines for the same conversation compare equal. '-' is an unnamed entry.
+std::string session_key_label(const models::qwen3_5::PreparedSessionKey* key) {
+    if (key == nullptr) { return "-"; }
+    constexpr std::size_t kTraceKeyBytes = 48;
+    const std::string_view view          = key->view();
+    return view.size() <= kTraceKeyBytes ? std::string(view)
+                                         : std::string(view.substr(0, kTraceKeyBytes)) + "...";
+}
+
+// Length of the token prefix two histories share. A rewrite of one conversation - a folded context,
+// a re-rendered tail - keeps a long prefix, while a one-off call beside it (a title, review or
+// summary request carrying the session's own header) opens on instructions of its own and covers
+// neither history.
+std::size_t shared_history_prefix(const std::vector<TokenId>& first,
+                                  const std::vector<TokenId>& second) {
+    const std::size_t limit = std::min(first.size(), second.size());
+    std::size_t shared      = 0;
+    while (shared < limit && first[shared] == second[shared]) { ++shared; }
+    return shared;
+}
+
+// How much of the shorter of two histories a shared prefix may leave out and still mean "this turn
+// continues that entry". A folded context shortens the tail and a re-rendered generated reply
+// changes it, both inside a bounded tail, while a one-off call beside the conversation diverges
+// where its own instructions begin - which is not a tail.
+constexpr std::size_t kSessionRewrittenTailTokens = 256;
+
 } // namespace
 
 void TP2GenerationCore::abort_if_ar_stalled() {
@@ -5561,6 +5589,35 @@ void TP2GenerationCore::demote_session_owners(
     }
 }
 
+std::size_t TP2GenerationCore::session_owner_index(
+    const models::qwen3_5::PreparedSessionKey& key) const {
+    // Newest first: a conversation's owner is the entry the next turn extends, and the prune below
+    // keeps that entry the only one carrying the name.
+    for (std::size_t index = sessions_.size(); index-- > 0;) {
+        const SessionEntry& entry = sessions_[index];
+        if (entry.session && *entry.session == key) { return index; }
+    }
+    return kNoSession;
+}
+
+std::size_t TP2GenerationCore::session_prune_keyed(
+    const models::qwen3_5::PreparedSessionKey& key, std::size_t keep) {
+    for (std::size_t index = 0; index < sessions_.size();) {
+        const SessionEntry& entry = sessions_[index];
+        const bool replaced_owner = index != keep && entry.device_lane < 0 && entry.session &&
+                                    *entry.session == key;
+        if (!replaced_owner) {
+            ++index;
+            continue;
+        }
+        session_drop(index);
+        // session_drop erases and shifts whatever lane state pointed past 'index', and this loop's
+        // own keep-index has to follow it.
+        if (keep != kNoSession && keep > index) { --keep; }
+    }
+    return keep;
+}
+
 void TP2GenerationCore::bind_entry_session(
     SessionEntry& entry, const models::qwen3_5::PreparedContextCache& cache_hints) {
     if (!cache_hints.session_key) {
@@ -5575,13 +5632,14 @@ void TP2GenerationCore::bind_entry_session(
     entry.retention_weight = private_retention_weight(cache_hints.retention);
 }
 
-bool TP2GenerationCore::session_evict_one() {
+bool TP2GenerationCore::session_evict_one(std::uint32_t publisher_weight) {
     // Lowest retention weight first, least recently used within a weight. A conversation the client
     // named is retained against the anonymous ones around it, which is what keeps a long agent
     // session reusable while one-off writes keep taking the device pools.
     std::size_t victim = kNoSession;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         if (sessions_[index].device_lane >= 0) { continue; }
+        if (sessions_[index].retention_weight > publisher_weight) { continue; }
         if (victim == kNoSession ||
             sessions_[index].retention_weight < sessions_[victim].retention_weight ||
             (sessions_[index].retention_weight == sessions_[victim].retention_weight &&
@@ -5800,10 +5858,11 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     if (pages == 0) {
         // Nothing to copy, and nothing a recall could stand on either: clear the boundaries so a
         // later request cannot restore a state whose KV the device pools do not hold.
-        entry.device_lane = -1;
-        entry.host_prompt_end = 0;
-        entry.host_shared_end = 0;
-        entry.host_kv_end     = 0;
+        entry.device_lane       = -1;
+        entry.host_prompt_end   = 0;
+        entry.host_shared_end   = 0;
+        entry.host_frontier_end = 0;
+        entry.host_kv_end       = 0;
         return true;
     }
     if (!session_ensure_host_slabs(entry, pages)) { return false; }
@@ -5932,7 +5991,8 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     // The slabs now carry the KV up to the frontier they were filled at, which is the extent every
     // later capture and recall has to stay inside. A shared-prefix image this shorter extent no
     // longer reaches - a partial recall whose walk stopped before it - goes with them.
-    entry.host_kv_end = entry.frontier;
+    entry.host_kv_end       = entry.frontier;
+    entry.host_frontier_end = entry.frontier;
     if (entry.host_shared_end > entry.host_kv_end) { entry.host_shared_end = 0; }
     // The prompt-end boundary is only offered when its target image *and* its draft image exist; a
     // recall that restored one without the other would run the draft against the wrong tokens.
@@ -5979,7 +6039,8 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
     const std::uint32_t pages = pages_for_tokens(boundary);
     if (pages == 0) {
         entry.tokens.clear();
-        entry.frontier = 0;
+        entry.frontier         = 0;
+        entry.host_frontier_end = 0;
         mark_device_lane(sessions_, static_cast<std::size_t>(&entry - sessions_.data()),
                          static_cast<std::int32_t>(lane));
         return;
@@ -6195,7 +6256,8 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         while (shared < common && entry.tokens[shared] == prompt_tokens[shared]) { ++shared; }
         shared = media_prefix_cap(entry.media, media, shared);
         static constexpr const char* kReachName[3] = {"frontier", "prompt-end", "shared"};
-        const std::uint32_t offered[3] = {entry.frontier, entry.host_prompt_end, entry.host_shared_end};
+        const std::uint32_t offered[3] = {entry.host_frontier_end, entry.host_prompt_end,
+                                          entry.host_shared_end};
         std::uint32_t reach = 0;
         RecallState via     = RecallState::Frontier;
         for (std::size_t kind = 0; kind < 3; ++kind) {
@@ -6206,7 +6268,9 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
             // shape of publishing a conversation whose opening prompt the resident one already
             // answered, once the two generated tails part - carries no slabs at all: its frontier
             // still names the boundary it reached on the device, and offering it here restored pages
-            // that do not exist.
+            // that do not exist. The frontier image is offered at the position it was filled at
+            // rather than at the entry's frontier, so an entry that took later turns on the device or
+            // came back to a shallower boundary still names a state it really holds.
             const std::uint32_t ceiling = entry.host_kv_end;
             if (offered[kind] == 0 || offered[kind] > shared ||
                 offered[kind] >= prompt_tokens.size() || offered[kind] > ceiling) {
@@ -6219,10 +6283,14 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         }
         if (session_trace_enabled()) {
             std::fprintf(stderr,
-                         "[tp2-session]   entry %zu tokens=%zu frontier=%u kv_end=%u prompt_end=%u "
-                         "host_prompt_end=%u shared_end=%u shared=%zu reach=%u via=%s resident=%d\n",
-                         index, entry.tokens.size(), entry.frontier, entry.host_kv_end,
-                         entry.prompt_end, entry.host_prompt_end, entry.host_shared_end, shared, reach,
+                         "[tp2-session]   entry %zu session=%s tokens=%zu frontier=%u "
+                         "frontier_end=%u kv_end=%u prompt_end=%u host_prompt_end=%u shared_end=%u "
+                         "shared=%zu reach=%u via=%s resident=%d\n",
+                         index,
+                         session_key_label(entry.session ? &*entry.session : nullptr).c_str(),
+                         entry.tokens.size(), entry.frontier, entry.host_frontier_end,
+                         entry.host_kv_end, entry.prompt_end, entry.host_prompt_end,
+                         entry.host_shared_end, shared, reach,
                          reach == 0 ? "none" : kReachName[static_cast<std::size_t>(via)],
                          entry.device_lane >= 0 ? 1 : 0);
         }
@@ -6353,6 +6421,52 @@ void TP2GenerationCore::session_publish(
     // would hold, and the slot is what a returning conversation needs; a client that fires a one-off
     // title or summary call beside every new session would otherwise evict the sessions themselves.
     if (history.size() < session_retention_floor_tokens_) { return; }
+    // A conversation the client named owns exactly one catalog entry. The name is the client's
+    // statement that two requests are the same conversation, so a rewrite of its history - a folded
+    // context, a re-rendered tail, a prompt that lost its last byte - replaces that entry instead of
+    // leaving a variant beside it. Keeping the variants is what let one conversation fill every slot
+    // while the conversation it displaced lost the only entry its next turn could recall.
+    const bool names_conversation = cache_hints.session_key.has_value();
+    // The entry this request continues, found by matching the history rather than by trusting the
+    // name: one entry per conversation only holds while the next turn can tell which entry the
+    // conversation stands on. A turn continues the entry it reproduces bar a rewritten tail; a
+    // one-off call beside the conversation opens on instructions of its own, so the prefix it shares
+    // stops at the boilerplate the two happen to have in common and covers neither history. Matching
+    // content is also what lets a conversation take its slot back after such a call took it first.
+    std::size_t parent      = kNoSession;
+    std::size_t parent_span = 0;
+    if (names_conversation) {
+        for (std::size_t index = 0; index < sessions_.size(); ++index) {
+            const SessionEntry& entry = sessions_[index];
+            // An entry another lane is running cannot be replaced here, and an entry carrying another
+            // client's name is that conversation's slot: content alone does not prove this client
+            // means it.
+            if (entry.device_lane >= 0 && entry.device_lane != static_cast<std::int32_t>(lane)) {
+                continue;
+            }
+            if (entry.session && !(*entry.session == *cache_hints.session_key)) { continue; }
+            const std::size_t shared = shared_history_prefix(history, entry.tokens);
+            if (shared < session_retention_floor_tokens_) { continue; }
+            const std::size_t span = std::min(history.size(), entry.tokens.size());
+            if (shared + kSessionRewrittenTailTokens < span) { continue; }
+            if (parent == kNoSession || span > parent_span) {
+                parent      = index;
+                parent_span = span;
+            }
+        }
+    }
+    const std::size_t named_owner =
+        names_conversation ? session_owner_index(*cache_hints.session_key) : kNoSession;
+    // A named request that continues an entry adopts it, even one an earlier one-off call left
+    // unnamed; a named request that continues nothing opens the conversation only while the name has
+    // no entry at all. A request that continues nothing beside a named entry publishes anonymously
+    // and leaves that entry alone - it still runs, it just does not claim the slot.
+    const bool bind_name = names_conversation && (parent != kNoSession || named_owner == kNoSession);
+    // An entry published without a name is an ordinary continuation, whatever retention the route
+    // asked for on the name's behalf.
+    models::qwen3_5::PreparedContextCache anonymous_hints;
+    const models::qwen3_5::PreparedContextCache* const published_hints =
+        bind_name ? &cache_hints : &anonymous_hints;
     // Only the conversation the device still holds may be updated in place. A different one that
     // reaches this point must get an entry of its own, or it would overwrite the resident history
     // and leave the conversation that owned it unreachable - which is what a short request beside a
@@ -6364,12 +6478,22 @@ void TP2GenerationCore::session_publish(
         std::equal(sessions_[lane_state.active_session].tokens.begin(), sessions_[lane_state.active_session].tokens.end(),
                    history.begin());
     if (extends_resident) {
+        // The resident entry is this request's parent by content, so the name belongs on it. Another
+        // entry carrying the name is a stale claim: it is released before this entry takes the name,
+        // which also frees the slabs it held and keeps the resident reference below valid.
+        const bool adopt = bind_name && parent == lane_state.active_session;
+        // Another entry carrying the name is a stale claim, and dropping one below the resident entry
+        // shifts it; the returned index is where the resident entry now sits.
+        if (adopt) {
+            lane_state.active_session =
+                session_prune_keyed(*cache_hints.session_key, lane_state.active_session);
+        }
         SessionEntry& entry = sessions_[lane_state.active_session];
         entry.tokens.assign(history.begin(), history.end());
         entry.media.assign(media.begin(), media.end());
         entry.frontier  = frontier;
         entry.lru_clock = ++session_lru_clock_;
-        bind_entry_session(entry, cache_hints);
+        bind_entry_session(entry, adopt ? *published_hints : anonymous_hints);
         // The reuse scan compares against the resident history, so it has to carry the generated
         // tail too: that is what lets a continued turn start at the committed frontier instead of
         // replaying the previous answer.
@@ -6378,7 +6502,70 @@ void TP2GenerationCore::session_publish(
         lane_state.live_state_valid     = true;
         return;
     }
-    if (sessions_.size() >= session_capacity_ && !session_evict_one()) {
+    // A named request that continues an entry stands on that entry: its next turn has to find it
+    // still there, and the slot it occupies is the conversation's own, so the capacity check below
+    // counts it once whether it is rewritten or appended beside.
+    const bool replaces_parent = bind_name && parent != kNoSession;
+    if (session_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[tp2-session] publish key=%s named=%d bind=%d owner=%zu replaces=%d entries=%zu "
+                     "history=%zu held_by=%zu\n",
+                     names_conversation
+                         ? session_key_label(&*cache_hints.session_key).c_str()
+                         : "-",
+                     names_conversation ? 1 : 0, bind_name ? 1 : 0,
+                     replaces_parent ? parent : named_owner, replaces_parent ? 1 : 0,
+                     sessions_.size(), history.size(), named_owner);
+    }
+    if (replaces_parent) {
+        // The entry this request continues is rewritten where it stands rather than dropped and
+        // replaced by a copy of itself. What the entry is worth is its host slabs: the KV of the
+        // prefix this history reproduces, and the divergence image this prefill just captured before
+        // the walk reached the frontier. A copy would arrive with none of it and destroy the captured
+        // image with the entry, so a conversation that folded or re-rendered its tail would re-prefill
+        // its whole history on every return - which is exactly the reuse the entry was holding.
+        if (bind_name) { parent = session_prune_keyed(*cache_hints.session_key, parent); }
+        SessionEntry& entry = sessions_[parent];
+        // Only the part of the slabs this history reproduces is still theirs: past 'shared' the tokens
+        // differ, so the KV there describes the conversation this request diverged from. The images
+        // go with it - each is offered at the position it was filled at, so an image that no longer
+        // sits inside the shared prefix is dropped rather than left mislabelled.
+        const std::uint32_t shared = static_cast<std::uint32_t>(
+            std::min(shared_history_prefix(history, entry.tokens),
+                     static_cast<std::size_t>(entry.host_kv_end)));
+        entry.host_kv_end = shared;
+        if (entry.host_frontier_end > entry.host_kv_end) { entry.host_frontier_end = 0; }
+        if (entry.host_prompt_end > entry.host_kv_end) { entry.host_prompt_end = 0; }
+        if (entry.host_shared_end > entry.host_kv_end) { entry.host_shared_end = 0; }
+        entry.tokens.assign(history.begin(), history.end());
+        entry.media.assign(media.begin(), media.end());
+        entry.frontier  = frontier;
+        entry.lru_clock = ++session_lru_clock_;
+        // The prompt-end image belongs to the history this rewrite replaced, and the walk finishing
+        // this prefill publishes the boundary that replaced it.
+        entry.prompt_end = 0;
+        bind_entry_session(entry, *published_hints);
+        if (session_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[tp2-session] rewrite entry=%zu shared=%u kv_end=%u frontier_end=%u "
+                         "prompt_end=%u shared_end=%u history=%zu\n",
+                         parent, shared, entry.host_kv_end, entry.host_frontier_end,
+                         entry.host_prompt_end, entry.host_shared_end, history.size());
+        }
+        lane_state.active_session = parent;
+        mark_device_lane(sessions_, parent, static_cast<std::int32_t>(lane));
+        lane_state.cached_prompt_tokens = entry.tokens;
+        lane_state.cached_media.assign(media.begin(), media.end());
+        lane_state.live_state_valid     = true;
+        return;
+    }
+    if (bind_name) {
+        // Every other entry carrying the name is a stale claim - a one-off call that took the name
+        // first, a variant left by an older publish - now that the name lands on this lineage.
+        session_prune_keyed(*cache_hints.session_key, kNoSession);
+    }
+    const std::uint32_t publisher_weight = private_retention_weight(published_hints->retention);
+    if (sessions_.size() >= session_capacity_ && !session_evict_one(publisher_weight)) {
         // The catalog is full of entries the device cannot help with right now. This conversation
         // still runs - the device pools hold it - it just has no recalling entry.
         return;
@@ -6388,7 +6575,7 @@ void TP2GenerationCore::session_publish(
     entry.media.assign(media.begin(), media.end());
     entry.frontier  = frontier;
     entry.lru_clock = ++session_lru_clock_;
-    bind_entry_session(entry, cache_hints);
+    bind_entry_session(entry, *published_hints);
     sessions_.push_back(std::move(entry));
     lane_state.active_session = sessions_.size() - 1;
     mark_device_lane(sessions_, lane_state.active_session, static_cast<std::int32_t>(lane));

@@ -389,6 +389,12 @@ private:
         // Token count the shared-prefix image corresponds to, never deeper than the KV the slabs
         // hold. Zero means no other conversation has diverged from this one yet.
         std::uint32_t host_shared_end = 0;
+        // Token count the frontier state image corresponds to. It is the entry's frontier at the
+        // store that filled the image, and it stays there while the entry takes later turns on the
+        // device or comes back to a shallower boundary: the image describes the tokens up to this
+        // position, not the position the device last stood on. Zero means no frontier image exists -
+        // the entry was never stored, or its history was rewritten under an older image.
+        std::uint32_t host_frontier_end = 0;
         // Token count the host KV slabs carry. A store fills them to the evicted frontier; a recall
         // restores the device to a boundary that may be shallower without shortening them, so this
         // is the extent that anything paired with the slabs - a recall, or a shared-prefix capture -
@@ -845,10 +851,15 @@ private:
     void session_drop(std::size_t index);
     // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.
     [[nodiscard]] bool session_ensure_host_slabs(SessionEntry& entry, std::uint32_t pages);
+    // A retention weight no entry carries, for a caller that has to make room whatever the catalog
+    // holds.
+    static constexpr std::uint32_t kAnyRetentionWeight = 0xFFFF'FFFFU;
     // Evicts the non-resident entry with the lowest retention weight, breaking ties by least recent
     // use, so a client-named session outlives the anonymous continuations around it; false when only
-    // the resident one remains.
-    bool session_evict_one();
+    // the resident one remains, or when every entry outranks 'publisher_weight'. The weight gate is
+    // what keeps a weaker newcomer - an anonymous one-off that arrived beside a named conversation -
+    // from paying for its own entry with a session's slot.
+    bool session_evict_one(std::uint32_t publisher_weight = kAnyRetentionWeight);
     // Records the conversation and the retention class a request's cache hints assign to an entry,
     // demoting whichever entry held the same session before it: only the newest entry of a
     // conversation keeps the session weight, because that is the one the next turn extends.
@@ -857,6 +868,14 @@ private:
     // Drops a session binding from every entry that still holds it, leaving them anonymous
     // continuations.
     void demote_session_owners(const models::qwen3_5::PreparedSessionKey& key);
+    // Index of the newest entry that owns 'key', or kNoSession when the catalog does not hold it.
+    [[nodiscard]] std::size_t session_owner_index(
+        const models::qwen3_5::PreparedSessionKey& key) const;
+    // Drops every non-resident entry that owns 'key' except 'keep', so a named conversation holds
+    // exactly one catalog entry. An entry resident on a lane keeps its claim: its KV never reached
+    // the slabs, so shedding it would leave that lane naming a slot in a vector that just shifted.
+    // Returns 'keep' shifted by the erasures, or kNoSession when nothing is kept.
+    std::size_t session_prune_keyed(const models::qwen3_5::PreparedSessionKey& key, std::size_t keep);
     [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept;
     // Publishes a walk's full history as the resident catalog entry. `frontier` is how far the
     // device KV and GDN state actually reach: the sampled token that ends the prompt is not

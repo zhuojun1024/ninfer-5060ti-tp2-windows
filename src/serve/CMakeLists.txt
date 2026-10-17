@@ -5,6 +5,7 @@ add_library(ninfer_serve STATIC
   openai_chat_response.cpp
   openai_chat_http.cpp
   openai_common.cpp
+  session_identity.cpp
   openai_responses_request.cpp
   openai_responses_state.cpp
   openai_responses_response.cpp

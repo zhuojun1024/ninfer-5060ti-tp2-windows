@@ -3,6 +3,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/session_identity.h"
 
 #include <atomic>
 #include <cstddef>
@@ -24,11 +25,15 @@ std::string sse_error_event(const ApiError& error) {
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     OpenAIChatRequest request;
+    ContextCacheHints cache_hints;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(parse_json_body(req), limits);
+        const RequestJson body    = parse_json_body(req);
+        request                   = parse_chat_completion_request(body, limits);
         validate_openai_model(request.model, public_model_id_);
+        apply_session_identity(cache_hints,
+                               resolve_session_identity(req, body, "/v1/chat/completions"));
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
         return;
@@ -48,7 +53,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepared = service_->prepare(request.generation,
                                      request.stream ? GenerationConsumerMode::Streaming
                                                     : GenerationConsumerMode::Aggregate,
-                                     observation, [&req] { return client_disconnected(req); });
+                                     observation, [&req] { return client_disconnected(req); },
+                                     cache_hints);
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));

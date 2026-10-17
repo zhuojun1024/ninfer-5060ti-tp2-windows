@@ -549,6 +549,24 @@ copies the returning session back, so an alternating chat client pays one PCIe r
 of a full prefill. The catalog holds the resident conversation plus `--max-private-continuations - 1`
 host-resident ones (six entries by default) and evicts the least recently used when it is full.
 
+Each entry is one conversation. A client identity (`x-session-id`, `x-claude-code-session-id`,
+`x-bili-plugin-conversation` beside `x-bili-plugin`, or the body `prompt_cache_key`/`session_id`;
+see [Conversation identity](serving.md#conversation-identity)) names that conversation. A publish
+locates the entry the request continues by content - the entry, carrying that identity or still
+anonymous, whose stored history shares the longest prefix with the incoming one, covering all but a
+short rewritten tail - so a folded, trimmed or extended context rewrites one entry, adopts an entry
+an earlier one-off call left unnamed, and is rewritten in place rather than replaced. Rewriting in
+place is what preserves reuse: the entry's host slabs hold the prefix KV and the divergence image
+the request's own prefill just captured, so dropping and re-appending the record would discard the
+image and force the next turn to re-prefill the whole prompt. The rewrite clamps the entry's
+boundary bookkeeping to the shared prefix before the new history is stored, so no unreachable
+boundary is offered afterwards. A one-off call
+beside the conversation (a title, review or sub-agent request carrying the session's identity on a
+prompt of its own) reproduces none of that history and is published anonymously instead of
+overwriting it; the conversation's own next turn replaces that one-off entry and takes the slot back.
+Anonymous publishes are stored only when the catalog has room for one and never evict a named entry,
+so a burst of one-off calls cannot cost a conversation its slot.
+
 Enable it by giving the host KV budget, which is split evenly between the two shards:
 
 ```
@@ -588,7 +606,25 @@ Observable behaviour:
   whole generated tail.
 - A conversation the LRU budget evicted reports `reused_prompt_tokens == 0` and is prefilled from
   zero again.
-- `NINFER_TP2_SESSION_TRACE=1` prints every recall and eviction with its frontier, and
+- A named conversation keeps one entry however its history changes: an extended, trimmed or folded
+  context re-publishes the same name, the trace reports `rewrite ... shared=<kept>`, and the entry is
+  rewritten in place so the host slabs it already holds - the prefix KV and the divergence image its
+  own prefill captured - survive. A request that carries a conversation's name but continues none of
+  its history (a review, title or sub-agent call) reports `bind=0` and is stored anonymously instead
+  of overwriting the conversation, and the conversation's own next turn reports `replaces=1` under
+  the same name, taking its slot back from the one-off entry. An anonymous publish cannot evict a
+  named entry.
+- Two alternating conversations both keep their reuse: each returning turn reports a non-zero `cache`
+  (9,216 of 12,930 prompt tokens, 71.3%, in the measured pair of ~10-13k-token conversations) as long
+  as some boundary the entry still holds lies at or below the shared prefix; a turn whose history
+  diverges below every held boundary re-prefills from that boundary or from zero. With three agents
+  (DSH and two Claude Code sessions, 14.6k/26.7k/24.6k-token prompts) taking turns in a fixed order,
+  every conversation after its opening turn reused 96.5-99.9% and no entry was ever evicted; TTFT
+  dropped from 7.9-15.5 s cold to 0.16-1.3 s warm.
+- `NINFER_SERVE_SESSION_TRACE=1` prints, per request, which field named the conversation, every
+  identity candidate it carried, and any refusal with its reason.
+  `NINFER_TP2_SESSION_TRACE=1` prints every recall and eviction with its frontier (each catalog
+  entry dump carries its session name), and
   `NINFER_TP2_REUSE_TRACE=1` prints per request what the scan offered (`prompt`, `cached`,
   `shared`, `prev_prompt`, `replay_split`, `adopted`, the checkpoint census) and what it took
   (`reuse`, `slot`, `src`). When the client's rendering parts from the resident history inside the

@@ -475,9 +475,55 @@ Earlier schema-valid historical breakpoints are accepted but are not new write c
 reads of already-published prefixes do not require the request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
-rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
-Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
-promise their wall-clock residency; physical retention follows the resource scheduler.
+rendered-token frontier is ignored without changing prompt content. Valid TTL/retention values are
+accepted, but NInfer does not promise their wall-clock residency; physical retention follows the
+resource scheduler. `prompt_cache_key` is not a prefix identity: it can name a conversation for the
+private catalog (see [Conversation identity](#conversation-identity)), but it never substitutes for
+the token-prefix proof that gates reuse.
+
+## Conversation identity
+
+The private continuation catalog holds one entry per conversation. A request that carries a client
+conversation identity binds that name to its entry and re-publishes the entry - same name, new
+history - instead of appending a variant beside it, so a folded, trimmed or extended context never
+spends a second slot. An unnamed request keeps anonymous behaviour: it may still read any provably
+compatible prefix, it is stored only when the catalog has room for an anonymous entry, and it never
+evicts a named conversation.
+
+The served routes accept these headers, first match wins:
+
+| Header | Use |
+|---|---|
+| `x-session-id` | generic conversation identity, and the name billion-context can be asked to forward |
+| `x-claude-code-session-id` | Claude Code session |
+| `x-bili-plugin-conversation` | billion-context conversation, honored only on a request that also carries `x-bili-plugin` |
+
+A value of 1..256 bytes is used with control bytes replaced; an empty or longer value is refused and
+the request stays anonymous. With no header, `prompt_cache_key` and then `session_id` from the
+request body name the conversation when present. The Responses route otherwise keeps deriving its
+key from the stored response ID and `previous_response_id` inheritance, and a client header
+overrides that derived key. `NINFER_SERVE_SESSION_TRACE=1` prints one
+`[serve-session] endpoint=... key=... source=...` line per request naming the field that supplied
+the identity, every candidate the request carried, and any refusal with its reason.
+
+An identity is a name, not a reuse proof. A publish picks the entry the request continues by
+content: among the entries carrying that name or none, the one whose stored history shares the
+longest prefix with the incoming one, where that prefix must cover all but a short rewritten tail (a
+folded context shortens the tail, a re-rendered answer changes it). A one-off call beside the
+conversation - a title, review or summary request that carries the session's own header on a prompt
+of its own - reproduces none of that history, so it is published anonymously instead of replacing the
+conversation it named, and the conversation's next turn replaces that one-off entry and takes its
+slot back.
+
+A continued conversation is rewritten in place rather than dropped and re-added. The entry's host
+slabs are what make the next turn cheap - the prefix KV it holds plus the divergence image this
+request's own prefill snaphsotted - so replacing the record would discard the reuse it just earned
+and the next turn would re-prefill the whole prompt. The rewrite folds the new history over the old
+record and clamps the entry's boundary bookkeeping to the shared prefix, so it never offers a
+boundary the engine can no longer reach. The practical effect on an interleaved pair of sessions
+(two Claude Code conversations alternating, 9.9k -> 11.4k -> 12.9k tokens each): every returning
+turn reuses the prefix kept across the rewrite - 9,216 of 12,930 prompt tokens (71.3%) in the
+measured run, at 2.5 s TTFT against 6.4 s for a full prefill of the same prompt.
 
 ## OpenAI Responses Core
 
@@ -721,7 +767,9 @@ rendering and identity still determine reuse. Changing the boolean alone never i
 checkpoint already proved compatible by the model runtime.
 
 For Engine-local reuse, a stored root Response receives one bounded session key derived from its
-response ID, and every `previous_response_id` child inherits that key. `store:false` roots remain
+response ID, and every `previous_response_id` child inherits that key, unless the request carries a
+conversation identity header, which takes precedence
+([Conversation identity](#conversation-identity)). `store:false` roots remain
 anonymous; a `store:false` child may read its inherited session checkpoint but does not replace the
 stored chain's latest endpoint. Response-store eviction or deletion removes the HTTP object, not an
 independently retained Engine checkpoint; the latter remains bounded by the Engine's own retention

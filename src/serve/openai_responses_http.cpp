@@ -4,6 +4,7 @@
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
 #include "serve/request_validation.h"
+#include "serve/session_identity.h"
 
 #include <nlohmann/json.hpp>
 
@@ -245,10 +246,15 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request = parse_openai_responses_create_request(parse_json_body(req), limits);
+        const RequestJson body = parse_json_body(req);
+        request = parse_openai_responses_create_request(body, limits);
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
+        // A client that named the conversation outranks the response-id-derived session key: the
+        // response id changes with every turn, the client's name is what stays.
+        apply_session_identity(resolved.cache_hints,
+                               resolve_session_identity(req, body, "/v1/responses"));
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
         return;

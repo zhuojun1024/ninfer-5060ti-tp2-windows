@@ -2,6 +2,7 @@
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
+#include "serve/session_identity.h"
 
 #include <atomic>
 #include <cstddef>
@@ -41,10 +42,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     res.set_header("request-id", request_id);
 
     AnthropicMessagesRequest request;
+    ContextCacheHints cache_hints;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
+        const RequestJson body    = parse_json_body(req);
+        request                   = parse_anthropic_messages_request(body, limits);
+        apply_session_identity(cache_hints, resolve_session_identity(req, body, "/v1/messages"));
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -68,7 +72,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepared = service_->prepare(request.generation,
                                      request.stream ? GenerationConsumerMode::Streaming
                                                     : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+                                     {}, [&req] { return client_disconnected(req); },
+                                     cache_hints);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
