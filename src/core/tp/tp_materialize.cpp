@@ -409,6 +409,85 @@ std::pair<artifact::MaterializedArtifact, artifact::MaterializedArtifact> materi
         }
     }
 
+    // Host-mapped weights: the object's bytes stay in host memory, split per shard exactly like its
+    // device variant, so each shard reads its own half through its own mapping and charges no arena
+    // bytes. The bytes move from the reader's buffer straight into the mapping - there is no H2D
+    // upload and no staging slot, because the destination is already host memory.
+    for (const auto& placement : plan.mapped_objects) {
+        const auto& geometry = reader.geometry(placement.object);
+        const std::uint64_t n = geometry.shape.size() >= 1 ? geometry.shape[0] : 1;
+        const std::uint64_t k = geometry.shape.size() >= 2 ? geometry.shape[1] : 1;
+        auto payload         = read_object_payload(reader, placement.object, a0_stats);
+        if (payload.size() != placement.bytes) {
+            throw artifact::ArtifactError("mapped placement size differs from object");
+        }
+        const float divisor =
+            geometry.format == QType::NVFP4
+                ? std::bit_cast<float>(artifact::read_u32_le(payload.data() + geometry.divisor_offset))
+                : 0.0F;
+        const auto kind = spec.kind(placement.object);
+        std::span<const std::uint8_t> payload_span(
+            reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());
+        std::vector<WeightShard> shards;
+        std::int32_t shard_n = static_cast<std::int32_t>(n);
+        std::int32_t shard_k = static_cast<std::int32_t>(k);
+        if (kind != WeightSplitKind::Replicated) {
+            const Weight full_weight = make_full_weight(payload, geometry, divisor);
+            if (kind == WeightSplitKind::GatherRows) {
+                const auto* split = spec.find(placement.object);
+                if (!split || split->parts.empty()) {
+                    throw artifact::ArtifactError("tp gather split is missing its row parts");
+                }
+                std::span<const RowPart> parts(split->parts.data(), split->parts.size());
+                shards   = {gather_weight_rows(payload_span, full_weight, parts, 0),
+                            gather_weight_rows(payload_span, full_weight, parts, 1)};
+                shard_n  = shards[0].weight.n;
+            } else if (kind == WeightSplitKind::GatherCols) {
+                const auto* split = spec.find(placement.object);
+                if (!split || split->parts.empty()) {
+                    throw artifact::ArtifactError("tp gather split is missing its column parts");
+                }
+                std::span<const RowPart> parts(split->parts.data(), split->parts.size());
+                shards  = {gather_weight_cols(payload_span, full_weight, parts, 0),
+                           gather_weight_cols(payload_span, full_weight, parts, 1)};
+                shard_k = shards[0].weight.k;
+            } else {
+                shards  = split_weight(payload_span, full_weight, kind);
+                shard_n = kind == WeightSplitKind::ColumnParallel ? static_cast<std::int32_t>(n / 2)
+                                                                  : static_cast<std::int32_t>(n);
+                shard_k = kind == WeightSplitKind::ColumnParallel ? static_cast<std::int32_t>(k)
+                                                                  : static_cast<std::int32_t>(k / 2);
+            }
+        }
+        const auto shard_geo = shard_geometry(geometry, shard_n, shard_k);
+        for (int shard = 0; shard < 2; ++shard) {
+            if (!spec.on_shard(placement.object, shard)) { continue; }
+            auto& storage =
+                shard == 0 ? a0_objects.at(placement.object.index)
+                           : a1_objects.at(placement.object.index);
+            artifact::MaterializationStats& stats = shard == 0 ? a0_stats : a1_stats;
+            // cudaHostGetDevicePointer answers for the current context, so bind the shard that will
+            // read the mapping before asking for its address.
+            (shard == 0 ? device0 : device1).bind_to_current_thread();
+            const std::uint8_t* source =
+                kind == WeightSplitKind::Replicated ? payload_span.data()
+                                                    : shards[shard].payload.data();
+            const std::size_t bytes =
+                kind == WeightSplitKind::Replicated ? payload.size() : shards[shard].payload.size();
+            auto mapping = std::make_unique<PinnedHostBuffer>(bytes, /*portable=*/true);
+            std::copy_n(reinterpret_cast<const std::byte*>(source), bytes,
+                        static_cast<std::byte*>(mapping->data()));
+            storage.device = WeightParent{
+                shard_geo, static_cast<const std::byte*>(mapping->device_data()), divisor};
+            stats.host_mapped_bytes =
+                stats.host_mapped_bytes + static_cast<std::uint64_t>(bytes);
+            (shard == 0 ? a0.tp_mapped() : a1.tp_mapped()).push_back(std::move(mapping));
+        }
+    }
+    // Leave the device that was current before this pass, so the drain below and the caller see the
+    // same context the device pass ended on.
+    device1.bind_to_current_thread();
+
     // The weights must be fully resident before the engine takes ownership: drain the ring
     // and both transfer streams. Nothing above synchronized per object — a later object's
     // reads already overlapped this one's transfers.

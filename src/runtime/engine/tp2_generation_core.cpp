@@ -392,9 +392,10 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     lanes_ = (options_.max_concurrency == 0 ? 1U : options_.max_concurrency);
 
     models::LoadOptions load;
-    load.vision        = options.enable_vision;
-    load.speculative   = options.speculative.backend;
-    load.proposal_head = options.speculative.proposal_head;
+    load.vision         = options.enable_vision;
+    load.speculative    = options.speculative.backend;
+    load.proposal_head  = options.speculative.proposal_head;
+    load.embedding_host = options.embedding_host;
 
     mtp_enabled_ = options.speculative.backend == SpeculativeBackend::Mtp;
     if (mtp_enabled_) {
@@ -1158,12 +1159,17 @@ void TP2GenerationCore::build_shard(Shard& shard, int shard_index) {
     {
         std::size_t free_bytes = 0, total_bytes = 0;
         cudaMemGetInfo(&free_bytes, &total_bytes);
+        // Weights the kernels read out of mapped host memory are not part of the device budget this
+        // line enumerates, so they are reported beside it rather than folded into weights+ctx.
+        const std::uint64_t host_mapped = shard.model->storage_stats().host_mapped_bytes;
         std::fprintf(stderr,
-                     "[mem] shard %d capacity %u lanes %u | weights+ctx %.1f | kv %.1f | "
+                     "[mem] shard %d capacity %u lanes %u | weights+ctx %.1f | host-mapped %.1f | "
+                     "kv %.1f | "
                      "state %.1f | "
                      "record %.1f | draft-snap %.1f | round %.1f | workspace %u.0 | vision %.1f | "
                      "free %.1f of %.1f MiB\n",
                      shard_index, capacity, lanes_, resident_bytes,
+                     static_cast<double>(host_mapped) / 1048576.0,
                      static_cast<double>(kv_bytes) / 1048576.0,
                      static_cast<double>(state_planes * state_bytes) / 1048576.0,
                      static_cast<double>(record_bytes) / 1048576.0,
@@ -8440,6 +8446,7 @@ LoadSummary TP2GenerationCore::load_summary() const {
     summary.artifact_bytes_read  = stats.read_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
+    summary.host_mapped_bytes    = stats.host_mapped_bytes;
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     return summary;

@@ -32,6 +32,19 @@ struct HostPlacement {
     std::vector<std::byte> data;
 };
 
+// cudaHostAlloc returns page-aligned memory, so a mapped host weight can satisfy any layout
+// alignment up to a page and nothing beyond it.
+inline constexpr std::uint64_t kMappedHostAlignmentBytes = 4096;
+
+// A weight whose bytes stay in host memory but remain device-readable (one pinned, UVA-mapped
+// allocation per shard). The model's kernels read it over PCIe instead of from a VRAM copy, so it
+// costs no device capacity and no H2D upload.
+struct MappedPlacement {
+    ObjectHandle object;
+    std::uint64_t bytes     = 0;
+    std::uint64_t alignment = 256;
+};
+
 struct MaterializationPlan {
     const Reader* source                = nullptr;
     std::size_t object_count            = 0;
@@ -40,6 +53,7 @@ struct MaterializationPlan {
     std::uint64_t owned_value_bytes     = 0;
     std::vector<DevicePlacement> device_objects;
     std::vector<HostPlacement> host_objects;
+    std::vector<MappedPlacement> mapped_objects;
 };
 
 struct MaterializationStats {
@@ -50,6 +64,9 @@ struct MaterializationStats {
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t owned_value_bytes     = 0;
     std::uint64_t peak_staging_bytes    = 0;
+    // Weight bytes that live in mapped host memory instead of VRAM. They are device-readable, so
+    // they are not counted in device_capacity_bytes.
+    std::uint64_t host_mapped_bytes     = 0;
     std::size_t device_object_count     = 0;
     std::size_t host_object_count       = 0;
     double upload_seconds               = 0;
@@ -81,6 +98,11 @@ public:
     [[nodiscard]] std::vector<ObjectStorage>& tp_objects() noexcept { return objects_; }
     [[nodiscard]] DeviceArena& tp_arena() noexcept { return *arena_; }
     [[nodiscard]] MaterializationStats& tp_stats() noexcept { return stats_; }
+    // Host-mapped weight bytes: one pinned, device-readable mapping per (object, shard). The weight
+    // views point into them, so the artifact owns them for the model's lifetime.
+    [[nodiscard]] std::vector<std::unique_ptr<PinnedHostBuffer>>& tp_mapped() noexcept {
+        return mapped_;
+    }
     void tp_init(std::size_t object_count, std::uint64_t capacity_bytes) {
         objects_.resize(object_count);
         arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity_bytes));
@@ -93,6 +115,7 @@ private:
 
     std::unique_ptr<DeviceArena> arena_;
     std::vector<ObjectStorage> objects_;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> mapped_;
     MaterializationStats stats_;
 };
 

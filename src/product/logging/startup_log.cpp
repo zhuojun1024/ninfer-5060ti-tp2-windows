@@ -303,14 +303,16 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     const double total_seconds = impl_->engine_elapsed_ns != 0
                                      ? static_cast<double>(impl_->engine_elapsed_ns) * 1.0e-9
                                      : load.load_seconds;
-    impl_->logger->info("engine ready | {} | total {} | weights {}",
+    impl_->logger->info("engine ready | {} | total {} | weights {} | host-mapped {}",
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
-                        format_pretty_bytes(load.host_to_device_bytes));
+                        format_pretty_bytes(load.host_to_device_bytes),
+                        format_pretty_bytes(load.host_mapped_bytes));
     impl_->logger->debug(
-        "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
-        "objects {} | host objects {}",
+        "load detail | architecture {} | artifact read {} | H2D {} | host-mapped {} | staging peak "
+        "{} | device objects {} | host objects {}",
         format_pretty_text(load.architecture), format_pretty_bytes(load.artifact_bytes_read),
         format_pretty_bytes(load.host_to_device_bytes),
+        format_pretty_bytes(load.host_mapped_bytes),
         format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
         format_pretty_count(load.host_object_count));
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",

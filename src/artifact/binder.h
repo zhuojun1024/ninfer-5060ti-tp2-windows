@@ -10,7 +10,17 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
+// How a parameter's bytes reach the kernel. Device spends VRAM, Host keeps them on the host for a
+// caller that reads them itself, and MappedHost keeps them in host memory while leaving them
+// device-readable, so a weight the device reads rarely (the token embedding table) costs no VRAM.
+enum class Residency { Device, Host, MappedHost, Values };
+
+// Whether a residency's bytes are addressed from the device: either they sit in VRAM (Device) or in
+// host memory mapped into the device address space (MappedHost). Everything that binds a weight
+// view asks this, so a new residency cannot be device-readable in one place and not in another.
+[[nodiscard]] constexpr bool device_readable(Residency residency) noexcept {
+    return residency == Residency::Device || residency == Residency::MappedHost;
+}
 
 struct ParameterReference {
     std::string name;
@@ -46,6 +56,10 @@ public:
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
     void require_device(ObjectHandle object, std::uint64_t alignment = 256);
+    // Demands the object's bytes in mapped host memory: no device capacity, no H2D upload, and a
+    // device-visible address the kernels read through. Materialization gives each shard its own
+    // mapping, so a split object is mapped per shard.
+    void require_mapped_host(ObjectHandle object, std::uint64_t alignment = 256);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
@@ -55,6 +69,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool mapped_host        = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;
     };

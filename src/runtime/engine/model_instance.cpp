@@ -314,6 +314,7 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     summary.artifact_bytes_read  = stats.read_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
+    summary.host_mapped_bytes    = stats.host_mapped_bytes;
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);

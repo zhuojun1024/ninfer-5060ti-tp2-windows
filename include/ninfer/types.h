@@ -200,6 +200,13 @@ struct EngineOptions {
     // make the processor downsize larger media into the smaller pixel budget.
     std::uint32_t vision_item_tokens       = kMaximumVisionItemTokens;
     bool use_cuda_graph                    = true;
+    // Keep the token embedding table in mapped host memory and let the kernels gather rows from it
+    // over PCIe instead of charging each device its copy. The table is read once per prompt token
+    // per rank, so the upload is free at decode and a fraction of the prefill time at the cost of
+    // one pinned host allocation per rank instead of ~0.59 GiB of device memory per rank. The
+    // devices must be able to read mapped host memory; every sm_120 part and every 5060 Ti driver
+    // this fork targets can.
+    bool embedding_host = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -1067,6 +1074,8 @@ struct LoadSummary {
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
+    // Weight bytes kept in mapped host memory (read over PCIe) rather than uploaded, per rank.
+    std::uint64_t host_mapped_bytes    = 0;
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;

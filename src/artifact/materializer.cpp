@@ -176,6 +176,38 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
         }
     }
+    // Host-mapped weights: one pinned, device-readable mapping instead of an arena slice. Nothing
+    // is uploaded and no device capacity is charged; the kernels read these bytes over PCIe through
+    // the address the mapping reports.
+    for (const auto& placement : plan.mapped_objects) {
+        reader.validate_object(placement.object);
+        auto& object = out.objects_.at(placement.object.index);
+        if (object.device || object.host) {
+            throw ArtifactError("invalid or duplicate mapped placement");
+        }
+        if (placement.bytes > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError("mapped host weight exceeds size_t");
+        }
+        if (placement.alignment > kMappedHostAlignmentBytes) {
+            throw ArtifactError("mapped host weight alignment exceeds a page");
+        }
+        const auto& geometry = reader.geometry(placement.object);
+        auto payload         = reader.read_object(placement.object);
+        if (payload.size() != placement.bytes) {
+            throw ArtifactError("mapped placement size differs from object");
+        }
+        out.stats_.read_bytes = checked_add(out.stats_.read_bytes, payload.size(), "mapped read bytes");
+        auto mapping =
+            std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(placement.bytes),
+                                              /*portable=*/true);
+        std::copy_n(payload.begin(), payload.size(), static_cast<std::byte*>(mapping->data()));
+        const auto divisor = read_divisor(reader, placement.object, geometry, payload, out.stats_);
+        object.device      = WeightParent{
+            geometry, static_cast<const std::byte*>(mapping->device_data()), divisor};
+        out.stats_.host_mapped_bytes =
+            checked_add(out.stats_.host_mapped_bytes, placement.bytes, "host-mapped weight bytes");
+        out.mapped_.push_back(std::move(mapping));
+    }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {
         const auto& geometry = reader.geometry(placement.object);

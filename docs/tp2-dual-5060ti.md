@@ -30,7 +30,11 @@ choices is numerically transparent: the greedy output at 262,144 is byte-identic
 build at 131,072 (see Verification). `--kv-capacity auto` sizes the pool from the free bytes each
 shard reports after loading, leaving 1 GiB of headroom; `--kv-headroom-mib N` overrides that
 headroom (`0` maximizes the pool), which is the knob to reach for when the ceiling is a few tokens
-short or when another process shares the card.
+short or when another process shares the card. `--embedding-host` is the other lever on the same
+number: it keeps the token embedding table in pinned host memory (each shard holds its own column
+half) instead of VRAM, which frees 606 MiB per shard - about 38,000 more fp8 tokens - with
+bit-identical results and no measurable throughput cost, because the device only reads a row per
+prompt token and one per MTP step.
 
 ## Current measurement
 

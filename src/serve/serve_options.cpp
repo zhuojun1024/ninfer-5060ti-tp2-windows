@@ -85,6 +85,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--reasoning-effort low|medium|xhigh] "
            "[--vision] [--vision-item-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--embedding-host] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -113,6 +114,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-headroom-mib overrides that headroom for automatic sizing "
            "(0 maximizes the pool)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --embedding-host keeps the token embedding table in mapped host memory instead\n"
+           "       of charging it to the device, and reads it over PCIe; the table is read once\n"
+           "       per prompt token, so decode is unaffected\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --lane-context caps how much context one TP-2 lane may admit so the first "
@@ -350,6 +354,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.vision_item_tokens = static_cast<std::uint32_t>(tokens);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {

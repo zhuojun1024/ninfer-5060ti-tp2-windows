@@ -111,6 +111,11 @@ public:
 
     void* data() const noexcept;
     std::size_t size() const noexcept;
+    // Device-visible address of the same bytes, for a weight the device reads over PCIe instead of
+    // holding a VRAM copy (PinnedHostBuffer with portable=true, which is the mapped variant). The
+    // query is a no-op under UVA - it returns the host pointer - but it is the documented way to
+    // obtain that address and stays correct where a driver remaps host memory.
+    void* device_data() const;
 
 private:
     void* data_       = nullptr;

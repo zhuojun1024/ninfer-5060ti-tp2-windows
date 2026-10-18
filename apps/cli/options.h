@@ -32,6 +32,8 @@ struct Options {
     // Per-item merged Vision token ceiling; lower values shrink the fixed Vision workspace.
     std::uint32_t vision_item_tokens = kMaximumVisionItemTokens;
     bool use_cuda_graph = true;
+    // Keep the token embedding table in mapped host memory; see EngineOptions::embedding_host.
+    bool embedding_host = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;

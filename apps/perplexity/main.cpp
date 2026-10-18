@@ -58,13 +58,14 @@ struct Options {
     // Writes one line per scored token so a caller can plot the metric against the history depth
     // each target actually saw instead of only reading the corpus-wide average.
     bool dump_token_nll                 = false;
+    bool embedding_host                 = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N | --devices A,B]\n"
+           "       [--context N] [--stride N] [--device N | --devices A,B] [--embedding-host]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--dump-token-nll]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -149,6 +150,8 @@ Options parse_options(int argc, char** argv) {
             } else {
                 usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
             }
+        } else if (option == "--embedding-host") {
+            out.embedding_host = true;
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--log-level") {
@@ -259,6 +262,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device_b         = options.device_b;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    engine_options.embedding_host   = options.embedding_host;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
@@ -453,6 +457,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)},
+          {"embedding_host", options.embedding_host},
           {"token_nll_dump", options.dump_token_nll}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

@@ -211,6 +211,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-headroom-mib N` | sizing headroom left unallocated by `--kv-capacity auto`; requires `auto` and `0` maximizes the pool | `1024` |
+| `--embedding-host` | keep the token embedding table in pinned host memory, mapped into the device address space instead of uploaded to VRAM | off |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -283,6 +284,17 @@ CLI normally leaves the option omitted so it follows
 server route the pool is shared dynamically and `--lane-context N` caps how much context one lane
 may reserve (`0` lets one lane take the whole pool); see
 [HTTP serving](serving.md#tensor-parallel-2-tp-2).
+
+`--embedding-host` keeps the token embedding table in pinned host memory and maps it into the device
+address space instead of uploading it. It is the one weight the device reads a few rows at a time -
+one row per prompt token while the prompt is embedded, one per step for MTP - so the table can live
+on the host without touching the per-step weight stream. On a 27B artifact the device-resident copy
+drops by 607 MiB on each TP-2 shard, or by the whole table (1.18 GiB for the FP8 artifacts) on the
+single-GPU route, and the freed bytes become KV capacity: at 16.125 KiB per token, 606 MiB is about
+38,000 more fp8 tokens per shard. The rows are read over PCIe as the prompt is embedded, so the
+option moves cost from VRAM into the prefill path; a 64,967-token scoring run at context 2048
+measured bit-identical perplexity (1.800897 both ways) with no throughput difference (605.7 tok/s
+resident, 606.2 tok/s host-mapped). It is off by default.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

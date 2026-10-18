@@ -935,6 +935,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--kv-headroom-mib N` | sizing headroom left unallocated by `--kv-capacity auto`; requires `auto` and `0` maximizes the pool | `1024` |
+| `--embedding-host` | keep the token embedding table in pinned host memory, mapped into the device address space instead of uploaded to VRAM | off |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--lane-context N` | TP-2 multi-lane admission ceiling in tokens: how much context one lane may reserve; `0` lets one lane take the whole shared KV pool (ignored at `--max-concurrency 1`) | `0` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
@@ -1144,6 +1145,15 @@ pool used by active requests and retained prefixes. `auto` accounts for the comp
 and leaves 1 GiB of sizing headroom, which `--kv-headroom-mib N` overrides (`0` maximizes the pool;
 the flag requires `auto`, since an explicit capacity already fixes the pool); omitting the option
 makes it follow `--max-context`. Capacity resolves once at startup.
+
+`--embedding-host` trades VRAM for PCIe on the prompt path: the token embedding table stays in
+pinned host memory and is mapped into the device address space instead of being uploaded, so the
+bytes it held become KV capacity. Each TP-2 shard keeps its own column half of the table, so the
+resident copy drops by 607 MiB per shard (1.18 GiB for the whole table on the single-GPU route). The
+startup ledger reports the mapping as `host-mapped` on the `[mem]` line and in `engine ready`. At
+16.125 KiB per token, 606 MiB is about 38,000 more fp8 tokens per shard. On a 64,967-token scoring
+run at context 2048 the option was bit-identical (perplexity 1.800897 both ways) and cost nothing
+measurable (605.7 tok/s resident, 606.2 tok/s host-mapped).
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.

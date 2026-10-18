@@ -56,6 +56,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
         }
         if (residency == Residency::Device) {
             require_device(part.object);
+        } else if (residency == Residency::MappedHost) {
+            require_mapped_host(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
         }
@@ -94,6 +96,22 @@ std::span<const std::byte> Binder::host_object(ObjectHandle object) {
         demand.host      = true;
     }
     return demand.host_data;
+}
+
+void Binder::require_mapped_host(ObjectHandle object, std::uint64_t alignment) {
+    const auto& geometry = reader_.geometry(object);
+    if (!alignment || (alignment & (alignment - 1))) {
+        throw ArtifactError("mapped host alignment must be a power of two");
+    }
+    // CUDA host allocations are page-aligned, so any layout alignment up to a page is satisfied by
+    // the mapping's base address. A format that wants more cannot be host-mapped, and says so here
+    // instead of reading a misaligned table later.
+    if (geometry.alignment > kMappedHostAlignmentBytes) {
+        throw ArtifactError("a mapped host weight cannot satisfy this layout's alignment");
+    }
+    auto& demand        = demands_.at(object.index);
+    demand.mapped_host  = true;
+    demand.alignment    = std::max({demand.alignment, alignment, geometry.alignment});
 }
 
 ObjectHandle Binder::resource(std::string_view component, std::string_view role) {
@@ -162,6 +180,16 @@ MaterializationPlan Binder::finish() && {
     plan.owned_value_bytes = owned_value_bytes_;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
+        if (demand.mapped_host) {
+            // One physical destination per object: a mapped weight owns its bytes in host memory,
+            // so it can neither also land in an arena nor also be retained as a Host copy.
+            if (demand.device || demand.host) {
+                throw ArtifactError("a weight cannot be host-mapped and also materialized elsewhere");
+            }
+            const ObjectHandle handle{i};
+            plan.mapped_objects.push_back(
+                {handle, reader_.geometry(handle).bytes, demand.alignment});
+        }
         if (demand.device) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);

@@ -11,6 +11,9 @@ struct LoadOptions {
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
+    // Keep the token embedding table in mapped host memory instead of device memory (see
+    // EngineOptions::embedding_host).
+    bool embedding_host = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -53,10 +56,11 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-    return {.purpose       = options.purpose,
-            .vision        = options.enable_vision,
-            .speculative   = options.speculative.backend,
-            .proposal_head = options.speculative.proposal_head};
+    return {.purpose        = options.purpose,
+            .vision         = options.enable_vision,
+            .speculative    = options.speculative.backend,
+            .proposal_head  = options.speculative.proposal_head,
+            .embedding_host = options.embedding_host};
 }
 
 } // namespace ninfer::models

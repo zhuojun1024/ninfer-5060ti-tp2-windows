@@ -453,6 +453,7 @@ std::string format_server_start_json(
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
+                                                          {"host_mapped_bytes", load.host_mapped_bytes},
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
                                                           {"load_seconds", load.load_seconds},

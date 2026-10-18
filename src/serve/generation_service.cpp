@@ -249,6 +249,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_item_tokens       = options_.vision_item_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.embedding_host           = options_.embedding_host;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     // Served conversations shorter than this history are not retained (a title or summary call beside

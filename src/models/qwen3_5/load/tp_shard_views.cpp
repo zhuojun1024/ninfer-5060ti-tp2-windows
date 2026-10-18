@@ -93,8 +93,9 @@ std::vector<BoundWeight> shard_views(std::span<const PendingWeight> pending,
     out.reserve(pending.size());
     for (std::size_t index = 0; index < pending.size(); ++index) {
         const auto& item = pending[index];
-        if (item.reference.residency != artifact::Residency::Device) {
-            throw std::invalid_argument("shard view: only device-resident weights are supported");
+        if (!artifact::device_readable(item.reference.residency)) {
+            throw std::invalid_argument(
+                "shard view: a shard weight must be device-readable (device-resident or host-mapped)");
         }
         // Shard-local components (the MTP layer on shard 0, the Vision tower on shard 1) are absent
         // from the other shard. Keep the entry so WeightId indices stay aligned with the parameter

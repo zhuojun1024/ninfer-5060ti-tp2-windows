@@ -192,6 +192,17 @@ full `max_position_embeddings` and is what the [TP-2 note](docs/tp2-dual-5060ti.
 shipped Windows `serve.ps1` recipe uses 131,072 with `--vision`, because the vision workspace on top
 of a 262,144-token KV pool leaves too little VRAM for comfort under WDDM.
 
+### Host-mapped embedding table
+
+`--embedding-host` keeps the token embedding table in pinned host memory and maps it into the device
+address space instead of uploading it: the device reads a row per prompt token while embedding (and
+one per MTP step), so the table can live on the host without touching the decode weight stream. Each
+TP-2 shard holds its own column half and drops 606 MiB of resident weights (the whole table, 1.18 GiB
+for the FP8 artifacts, on the single-GPU route), which at 16.125 KiB per token is about 38,000 more
+fp8 tokens of context per shard; the startup ledger reports the mapping as `host-mapped`. Verified
+bit-identical, and free: a 64,967-token scoring run at context 2048 measured perplexity 1.800897
+with and without the flag, at 606.2 versus 605.7 tok/s. It is off by default.
+
 ### DFlash2 draft weights
 
 A DFlash2 artifact carries a second, masked draft model next to the target weights. Every shipped

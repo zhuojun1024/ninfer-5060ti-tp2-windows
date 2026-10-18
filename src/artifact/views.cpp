@@ -11,7 +11,9 @@ WeightView bind_view(const ParameterReference& reference,
     out.shape             = reference.shape;
     std::uint64_t covered = 0;
     for (const auto& part : reference.binding.parts) {
-        const auto& parent = reference.residency == Residency::Device
+        // A mapped host weight is device-readable, so its view binds like a device-resident one;
+        // only the address it points at lives in host memory.
+        const auto& parent = device_readable(reference.residency)
                                  ? materialized.device_parent(part.object)
                                  : materialized.host_parent(part.object);
         if (part.begin >= part.end || part.end > parent.geometry.elements) {

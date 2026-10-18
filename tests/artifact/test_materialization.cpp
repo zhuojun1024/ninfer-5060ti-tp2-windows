@@ -102,6 +102,43 @@ void failure_and_host_only(DeviceContext& device) {
     materialization(device);
 }
 
+void mapped_host_residency(DeviceContext& device) {
+    // A weight bound as MappedHost keeps its bytes in host memory but stays readable from a kernel:
+    // it must cost no device capacity, no upload, and still hand out the artifact's own bytes.
+    Fixture fixture;
+    fixture.write(true);
+    std::optional<MaterializedArtifact> backing;
+    ObjectHandle mapped{};
+    std::uint64_t mapped_bytes = 0;
+    std::vector<std::byte> source;
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        (void)binder.parameter("matrix", {2, 130}, Residency::MappedHost);
+        auto plan = std::move(binder).finish();
+        require(plan.mapped_objects.size() == 1 && plan.device_objects.empty(),
+                "a mapped host demand also planned a device object");
+        mapped       = plan.mapped_objects.front().object;
+        mapped_bytes = plan.mapped_objects.front().bytes;
+        source       = reader.read_object(mapped);
+        require(source.size() == mapped_bytes, "mapped placement size differs from the object");
+        backing.emplace(materialize(reader, std::move(plan), device));
+    }
+    const auto& stats = backing->stats();
+    require(stats.host_mapped_bytes == mapped_bytes && stats.device_capacity_bytes == 0 &&
+                stats.h2d_bytes == 0,
+            "mapped host demand was charged to device capacity or uploaded");
+    require(backing->tp_mapped().size() == 1, "the mapped host allocation is not owned by the model");
+    const std::byte* address = backing->device_parent(mapped).data;
+    cudaPointerAttributes attributes{};
+    CUDA_CHECK(cudaPointerGetAttributes(&attributes, address));
+    require(attributes.type == cudaMemoryTypeHost,
+            "a mapped host weight is not reachable as host memory");
+    std::vector<std::byte> downloaded(source.size());
+    CUDA_CHECK(cudaMemcpy(downloaded.data(), address, downloaded.size(), cudaMemcpyDeviceToHost));
+    require(downloaded == source, "a mapped host weight did not keep the artifact bytes");
+}
+
 void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bool writer_fixture) {
     std::optional<MaterializedArtifact> storage;
     std::map<std::size_t, std::vector<std::byte>> expected;
@@ -233,6 +270,7 @@ int main(int argc, char** argv) {
         }
         materialization(device);
         failure_and_host_only(device);
+        mapped_host_residency(device);
 #if !defined(_WIN32)
         ninfer::test::materialization_cuda_errors(device);
 #endif

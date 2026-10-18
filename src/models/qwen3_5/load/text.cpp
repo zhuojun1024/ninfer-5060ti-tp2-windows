@@ -103,8 +103,13 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
 
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options) {
     TextWeights out;
-    out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    // --embedding-host: the token embedding is the one large table read once per prompt token, so it
+    // can live in mapped host memory while the device keeps the whole vocabulary.
+    const auto embedding_residency =
+        options.embedding_host ? artifact::Residency::MappedHost : artifact::Residency::Device;
+    out.token_embedding = b.parameter("text/token_embedding",
+                                      {config.vocab_size, config.hidden_size}, {}, std::nullopt,
+                                      embedding_residency);
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");

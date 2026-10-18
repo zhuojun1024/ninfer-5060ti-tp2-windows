@@ -296,6 +296,16 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
+void* PinnedHostBuffer::device_data() const {
+    if (data_ == nullptr) { return nullptr; }
+    void* device_ptr      = nullptr;
+    const cudaError_t err = cudaHostGetDevicePointer(&device_ptr, data_, 0);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("mapped host pointer query failed", err));
+    }
+    return device_ptr;
+}
+
 HostBuffer::HostBuffer(std::size_t size_bytes, HostPinning pinning) {
     if (size_bytes == 0) { throw std::invalid_argument("HostBuffer size must be nonzero"); }
 

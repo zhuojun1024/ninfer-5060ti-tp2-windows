@@ -439,6 +439,14 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("--kv-headroom-mib") != std::string::npos,
               "serve help omits --kv-headroom-mib");
 
+    failures += check(!automatic.embedding_host,
+                      "--embedding-host is on without being requested");
+    const ServeOptions mapped =
+        parse({"ninfer-serve", "model.ninfer", "--embedding-host"});
+    failures += check(mapped.embedding_host, "--embedding-host did not select mapped host weights");
+    failures += check(serve_usage_text("ninfer-serve").find("--embedding-host") != std::string::npos,
+                      "serve help omits --embedding-host");
+
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",

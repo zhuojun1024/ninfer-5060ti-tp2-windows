@@ -242,8 +242,11 @@ int main(int argc, char** argv) {
                 options.proposal_head = ProposalHead::Optimized;
             } else if (arg == "--vision") {
                 options.vision = true;
+            } else if (arg == "--embedding-host") {
+                options.embedding_host = true;
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--spec mtp|dflash2] [--lm-head-draft] [--vision]\n";
+                std::cout << "--artifact PATH [--spec mtp|dflash2] [--lm-head-draft] [--vision]"
+                             " [--embedding-host]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
