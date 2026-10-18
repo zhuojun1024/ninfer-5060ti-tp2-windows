@@ -934,6 +934,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-headroom-mib N` | sizing headroom left unallocated by `--kv-capacity auto`; requires `auto` and `0` maximizes the pool | `1024` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--lane-context N` | TP-2 multi-lane admission ceiling in tokens: how much context one lane may reserve; `0` lets one lane take the whole shared KV pool (ignored at `--max-concurrency 1`) | `0` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
@@ -1140,8 +1141,9 @@ network serialization run outside the GPU executor and do not delay formation of
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
-resolves once at startup.
+and leaves 1 GiB of sizing headroom, which `--kv-headroom-mib N` overrides (`0` maximizes the pool;
+the flag requires `auto`, since an explicit capacity already fixes the pool); omitting the option
+makes it follow `--max-context`. Capacity resolves once at startup.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.

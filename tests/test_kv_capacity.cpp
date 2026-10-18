@@ -36,6 +36,17 @@ int main() {
     failures += check(capped.main_page_groups == 6 && capped.resolved_tokens == 384,
                       "automatic KV capacity exceeded or missed the target maximum");
 
+    const auto squeezed =
+        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(300), curve, 1360);
+    failures += check(squeezed.main_page_groups == 2 && squeezed.resolved_tokens == 128 &&
+                          squeezed.automatic_headroom_bytes == 300,
+                      "a larger automatic headroom did not shrink the resolved page count");
+
+    const auto no_headroom =
+        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(0), curve, 1360);
+    failures += check(no_headroom.main_page_groups == 4 && no_headroom.planned_slack_bytes == 104,
+                      "zero automatic headroom did not maximize the pool");
+
     const auto explicit_capacity = ninfer::runtime::resolve_kv_capacity(
         ninfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200);
     failures +=

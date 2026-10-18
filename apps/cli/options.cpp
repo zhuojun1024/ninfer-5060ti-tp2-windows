@@ -107,7 +107,9 @@ std::string usage_text(const char* argv0) {
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           " MiB of sizing headroom;\n"
+           "--kv-headroom-mib overrides that headroom for automatic sizing (0 maximizes the "
+           "pool).\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--version prints the release version and exits.\n";
@@ -126,6 +128,8 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool kv_headroom_explicit = false;
+    std::size_t kv_headroom_mib = 0;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -147,6 +151,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-headroom-mib") {
+            kv_headroom_mib = static_cast<std::size_t>(
+                parse_u32(value(arg), "kv-headroom-mib"));
+            kv_headroom_explicit = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -223,6 +231,12 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (kv_headroom_explicit) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity.automatic_headroom_bytes = kv_headroom_mib * (1024ULL * 1024ULL);
     }
 
     const bool has_prompt   = !options.prompt.empty();

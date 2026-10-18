@@ -68,7 +68,8 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] [--lane-context N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--kv-headroom-mib N] "
+           "[--max-concurrency N] [--lane-context N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-overlap N] [--log-stats-interval-ms N] [--device N] [--devices A,B] "
            "[--context-cost-presets FILE] "
@@ -108,7 +109,9 @@ std::string serve_usage_text(const char* argv0) {
            "       downsizes larger media instead of rejecting it\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
+           " MiB of sizing headroom;\n"
+           "       --kv-headroom-mib overrides that headroom for automatic sizing "
+           "(0 maximizes the pool)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
@@ -146,6 +149,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    bool kv_headroom_explicit        = false;
+    std::size_t kv_headroom_mib      = 0;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -179,6 +184,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-headroom-mib") {
+            kv_headroom_mib = static_cast<std::size_t>(
+                parse_nonnegative_int(require_value("--kv-headroom-mib"), "kv-headroom-mib"));
+            kv_headroom_explicit = true;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -384,6 +393,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (kv_headroom_explicit) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity.automatic_headroom_bytes = kv_headroom_mib * (1024ULL * 1024ULL);
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

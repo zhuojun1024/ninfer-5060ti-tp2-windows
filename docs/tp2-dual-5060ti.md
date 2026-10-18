@@ -27,7 +27,10 @@ measurement](#current-measurement) has the current four-route table) and is
 verified non-degenerate (see the MTP section); `--lm-head-draft` selects the artifact's reduced
 proposal head for the draft side; drop those two flags for the plain route. Every one of those
 choices is numerically transparent: the greedy output at 262,144 is byte-identical to the pre-split
-build at 131,072 (see Verification).
+build at 131,072 (see Verification). `--kv-capacity auto` sizes the pool from the free bytes each
+shard reports after loading, leaving 1 GiB of headroom; `--kv-headroom-mib N` overrides that
+headroom (`0` maximizes the pool), which is the knob to reach for when the ceiling is a few tokens
+short or when another process shares the card.
 
 ## Current measurement
 

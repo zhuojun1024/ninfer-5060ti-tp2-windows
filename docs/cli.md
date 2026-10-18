@@ -210,6 +210,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-headroom-mib N` | sizing headroom left unallocated by `--kv-capacity auto`; requires `auto` and `0` maximizes the pool | `1024` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -273,8 +274,10 @@ The artifact describes its model configuration and weight representations;
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
-and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
+and CUDA Graph allowance, while leaving the automatic headroom
+unallocated. `--kv-headroom-mib N` sets that headroom explicitly (`0` maximizes the pool); it
+requires `--kv-capacity auto`, because an explicit capacity already fixes the pool. It does not
+probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server. On the TP-2
 server route the pool is shared dynamically and `--lane-context N` caps how much context one lane

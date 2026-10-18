@@ -408,6 +408,37 @@ int main() {
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
+    const ServeOptions headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-headroom-mib", "512", "--kv-capacity", "auto"});
+    failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          headroom.kv_capacity.automatic_headroom_bytes ==
+                              (static_cast<std::size_t>(512) << 20),
+                      "--kv-headroom-mib did not override the automatic headroom");
+
+    const ServeOptions maximizing =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--kv-headroom-mib", "0"});
+    failures += check(maximizing.kv_capacity.automatic_headroom_bytes == 0,
+                      "--kv-headroom-mib 0 did not clear the automatic headroom");
+
+    bool headroom_without_auto_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-headroom-mib", "512"});
+    } catch (const std::invalid_argument&) { headroom_without_auto_rejected = true; }
+    failures += check(headroom_without_auto_rejected,
+                      "--kv-headroom-mib without --kv-capacity auto was accepted");
+
+    bool headroom_with_explicit_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "8192",
+                     "--kv-headroom-mib", "512"});
+    } catch (const std::invalid_argument&) { headroom_with_explicit_rejected = true; }
+    failures += check(headroom_with_explicit_rejected,
+                      "--kv-headroom-mib with an explicit --kv-capacity was accepted");
+
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--kv-headroom-mib") != std::string::npos,
+              "serve help omits --kv-headroom-mib");
+
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",
