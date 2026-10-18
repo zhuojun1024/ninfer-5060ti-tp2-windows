@@ -41,6 +41,7 @@ is needed.
 pwsh -File tools/win_port/serve.ps1                  # foreground TP-2 server on 127.0.0.1:8099
 pwsh -File tools/win_port/serve.ps1 -Context 32768   # smaller KV capacity
 pwsh -File tools/win_port/serve.ps1 -Plain           # no MTP or vision
+pwsh -File tools/win_port/serve.ps1 -EmbeddingHost   # +606 MiB VRAM per shard, mapped embedding table
 pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
 pwsh -File tools/win_port/serve.ps1 -Stop            # stop every ninfer-serve process
 ```

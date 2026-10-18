@@ -9,11 +9,14 @@
 #   pwsh -File tools/win_port/serve.ps1 -Model <artifact>.ninfer   # or set NINFER_MODEL
 #   pwsh -File tools/win_port/serve.ps1 -ChatTemplate <template>.jinja   # custom chat template
 #   pwsh -File tools/win_port/serve.ps1 -VisionItemTokens 4096   # smaller Vision workspace
+#   pwsh -File tools/win_port/serve.ps1 -EmbeddingHost   # +606 MiB VRAM per shard from the mapped embedding table
 #   pwsh -File tools/win_port/serve.ps1 -Status          # processes, health, VRAM
 #   pwsh -File tools/win_port/serve.ps1 -Stop            # stop every ninfer-serve process
 #
 # Two 16 GiB cards hold the 27B NVFP4 artifact: 131072 tokens of KV leaves about 1.6 GiB free per shard
 # on this machine, and 262144 (the recipe used under WSL) leaves too little for comfort under WDDM.
+# -EmbeddingHost keeps the token embedding table in pinned host memory, which returns ~606 MiB per shard
+# (about 38,000 more fp8 KV tokens at this context) for ~2.5 KiB of PCIe read per prompt token per shard.
 # Only ninfer-serve is managed here: no llama.cpp process is ever touched.
 [CmdletBinding(DefaultParameterSetName = "start")]
 param(
@@ -30,6 +33,7 @@ param(
     [int] $HostKvMiB = 32768,
     [int] $PrivateContinuations = 6,
     [switch] $Plain,
+    [switch] $EmbeddingHost,
     [switch] $Background,
     [string] $LogFile = "",
     [string] $FfmpegRoot = $env:NINFER_FFMPEG_ROOT,
@@ -109,6 +113,10 @@ $arguments = @(
 )
 if ($ChatTemplate) { $arguments += @("--chat-template", $ChatTemplate) }
 if ($VisionItemTokens -ne 16384) { $arguments += @("--vision-item-tokens", "$VisionItemTokens") }
+# The token embedding table stays in pinned host memory instead of VRAM: ~606 MiB per shard, i.e. about
+# 38,000 more fp8 KV tokens at this context. Prefill pays ~2.5 KiB per prompt token per shard on PCIe;
+# decode reads a few rows and is unaffected. Measured bit-identical to the device-resident table.
+if ($EmbeddingHost) { $arguments += "--embedding-host" }
 if (-not $Plain) {
     $arguments += @(
         "--temperature", "0.7", "--top-k", "20", "--top-p", "0.80",
