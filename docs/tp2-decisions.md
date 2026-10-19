@@ -155,6 +155,34 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   fresh process per arm-half, paired-by-cycle analysis.
   (PLAN.md §A2; measurement JSONs under `_temp/20261017-0115_a2_*`; bench driver
   `_temp/20261017-0115_a2_interleaved_ab.ps1`)
+- **Tree-shaped verification of the selector's top-b candidates (2026-10-20): measured,
+  not worth it.** DFlash2 already computes 16 candidates per window position, so a tree could
+  in principle test several of them per round at no proposal cost. Measured on the production
+  route (262144/int8, K=5, `--draft-tokens 10` control) with 9 single requests / 617 decode
+  rounds (temp 0.7, fixed seed): target argmax lies in the selector's top-1 at 0.707/0.580/
+  0.533/0.429/0.392 and in the top-2 at 0.791/0.680/0.628/0.525/0.499 over depths 0-4
+  (top-16: 0.921/0.854/0.802/0.751/0.711). The marginal coverage per extra candidate column
+  is ≈8 pp at depth 0 and decays with depth, while a verify column costs **+0.68 ms** (+1.8% of
+  the 38.7 ms round; single-lane envelope — the 4-lane figure quoted in the adaptive-extent
+  entry is 1.85 ms/column), so the marginal expected token gain falls from +0.08 at depth 0 to
+  +0.03 at depth 4 — negative after depth 2 once weighted by prefix survival.
+  - The best tree the current proposal machinery can feed (extra candidate leaves hung off the
+    top-1 prefix: 4 candidates at depth 0, 2 at depth 1, 2 at depth 2) raises E from 3.10 to 3.35
+    tokens/round (**+8.2%**) for an 11-column window, i.e. +7% round time (verify 32.0→35.4 ms
+    measured on the same window) ⇒ **+1~2% tok/s, inside noise**, and it needs tree accept,
+    commit/rollback and mask work.
+  - The same 5 extra columns as a longer chain (K=10) were measured directly: 3.05→3.32
+    tokens/round (**+8.9%**) but round 38.7→46.9 ms (+21%; draft 5.2→9.7, verify 32.0→35.4)
+    ⇒ **78.8→70.8 tok/s (−10%)**. Extra window columns are dominated by fixed cost, not
+    candidate coverage. (Note the accept path verifies only the rank-0 draft token today;
+    the 16 candidates feed the rejection sampler's q, not the verified set.)
+  - Per-content spread is large (prose E 1.67, code/math/numeric E 4.3-5.5 tokens/round), so
+    tree gains concentrate on prose, but the aggregate stays below the 3.5% retention bar. Do not
+    re-open unless the selector's candidate concentration changes materially (top-16 − top-1
+    coverage) or the verify column marginal drops ~2×.
+    (measurement: 617-round per-column probe over the batched DFlash2 accept path; raw logs
+    `_temp/dflash_cov_k5.log`, `_temp/serve_k5.err`, `_temp/serve_k10.err`, analyzer
+    `_temp/20261020-0020_cov_analyze2.py`)
 - **Device-plane divergence anchor (+73.4 MiB/card): abandoned.** Saves only
   ~9.9 ms per session; in real chat the reachability guard usually holds and
   the device path is taken. (worklog Round 17)
