@@ -260,9 +260,10 @@ release version the binary was built from.
 ## Device selection
 
 The CLI runs on a single GPU selected by `--device` (default `0`). Tensor-parallel-2 (two
-identical RTX 5060 Ti cards) is available on the server route only: start `ninfer-serve` with
-`--devices <a>,<b>`; see [HTTP serving](serving.md#tensor-parallel-2-tp-2) and the
-[dual RTX 5060 Ti TP-2 note](tp2-dual-5060ti.md).
+identical RTX 5060 Ti cards) is available on the server and perplexity routes: start
+`ninfer-serve` or run `ninfer-perplexity` with `--devices <a>,<b>`; see [HTTP
+serving](serving.md#tensor-parallel-2-tp-2), [perplexity evaluation](perplexity.md#run-the-fixed-corpus),
+and the [dual RTX 5060 Ti TP-2 note](tp2-dual-5060ti.md).
 
 ## Context and memory
 

@@ -79,7 +79,7 @@ selector codebooks as one converted by `qwen3_8_27b`:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_gsq_rco_iq3_s.ninfer \
-  --model-id qwen3.8-27b --kv-dtype rk8v4 --spec mtp --draft-tokens 3
+  --model-id qwen3.8-27b --kv-dtype k8v4 --spec mtp --draft-tokens 3
 ```
 
 The converter recipe, the artifact and the products above are qualified by

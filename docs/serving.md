@@ -155,7 +155,7 @@ RTX 5060 Ti cards but not one.
   ([tp2-plan.md](maintainer/tp2-plan.md) §3.6).
 - KV capacity is page-aligned to `--max-context` (the core builds its own paged cache), and the
   context cache is disabled (the core owns its prefix-reuse snapshots).
-- The single-request CLI and the perplexity evaluator are single-GPU; only `ninfer-serve` accepts
+- The single-request CLI is single-GPU; `ninfer-serve` and `ninfer-perplexity` accept
   `--devices`.
 
 The [dual RTX 5060 Ti TP-2 note](tp2-dual-5060ti.md) records the verified configuration, memory
