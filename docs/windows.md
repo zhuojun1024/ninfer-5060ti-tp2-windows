@@ -60,7 +60,7 @@ The release version has one source of truth: `project(ninfer VERSION x.y.z ...)`
 compiled into every executable as `NINFER_VERSION` and printed by `--version`:
 
 ```powershell
-build-win/apps/ninfer-serve.exe --version    # ninfer-serve 0.1.0
+build-win/apps/ninfer-serve.exe --version    # ninfer-serve 0.1.1
 ```
 
 `tools/win_port/package.ps1` turns a finished build into a self-contained archive:
