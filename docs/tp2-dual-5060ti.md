@@ -198,23 +198,26 @@ throughput - and four things consume that on decode:
 
 - **Draft depth.** llama.cpp commits 2.60 tokens per round against 2.18 here. Raising
   `--draft-tokens` to 3 does not pay on this artifact: the round grows to 40.7 ms while acceptance
-  falls to 42.4%, so decode drops to 55.7 tok/s. Each extra draft is host-serialized
-  (`mtp_propose_window` synchronizes per draft) and adds only ~0.1 committed tokens.
+  falls to 42.4%, so decode drops to 55.7 tok/s. Each extra draft widens the verify window by a
+  column and adds only ~0.1 committed tokens; the chain itself is device-resident and synchronizes
+  once per round, not once per draft (`src/runtime/engine/tp2_generation_core.cpp:2019`).
 - **Weight bytes.** Roughly a quarter of the per-token traffic is stored at one byte per element:
   attention/GDN projections, embedding, output head and the last eight layers' FFN are FP8 where the
   reference GGUF spends 0.56-0.69 B/element. Repacking them as NVFP4 would remove ~2.6 GB per shard
   per token, at a quality cost.
-- **TP-2 structural losses.** This route runs with `use_cuda_graph = false`
-  (`src/runtime/engine/model_instance.cpp:99`), so a verify forward launches ~1,009 kernels and pays
+- **TP-2 structural losses.** This route ran with `use_cuda_graph = false`
+  (`src/runtime/engine/model_instance.cpp:151`), so a verify forward launched ~1,009 kernels and paid
   ~2.9 ms of launch gaps; splitting heads doubles the collectives to 128 allreduces per token
   (~2.6 MB round trip, 9-18 us each); the fused `linear_swiglu`/`attn_input_proj` kernels are
   registered for full-model rows only and are bypassed on shard-local rows. llama.cpp captures the
   whole round, draft chain included, in CUDA graphs (95-96 replays per 256-token answer). Both launch
-  gaps are recovered since: the verify window and the MTP draft chain are each captured per envelope
-  bucket (see "Verify CUDA graph" and "MTP draft-chain CUDA graph").
-- **Draft chain on the host.** Two drafts cost 7-10 ms of the 38.2 ms round on top of the ~30 ms
-  verify forward, so the MTP chain, not the kernels, is the largest single overhead. Recovered since:
-  the chain is one captured sequence per envelope bucket (see "MTP draft-chain CUDA graph").
+  gaps are gone now: the verify window and the MTP draft chain each replay as one graph per
+  envelope bucket (see "Verify CUDA graph" and "MTP draft-chain CUDA graph").
+- **Draft chain.** The chain is 3.5-3.7 ms of real MTP-layer work per round on top of the ~30 ms
+  verify forward, not the 7-10 ms of host serialization once inferred by subtracting it out of a
+  slower round; its launch gaps were already mostly hidden behind that work. Captured since: one
+  sequence per envelope bucket, worth a further 0.2-0.3 ms per round (see "MTP draft-chain CUDA
+  graph").
 
 Caveat: llama.cpp ran with the owner's exact command line and therefore its default batch/ubatch; a
 larger `-ub` was not tried and could move its prefill numbers.
@@ -379,16 +382,21 @@ costs most of the route's speed.
 
 What bounds the route is bandwidth. A forward stream reads 10.15 GB per shard, so no round can
 finish in less than 10.15/448 = 22.7 ms on TP-2, against 20.3/1,792 = 11.3 ms for the same stream
-on a single 5090; with the verify window still eager (the feature sink cannot enter the capture)
-and the proposal at 6.4-6.8 ms per round, the roofline estimate in
-[tp2-plan.md](maintainer/tp2-plan.md) §3.6 is 108 tok/s, and K=7's 63.6 tok/s does not reach it.
-Two route-specific terms sit on top of that floor: the draft's 2.07 GiB lives on shard 0 alone,
-about 5.0 ms per round against 1.24 ms on the 5090, while MTP pays 7-10 ms per round for the
-host-serialized draft chain DFlash2 does not have. The platforms are otherwise comparable in
-efficiency - the 5090's 192.5 tok/s at 37.0% acceptance is 3.59 tokens per round in 18.6 ms, 61% of
-that card's floor, and TP-2's MTP K=2 is 38.2 ms per round at 59% of its own - so the roughly 2x
-gap between them is the bandwidth ratio rather than an implementation difference. Single-5090
-numbers for the same route are tabulated in [qwen3.8-27b.md](performance/qwen3.8-27b.md).
+on a single 5090. On the single-lane route both verify windows replay from CUDA graphs (see "Verify
+CUDA graph"), so the ~1,009 eager launches per forward and the launch gap they cost are gone. The
+108 tok/s ceiling quoted in [tp2-plan.md](maintainer/tp2-plan.md) (Key numbers) is the older Round D
+projection: 22.7 ms of verify at the floor, 5.0 ms for the draft's stream on shard 0, 2.9 ms of
+launch gap and 2.5 ms of collectives, at 3.59 tokens per round - an upper bound that also leaves the
+proposal step out. Measured, the shipped route takes about 45 ms per round at 4096 tokens (3.17
+tokens per round, ~71 tok/s); above the weight-stream floor sit the verify's own non-bandwidth time,
+the 6.4-6.8 ms proposal step, the draft's 2.07 GiB stream (shard 0 alone, about 5.0 ms per round
+against 1.24 ms on the 5090) and the host-side round step.
+MTP has no draft-stream term but pays its chain instead: 3.5-3.7 ms of real MTP-layer work per
+round. The platforms are otherwise comparable in efficiency - the 5090's 192.5 tok/s at 37.0%
+acceptance is 3.59 tokens per round in 18.6 ms, 61% of that card's floor, and TP-2's MTP K=2 is
+38.2 ms per round at 59% of its own - so the roughly 2x gap between them is the bandwidth ratio
+rather than an implementation difference. Single-5090 numbers for the same route are tabulated in
+[qwen3.8-27b.md](performance/qwen3.8-27b.md).
 
 ### Verify CUDA graph
 

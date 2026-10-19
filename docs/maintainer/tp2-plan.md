@@ -31,8 +31,8 @@
   verify graph B7 accepted (aggregate +5.2%).
 - **Key numbers** (262,144 configuration, WSL): prefill 1,588 tok/s; decode 59.0 tok/s (MTP K=2); Windows 131,072 configuration
   decode 56.9 tok/s (on par with Linux). DFlash2 K=7 at 4096 context in the greedy tier ≈ 71 tok/s; 245,760/k8v4 (draftall artifact)
-  sweep K=5 96.4 / K=7 96.1 tok/s (interleaved recheck 93.3 / 96.9); roofline-corrected ceiling ≈ 108 tok/s (the
-  180 of the originally archived 90–180 is unreachable). The r69 final artifact saves 257.77 MiB relative to r66 (−1.08%), with no measurable cost in
+  sweep K=5 96.4 / K=7 96.1 tok/s (interleaved recheck 93.3 / 96.9); roofline-corrected ceiling ≈ 108 tok/s, an upper bound that
+  also leaves the proposal step out (the 180 of the originally archived 90–180 is unreachable). The r69 final artifact saves 257.77 MiB relative to r66 (−1.08%), with no measurable cost in
   acceptance (≤1σ, short-context A/B; the long-context 33k recheck shows about −2 pp for the codebook half), at a round-time cost of ~+0.4%
   (proposal step +0.19 ms). After the codebook revert to BF16, that difference returns to ≈79.7 MiB (converted value, throughput not re-measured).
 

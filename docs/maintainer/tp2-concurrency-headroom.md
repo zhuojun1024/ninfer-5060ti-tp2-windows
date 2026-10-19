@@ -365,8 +365,9 @@ and the other two joined mid-flight at `admit slot=2/3`.
    `release_lane_kv → invalidate_host_checkpoints(lane)`, wiping the grid ring at the decode tail,
    leaving only the catalog's frontier / prompt-end / block-shared mirrors
    (multi-turn sessions and shared system prefixes still hit; the middle-segment-only-sharing case does not).
-   Closing it needs another class of `SessionEntry` mirror, and the host budget of 10,240 MiB/shard only fits
-   2 × 3,960 MiB whole sessions.
+   Closing it needs another class of `SessionEntry` mirror, and the host KV budget bounds how many
+   fit: the §2.1 configuration (`--host-kv-mib 20480`) leaves 10,240 MiB/shard, two whole-session
+   mirrors of about 3,960 MiB, while the shipped `--host-kv-mib 32768` leaves 16,384 MiB/shard, four.
 
 ## 6. Recommendation list
 

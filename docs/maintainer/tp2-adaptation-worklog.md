@@ -4242,8 +4242,9 @@ log `[tp2-graph] verify step: eager`) — i.e. C (B7 graph wiring) is the first 
 - **The two routes' measured efficiency is comparable**: TP-2 MTP K=2 is 38.2 ms/round ≈ 59% of floor; 5090 DFlash2 192.5 tok/s,
   acc 37.0% ⇒ 3.59 token/round ⇒ 18.6 ms ≈ 61% of floor ⇒ the gap is mainly just the bandwidth ratio.
 - **DFlash2-specific disadvantage**: draft (2.07 GiB) is only on shard 0 ⇒ 2.22/448 ≈ **5.0 ms/round** (1.24 ms on the 5090, four times).
-- **DFlash2-specific advantage**: MTP's single largest cost item on TP-2 is the **7–10 ms host-serial draft chain**
-  (same document `:127-128`); DFlash2 produces all proposals in parallel in one non-causal masked block forward ⇒ this cost disappears.
+- **DFlash2-specific advantage**: MTP's draft chain was budgeted at **7–10 ms of host serialization** here (same document `:127-128`);
+  DFlash2 produces all proposals in parallel in one non-causal masked block forward ⇒ that cost disappears. *(Round E later measured the
+  chain at 3.5–3.7 ms of layer work - the 7–10 ms was a subtraction from a slower round - so this advantage is smaller than budgeted.)*
 - **Estimate**: (22.7 verify + 5.0 draft + 2.9 launch gap + ≈2.5 allreduce) ≈ **33 ms/round ÷ 3.59 ≈ 108 tok/s**
   ⇒ about **0.56×** of the 5090, but **≈1.9×** this machine's MTP K=2 at 57 tok/s —— clearly larger than the +19.5% on a single card,
   because the chain that gets eliminated accounts for the largest share of a TP-2 round.
@@ -7255,8 +7256,9 @@ the correct improvement in that scenario is kernel-based P2P exchange (graph-cap
 > This section only collects items that benefit **2×5060 Ti TP-2**, ordered by benefit/cost.
 >
 > Criterion (§1 and `docs/tp2-dual-5060ti.md`): decode is bandwidth-bound by the per-shard weight stream (10.15 GB/forward ÷ 448 GB/s
-> ≈ 22.7 ms lower bound, measured round 38.2 ms); there are also 128 allreduces/token (9–18 µs), the MTP draft chain host-serial
-> 7–10 ms, launch gap ~2.9 ms (1009 kernels/forward), and a hard 16 GiB device-memory constraint. Ordering: reduce weight bytes per card >
+> ≈ 22.7 ms lower bound, measured round 38.2 ms); there are also 128 allreduces/token (9–18 µs), the MTP draft chain at 3.5–3.7 ms of
+> layer work (the "host-serial 7–10 ms" recorded here on 2026-09-26 was a subtraction artifact; corrected 2026-10-20, see Round E), the
+> launch gap ~2.9 ms (1009 kernels/forward, removed once a window is captured), and a hard 16 GiB device-memory constraint. Ordering: reduce weight bytes per card >
 > reduce launch/kernel count ≈ reduce communication count > raise prefill compute > pure compute optimization.
 
 ### 5.1 Execution order and status
