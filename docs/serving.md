@@ -496,6 +496,7 @@ The served routes accept these headers, first match wins:
 |---|---|
 | `x-session-id` | generic conversation identity, and the name billion-context can be asked to forward |
 | `x-claude-code-session-id` | Claude Code session |
+| `x-deepseek-harness-session-id` | DeepSeek Harness session |
 | `x-bili-plugin-conversation` | billion-context conversation, honored only on a request that also carries `x-bili-plugin` |
 
 A value of 1..256 bytes is used with control bytes replaced; an empty or longer value is refused and

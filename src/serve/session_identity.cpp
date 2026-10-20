@@ -18,10 +18,11 @@ struct IdentityHeader {
     const char* marker;
 };
 
-constexpr std::array<IdentityHeader, 4> kIdentityHeaders{{
+constexpr std::array<IdentityHeader, 5> kIdentityHeaders{{
     {"x-bili-session-id", nullptr},
     {"x-session-id", nullptr},
     {"x-claude-code-session-id", nullptr},
+    {"x-deepseek-harness-session-id", nullptr},
     {"x-bili-plugin-conversation", "x-bili-plugin"},
 }};
 

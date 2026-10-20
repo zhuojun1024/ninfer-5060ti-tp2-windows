@@ -32,9 +32,10 @@ struct SessionIdentity {
 };
 
 // Resolves the conversation identity of one request. Header precedence: x-bili-session-id,
-// x-session-id, x-claude-code-session-id, then x-bili-plugin-conversation when the request also
-// carries the x-bili-plugin marker (a plugin's conversation header names the harness's session only
-// on the requests that plugin actually forwarded). Body fallbacks: session_id, prompt_cache_key.
+// x-session-id, x-claude-code-session-id, x-deepseek-harness-session-id, then
+// x-bili-plugin-conversation when the request also carries the x-bili-plugin marker (a plugin's
+// conversation header names the harness's session only on the requests that plugin actually
+// forwarded). Body fallbacks: session_id, prompt_cache_key.
 // 'endpoint' only labels the trace line, which NINFER_SERVE_SESSION_TRACE=1 enables.
 [[nodiscard]] SessionIdentity resolve_session_identity(const httplib::Request& request,
                                                        const RequestJson& body,

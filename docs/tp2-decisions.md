@@ -498,17 +498,18 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   weight 4, so variants of one conversation filled the `--max-private-continuations` slots and
   evicted the other conversation, paying host memory for no reuse. The serve layer now extracts a
   conversation identity (`x-session-id` > `x-claude-code-session-id` >
-  `x-bili-plugin-conversation` beside `x-bili-plugin` > body `prompt_cache_key`/`session_id`;
-  1..256 bytes) on all three routes and passes it as the existing LiveSession key. The engine keeps
-  one entry per name: a publish locates the entry the request continues by content - the entry,
-  carrying that identity or still anonymous, whose stored history shares the longest prefix with the
-  incoming history, covering all but a short rewritten tail - and rewrites that entry in place (the
-  resident case simply extends it) instead of dropping and re-appending it. That distinction is the
-  whole reuse benefit: the entry's host slabs hold the prefix KV and the divergence image this
-  request's own prefill just snapshotted, so replacing the record threw the fresh image away and the
-  next turn had to re-prefill the full prompt. The rewrite folds the new history over the old record
-  and clamps the host bookkeeping to the shared prefix (`host_kv_end`, plus every offered boundary
-  above it reset), so a boundary the engine can no longer reach is never offered again. A related
+  `x-deepseek-harness-session-id` > `x-bili-plugin-conversation` beside `x-bili-plugin` > body
+  `prompt_cache_key`/`session_id`; 1..256 bytes) on all three routes and passes it as the existing
+  LiveSession key. The engine keeps one entry per name: a publish locates the entry the request
+  continues by content - the entry, carrying that identity or still anonymous, whose stored history
+  shares the longest prefix with the incoming history, covering all but a short rewritten tail - and
+  rewrites that entry in place (the resident case simply extends it) instead of dropping and
+  re-appending it. That distinction is the whole reuse benefit: the entry's host slabs hold the
+  prefix KV and the divergence image this request's own prefill just snapshotted, so replacing the
+  record threw the fresh image away and the next turn had to re-prefill the full prompt. The rewrite
+  folds the new history over the old record and clamps the host bookkeeping to the shared prefix
+  (`host_kv_end`, plus every offered boundary above it reset), so a boundary the engine can no
+  longer reach is never offered again. A related
   correctness fix gives the frontier state image its own position (`SessionEntry::host_frontier_end`):
   an entry's `frontier` moves when the entry is recalled or extended while its `host_state` image
   stays where it was captured, so offering that image at the entry's current frontier would have
