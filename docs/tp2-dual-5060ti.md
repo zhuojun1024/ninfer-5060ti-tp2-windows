@@ -398,6 +398,30 @@ acceptance is 3.59 tokens per round in 18.6 ms, 61% of that card's floor, and TP
 rather than an implementation difference. Single-5090 numbers for the same route are tabulated in
 [qwen3.8-27b.md](performance/qwen3.8-27b.md).
 
+### Decode collective window
+
+Decode's layer chain is strictly sequential - every collective sits between the projection that
+produces its delta and the residual add that consumes it - so there is no compute to overlap with a
+reduction, and the wait itself is latency, not bandwidth: dividing the exchanged payload by four
+moved a verify round by 1.4 ms of 29.5. What the wait does leave idle is the memory system, and the
+next op's weight stream does not depend on the reduction, so each side can pull part of it into L2
+while the peer's arrival is in flight. `NINFER_TP2_DECODE_PREFETCH_MIB` sizes that window (32 MiB by
+default, 0 disables it): each collective prefetches at most that many bytes of this shard's next
+weight stream, the mixer's window fetching the same layer's FFN and the FFN's window fetching the
+next layer's mixer (`TextContext::run_layers_tp2`). The window is bounded by the rendezvous - the
+exchange block stops the prefetching blocks when its own arrival lands - so a hint can never hold a
+collective past the time its exchange would have taken, and nothing in the payload, the staging or
+the ids changes.
+
+Measured on the served path (8,192-token prompts with a per-prompt nonce, 128-token greedy outputs,
+plain route, interleaved arms, the server's own `timings`): 36.77 tok/s with the window empty
+against 37.43 tok/s at 32 MiB, a 0.46 ms round saving (10 and 8 reps; no overlap between the two
+arms, and every free arm's best round stays under every 32 MiB arm's worst). 2 MiB keeps the effect
+inside the spread, and 64 or 128 MiB give back part of it as the hint starts evicting what it
+fetched. MTP and DFlash2 rounds carry the same window, but their acceptance spread (69-75 tok/s
+across identical arms) does not resolve an effect, so 32 MiB is calibrated on the plain route
+alone.
+
 ### Verify CUDA graph
 
 The DFlash2 verify window is captured exactly like the MTP one (one graph per device per envelope

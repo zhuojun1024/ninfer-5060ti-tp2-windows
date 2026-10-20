@@ -165,6 +165,14 @@ public:
     template <class Tap>
     void run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
                         Phase ph, Tap& tap);
+    // The bytes this shard's next op streams from HBM, which decode's collective windows prefetch.
+    // Decode has no compute to overlap with a collective (the layer chain is strictly sequential),
+    // but it does have an idle memory system for the whole rendezvous, and these bytes are
+    // independent of the reduction. Null when the layer has nothing to hint.
+    [[nodiscard]] const Weight* tp_mixer_stream_weight(std::size_t layer) const;
+    [[nodiscard]] const Weight* tp_ffn_stream_weight(std::size_t layer) const;
+    [[nodiscard]] tp::DevicePair::ArPrefetchWindow tp_prefetch_window(const Weight* mine,
+                                                                      const Weight* peer) const;
     // Tensor-parallel prefill with the all-reduce overlapped against compute. The chunk is split into
     // `parts` 64-aligned sub-blocks and each sub-block's collective runs on the pair's second stream
     // while the next sub-block keeps the compute stream busy. The 64-token boundary keeps the result
@@ -571,6 +579,10 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    // Bytes each decode collective's rendezvous window may pull into L2, from this shard's own next
+    // op (see tp_prefetch_window in text.cpp). 32 MiB is the measured optimum; see the constructor
+    // for the sweep, and NINFER_TP2_DECODE_PREFETCH_MIB=0 keeps the window empty.
+    std::size_t decode_prefetch_bytes_ = std::size_t{32} << 20;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
@@ -592,6 +604,18 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block      = parameters_.text.layers[layer];
         const auto& block_peer = peer.parameters_.text.layers[layer];
+        // Rotation across the two collectives of this layer: each one waits on the peer with the
+        // memory system idle, so it pulls the bytes the next op is about to want. The mixer's window
+        // fetches this layer's FFN, the FFN's window fetches the next layer's mixer. Prefill keeps
+        // its own overlapped route and passes nothing here.
+        tp::DevicePair::ArPrefetchWindow mixer_window;
+        tp::DevicePair::ArPrefetchWindow ffn_window;
+        if (ph != Phase::Prefill && decode_prefetch_bytes_ != 0) {
+            mixer_window =
+                tp_prefetch_window(tp_ffn_stream_weight(layer), peer.tp_ffn_stream_weight(layer));
+            ffn_window = tp_prefetch_window(tp_mixer_stream_weight(layer + 1),
+                                            peer.tp_mixer_stream_weight(layer + 1));
+        }
         // One layer's activations are dead once the layer is done. Without this scope the two
         // deltas below would accumulate over all 64 layers, which only fits at T=1 - at a batched
         // prefill width each layer would leak 2 * hidden * T * 2 bytes (1.3 GiB at T=1024).
@@ -638,7 +662,7 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
         // kernels, H2D before residual_add), so no pre-sync is needed.
         ctx_.bind_to_current_thread();
         pair.allreduce(mixer_delta.data, mixer_delta_peer.data, mixer_delta.bytes(), ctx_.stream,
-                       peer.ctx_.stream);
+                       peer.ctx_.stream, mixer_window);
         ctx_.bind_to_current_thread();
         ops::residual_add(mixer_delta, x, ctx_.stream);
         peer.ctx_.bind_to_current_thread();
@@ -650,7 +674,8 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
         peer.ctx_.bind_to_current_thread();
         peer.tp_mlp_delta(block_peer, x_peer, delta_peer, layer, ph);
         ctx_.bind_to_current_thread();
-        pair.allreduce(delta.data, delta_peer.data, delta.bytes(), ctx_.stream, peer.ctx_.stream);
+        pair.allreduce(delta.data, delta_peer.data, delta.bytes(), ctx_.stream, peer.ctx_.stream,
+                       ffn_window);
         ctx_.bind_to_current_thread();
         ops::residual_add(delta, x, ctx_.stream);
         peer.ctx_.bind_to_current_thread();

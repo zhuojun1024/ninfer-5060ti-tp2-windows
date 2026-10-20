@@ -133,8 +133,23 @@ public:
     // D2H copies are ordered after the producing kernels and the H2D copies
     // before the caller's next work on those streams, so only the two D2H
     // transfers are synchronized.
+    // Bytes the rendezvous window may pull while the peer has not arrived yet. Decode's layer chain is
+    // strictly sequential, so a collective has no compute to overlap with: what it does have is a
+    // memory system that is idle for the whole wait. The next kernel's weight stream has no
+    // dependency on the reduction, so each side prefetches its own hint into L2 and the following
+    // kernel finds those bytes resident instead of paying for them on its critical path. A hint is
+    // never part of the contract: the payload, the staging and the ids are untouched, and a
+    // reduction that ignores it produces exactly the same values.
+    struct ArPrefetchWindow {
+        const void* base_a  = nullptr;
+        std::size_t bytes_a = 0;
+        const void* base_b  = nullptr;
+        std::size_t bytes_b = 0;
+    };
+
     void allreduce(void* data_a, void* data_b, std::size_t count_bytes,
-                   cudaStream_t stream_a, cudaStream_t stream_b);
+                   cudaStream_t stream_a, cudaStream_t stream_b,
+                   const ArPrefetchWindow& prefetch = {});
 
     // Byte-exact exchange of count_bytes (multiple of 16): on return recv_a holds send_b's bytes and
     // recv_b holds send_a's bytes, bit for bit. The in-kernel route reuses the all-reduce transport -

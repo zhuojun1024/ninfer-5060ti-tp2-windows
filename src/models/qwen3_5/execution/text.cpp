@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -349,6 +350,17 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
+    }
+    // Each decode collective's rendezvous window pulls at most this much of this shard's next weight
+    // stream into L2, which is free time: the window waits on the peer, not on its own memory.
+    // 32 MiB is worth 36.77 -> 37.43 tok/s on the plain TP-2 decode route (express 8192-token
+    // prompts, 128 tokens, interleaved arms; +1.8%), and the MTP route's acceptance noise does not
+    // resolve an effect either way. Larger budgets turn around: 64 and 128 MiB are back at 37.3 and
+    // 37.2 because the window's own lines start leaving L2, so 32 MiB ships and 0 disables.
+    if (const char* prefetch = std::getenv("NINFER_TP2_DECODE_PREFETCH_MIB");
+        prefetch != nullptr && *prefetch != '\0') {
+        const long long mib = std::strtoll(prefetch, nullptr, 10);
+        decode_prefetch_bytes_ = mib > 0 ? static_cast<std::size_t>(mib) << 20 : 0;
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
@@ -2038,6 +2050,65 @@ void TextContext::single_layer(const BlockParameters& block, Tensor& x, std::siz
                                Phase ph) {
     mixer_layer(block, x, layer, ph);
     mlp_layer(block, x, layer, ph);
+}
+
+namespace {
+
+// The first stored weight of a projection: where that projection's stream begins. This is the same
+// rule the MoE projection hint uses (the prefetch helper in parameters.cpp), kept in one place here
+// for the tensor-parallel window.
+const Weight* projection_stream_head(const ops::ProjectionWeights& projection) {
+    return std::visit(
+        [](const auto& part) -> const Weight* {
+            using Kind = std::decay_t<decltype(part)>;
+            if constexpr (std::is_same_v<Kind, ops::SingleProjectionWeight>) {
+                return &part.weight;
+            } else if constexpr (std::is_same_v<Kind, ops::PairedProjectionWeights>) {
+                return &part.first;
+            } else {
+                return part.parts.empty() ? nullptr : &part.parts.front().weight;
+            }
+        },
+        projection);
+}
+
+} // namespace
+
+const Weight* TextContext::tp_mixer_stream_weight(std::size_t layer) const {
+    if (layer >= parameters_.text.layers.size()) { return nullptr; }
+    const auto& mixer = parameters_.text.layers[layer].mixer;
+    if (const auto* attention = std::get_if<AttentionParameters>(&mixer)) {
+        return projection_stream_head(attention->projection);
+    }
+    if (const auto* gdn = std::get_if<GdnParameters>(&mixer)) {
+        return projection_stream_head(gdn->projection);
+    }
+    return nullptr;
+}
+
+const Weight* TextContext::tp_ffn_stream_weight(std::size_t layer) const {
+    if (layer >= parameters_.text.layers.size()) { return nullptr; }
+    const auto* dense = std::get_if<DenseParameters>(&parameters_.text.layers[layer].ffn);
+    return dense == nullptr ? nullptr : &dense->gate_up.weight;
+}
+
+tp::DevicePair::ArPrefetchWindow TextContext::tp_prefetch_window(const Weight* mine,
+                                                                const Weight* peer) const {
+    tp::DevicePair::ArPrefetchWindow window;
+    if (decode_prefetch_bytes_ == 0) { return window; }
+    const auto span = [this](const Weight* weight) {
+        if (weight == nullptr || weight->payload == nullptr) { return std::pair<const void*, std::size_t>{}; }
+        return std::pair<const void*, std::size_t>{
+            weight->payload, static_cast<std::size_t>(
+                                std::min<std::uint64_t>(weight->payload_bytes, decode_prefetch_bytes_))};
+    };
+    const auto [base_a, bytes_a] = span(mine);
+    const auto [base_b, bytes_b] = span(peer);
+    window.base_a  = base_a;
+    window.bytes_a = bytes_a;
+    window.base_b  = base_b;
+    window.bytes_b = bytes_b;
+    return window;
 }
 
 std::int32_t TextContext::tp_mixer_activation_width(const BlockParameters& block) const {

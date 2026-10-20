@@ -232,6 +232,24 @@ __device__ __forceinline__ bool ar_expired(unsigned long long deadline) {
     return deadline != 0ULL && ar_now_ns() >= deadline;
 }
 
+// Pulls one block's slice of a prefetch hint into L2. Nothing reads the result: the point is the
+// cache line, not a value. The loop stops as soon as the rendezvous no longer needs the wait, so a
+// hint can never hold a collective past the time its exchange would have taken - the stop edge is
+// the peer's arrival, published before this side reads its data.
+__device__ __forceinline__ void ar_prefetch_window(const char* base, unsigned long long bytes,
+                                                   unsigned int slice, unsigned int slices,
+                                                   const int* stop) {
+    if (base == nullptr || bytes == 0ULL || slice >= slices) { return; }
+    constexpr unsigned long long kLine = 128ULL;
+    const unsigned long long begin     = (bytes * slice) / slices;
+    const unsigned long long end       = (bytes * (slice + 1)) / slices;
+    const unsigned long long span      = kLine * static_cast<unsigned long long>(blockDim.x);
+    for (unsigned long long offset = begin + kLine * threadIdx.x; offset < end; offset += span) {
+        if (*reinterpret_cast<const volatile int*>(stop) != 0) { return; }
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(base + offset));
+    }
+}
+
 template <bool kAdd>
 __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
                             char* host_mine_base, const char* host_other_base, int count,
@@ -240,7 +258,8 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
                             unsigned int call_index, unsigned long long base_value, int slot_bytes,
                             int groups, int* stall_mine, int* stall_peer,
                             unsigned long long timeout_ns, unsigned int bank_mask,
-                            unsigned long long hold_ns) {
+                            unsigned long long hold_ns, const char* prefetch_mine,
+                            unsigned long long prefetch_bytes, int ar_blocks) {
     // The id is a device load of a cell the host filled before the launch, plus the ordinal this
     // kernel was captured with. It is fixed for the whole call, so one read per block, published
     // through shared memory, is enough.
@@ -249,9 +268,11 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     // memory and every thread leaves the block together. Returning from one thread alone would
     // deadlock the block at its next __syncthreads.
     __shared__ int stalled;
+    // Set by the spinner once this block's exchange is over; the prefetching threads read it to stop.
+    __shared__ int prefetch_stop;
     const unsigned long long deadline = timeout_ns == 0ULL ? 0ULL : ar_now_ns() + timeout_ns;
     const int stride                 = blockDim.x;
-    const int blocks                 = gridDim.x;
+    const int blocks                 = ar_blocks;
     // This block's contiguous slice of the 16-byte groups. Slice bounds are derived from the block
     // index alone, so every block on this device and its peer agree on which slot covers which data.
     // Computed before the entry check below because an abandoned call still has to fill its slice.
@@ -264,7 +285,8 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     // (about 128 of them) before the host can react. Both flags are read, because either side may
     // have been the one that gave up.
     if (threadIdx.x == 0) {
-        stalled = (*stall_mine != 0 || *stall_peer != 0) ? 1 : 0;
+        stalled       = (*stall_mine != 0 || *stall_peer != 0) ? 1 : 0;
+        prefetch_stop = 0;
         if (stalled == 0) {
             // A captured collective reads the cell its graph's memcpy node filled and adds the
             // ordinal baked into this kernel; an eager launch carries its id in the launch
@@ -273,6 +295,26 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
         }
     }
     __syncthreads();
+    // A block past the exchange slices owns no part of the payload as this call defines it: it must
+    // not touch the bank slots or the output, only fill the rendezvous window. Slice 0's arrival is
+    // published by the first exchange block as soon as the peer's data is readable and the remaining
+    // slices land inside the same window, so that arrival is the window's closing edge.
+    if (blockIdx.x >= static_cast<unsigned int>(blocks)) {
+        if (stalled != 0) { return; }
+        const int bank = static_cast<int>(shared_token & static_cast<unsigned long long>(bank_mask));
+        const auto* peer_cell =
+            arrival_other + static_cast<std::size_t>(bank) * DevicePair::kArSliceSlots;
+        if (threadIdx.x == 0) {
+            while (*(const volatile unsigned long long*)(peer_cell) != shared_token) {
+                if (ar_expired(deadline)) { break; }
+                __nanosleep(100);
+            }
+            *(volatile int*)(&prefetch_stop) = 1;
+            return;
+        }
+        ar_prefetch_window(prefetch_mine, prefetch_bytes, blockIdx.x, gridDim.x, &prefetch_stop);
+        return;
+    }
     if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     const unsigned long long token = shared_token;
     const int tail   = groups * 8;
@@ -330,6 +372,13 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
             }
             __nanosleep(100);
         }
+        *(volatile int*)(&prefetch_stop) = 1;
+    } else if (prefetch_bytes != 0ULL) {
+        // The wait is the window: the memory system is idle on this side while the peer's arrival is
+        // in flight, and the next kernel's weight stream is independent of this reduction, so it is
+        // fetched here instead of on that kernel's critical path. The stop flag is this block's own
+        // arrival, so the hint can never hold the collective past its rendezvous.
+        ar_prefetch_window(prefetch_mine, prefetch_bytes, blockIdx.x, gridDim.x, &prefetch_stop);
     }
     __syncthreads();
     if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
@@ -412,6 +461,13 @@ int ar_slices(std::size_t count_bytes) {
     return static_cast<int>(std::min<std::size_t>(std::max<std::size_t>(want, 2),
                                                   static_cast<std::size_t>(kArMaxSlices)));
 }
+
+// Blocks the rendezvous window may add on top of the exchange slices. Each one streams one slice of
+// the hint into L2, a line per thread per pass, so a handful already saturates the memory system
+// while the exchange block waits on the mapped-host round trip. Zero disables the window.
+constexpr int kArPrefetchBlocks = 4;
+
+int ar_prefetch_blocks(std::size_t bytes) { return bytes == 0 ? 0 : kArPrefetchBlocks; }
 
 void require_bytes(std::size_t count_bytes) {
     if (count_bytes == 0) { return; }
@@ -1217,7 +1273,8 @@ void DevicePair::require_capturable_payload(std::size_t count_bytes) const {
 }
 
 void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
-                           cudaStream_t stream_a, cudaStream_t stream_b) {
+                           cudaStream_t stream_a, cudaStream_t stream_b,
+                           const ArPrefetchWindow& prefetch) {
     require_bytes(count_bytes);
     require_capturable_payload(count_bytes);
     if (count_bytes == 0) { return; }
@@ -1263,42 +1320,50 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             // count stays at kArThreads: a smaller block regressed, because the payload's cost is
             // the mapped-host round trip and the group loops want the parallelism.
             const ArFaults faults = ar_faults();
+            const int extra_a     = ar_prefetch_blocks(prefetch.bytes_a);
             a_.bind_to_current_thread();
-            ar_exchange<true><<<1, kArThreads, 0, stream_a>>>(
+            ar_exchange<true><<<1 + extra_a, kArThreads, 0, stream_a>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_a),
                 reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
                 static_cast<const char*>(small_dev_b_), exchange_count, arrival_a_, arrival_b_, order_a,
                 id.base_a, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                stall_a_, stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns);
+                stall_a_, stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns,
+                static_cast<const char*>(prefetch.base_a), prefetch.bytes_a, 1);
             if (!faults.skip_peer) {
+                const int extra_b = ar_prefetch_blocks(prefetch.bytes_b);
                 b_.bind_to_current_thread();
-                ar_exchange<true><<<1, kArThreads, 0, stream_b>>>(
+                ar_exchange<true><<<1 + extra_b, kArThreads, 0, stream_b>>>(
                     reinterpret_cast<const __nv_bfloat16*>(data_b),
                     reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
                     static_cast<const char*>(small_dev_a_), exchange_count, arrival_b_, arrival_a_, order_b,
                     id.base_b, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                    stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns);
+                    stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns,
+                    static_cast<const char*>(prefetch.base_b), prefetch.bytes_b, 1);
             }
             return;
         }
         const int slices      = ar_slices(count_bytes);
         const int slot_bytes  = static_cast<int>(in_kernel_bytes_);
         const ArFaults faults = ar_faults();
+        const int extra_a     = ar_prefetch_blocks(prefetch.bytes_a);
         a_.bind_to_current_thread();
-        ar_exchange<true><<<slices, kArThreads, 0, stream_a>>>(
+        ar_exchange<true><<<slices + extra_a, kArThreads, 0, stream_a>>>(
             reinterpret_cast<const __nv_bfloat16*>(data_a),
             reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
             static_cast<const char*>(dev_b_), exchange_count, arrival_a_, arrival_b_, order_a, id.base_a,
             id.call_index, id.value, slot_bytes, exchange_groups, stall_a_, stall_b_, ar_timeout_ns_,
-            ar_bank_mask_, faults.hold_self_ns);
+            ar_bank_mask_, faults.hold_self_ns, static_cast<const char*>(prefetch.base_a),
+            prefetch.bytes_a, slices);
         if (!faults.skip_peer) {
+            const int extra_b = ar_prefetch_blocks(prefetch.bytes_b);
             b_.bind_to_current_thread();
-            ar_exchange<true><<<slices, kArThreads, 0, stream_b>>>(
+            ar_exchange<true><<<slices + extra_b, kArThreads, 0, stream_b>>>(
                 reinterpret_cast<const __nv_bfloat16*>(data_b),
                 reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
                 static_cast<const char*>(dev_a_), exchange_count, arrival_b_, arrival_a_, order_b, id.base_b,
                 id.call_index, id.value, slot_bytes, exchange_groups, stall_b_, stall_a_, ar_timeout_ns_,
-                ar_bank_mask_, faults.hold_peer_ns);
+                ar_bank_mask_, faults.hold_peer_ns, static_cast<const char*>(prefetch.base_b),
+                prefetch.bytes_b, slices);
         }
         return;
     }
@@ -1377,7 +1442,7 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
                 static_cast<char*>(small_dev_a_), static_cast<const char*>(small_dev_b_), exchange_count,
                 arrival_a_, arrival_b_, order_a, id.base_a, id.call_index, id.value,
                 static_cast<int>(kArSmallBytes), exchange_groups, stall_a_, stall_b_, ar_timeout_ns_,
-                ar_bank_mask_, faults.hold_self_ns);
+                ar_bank_mask_, faults.hold_self_ns, nullptr, 0ULL, 1);
             if (!faults.skip_peer) {
                 b_.bind_to_current_thread();
                 ar_exchange<false><<<1, kArThreads, 0, stream_b>>>(
@@ -1385,7 +1450,7 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
                     static_cast<char*>(small_dev_b_), static_cast<const char*>(small_dev_a_), exchange_count,
                     arrival_b_, arrival_a_, order_b, id.base_b, id.call_index, id.value,
                     static_cast<int>(kArSmallBytes), exchange_groups, stall_b_, stall_a_, ar_timeout_ns_,
-                    ar_bank_mask_, faults.hold_peer_ns);
+                    ar_bank_mask_, faults.hold_peer_ns, nullptr, 0ULL, 1);
             }
             return;
         }
@@ -1397,14 +1462,15 @@ void DevicePair::sendrecv(const void* send_a, void* recv_a, const void* send_b, 
             static_cast<const __nv_bfloat16*>(send_a), static_cast<__nv_bfloat16*>(recv_a),
             static_cast<char*>(dev_a_), static_cast<const char*>(dev_b_), exchange_count, arrival_a_,
             arrival_b_, order_a, id.base_a, id.call_index, id.value, slot_bytes, exchange_groups, stall_a_,
-            stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns);
+            stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns, nullptr, 0ULL, slices);
         if (!faults.skip_peer) {
             b_.bind_to_current_thread();
             ar_exchange<false><<<slices, kArThreads, 0, stream_b>>>(
                 static_cast<const __nv_bfloat16*>(send_b), static_cast<__nv_bfloat16*>(recv_b),
                 static_cast<char*>(dev_b_), static_cast<const char*>(dev_a_), exchange_count, arrival_b_,
                 arrival_a_, order_b, id.base_b, id.call_index, id.value, slot_bytes, exchange_groups,
-                stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns);
+                stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns, nullptr, 0ULL,
+                slices);
         }
         return;
     }
