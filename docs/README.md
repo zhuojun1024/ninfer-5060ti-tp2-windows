@@ -82,6 +82,7 @@ the shared machinery.
 | [TP-2 KV sharing plan](maintainer/tp2-plan-kv-sharing.md) | shared KV pool semantics behind multi-lane admission |
 | [TP-2 headroom execution plan](maintainer/tp2-plan-headroom-execution.md) | execution steps of the concurrency headroom campaign |
 | [TP-2 concurrency headroom](maintainer/tp2-concurrency-headroom.md) | headroom measurements and what remains |
+| [TP-2 prefill wavefront](maintainer/tp2-prefill-wavefront.md) | pending cross-layer/cross-sub-block prefill pipeline: mechanism, benefits, costs, risks, and gates |
 | [TP-2 GGUF plan](maintainer/tp2-plan-gguf.md) | GGUF block formats on the TP-2 route |
 | [TP-2 fix plan](maintainer/tp2-plan-fixes.md) | review defect fixes and their verification record |
 | [TP-2 DFlash2 draft NVFP4 feasibility](maintainer/tp2-dflash2-draft-nvfp4-feasibility.md) | why an all-draft NVFP4 artifact was rejected |
