@@ -3,6 +3,7 @@
 #include "core/arena.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 // The host-staging fallback's BF16 add is the one hot-path arithmetic this file performs on the
@@ -14,6 +15,8 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -250,7 +253,93 @@ __device__ __forceinline__ void ar_prefetch_window(const char* base, unsigned lo
     }
 }
 
-template <bool kAdd>
+// E4M3 wire codec (ArCodec::Fp8E4m3): one f32 scale per 128-element block, carried after the
+// payload in the same staging slot. The producer stages encode(v * 448 / amax); the receiver
+// rebuilds the identical quantized value from its own bf16 half, so both shards consume
+// Q(local) + Q(peer) and stay bit-identical (see DevicePair::allreduce). A whole-zero block encodes
+// to zero and stores a zero scale, which decodes back to zero.
+// One warp owns one block and each lane stages four consecutive elements, so the wire store is a
+// single coalesced 128-byte run per warp. That mapping is load-bearing: a byte-per-thread mapping
+// writes 32 scattered sectors per warp into mapped host memory and measured about four times slower
+// end to end than bf16, so both the producer and the receiver stride by lane, not by block.
+constexpr int kArWireBlockElements = 128; // one E4M3 byte per element
+constexpr int kArWireLaneElements  = kArWireBlockElements / 32;
+
+// The block's scale and its reciprocal, from the amax the warp agrees on.
+__device__ __forceinline__ float ar_wire_scale(float amax) { return __fdiv_rn(amax, 448.0f); }
+
+__device__ __forceinline__ float ar_wire_inv(float amax) {
+    return amax > 0.0f ? __fdiv_rn(448.0f, amax) : 0.0f;
+}
+
+// This lane's four elements of a block and the amax all 32 lanes agree on.
+__device__ __forceinline__ float4 ar_wire_lane_values(const __nv_bfloat16* block, int lane) {
+    const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(block + lane * kArWireLaneElements);
+    const float2 lo   = __bfloat1622float2(pairs[0]);
+    const float2 hi   = __bfloat1622float2(pairs[1]);
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+__device__ __forceinline__ float ar_wire_amax(float4 values) {
+    float amax = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
+                       fmaxf(fabsf(values.z), fabsf(values.w)));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+    }
+    return amax;
+}
+
+// Stages one block: four elements per lane, packed into one 32-bit store.
+__device__ __forceinline__ void ar_stage_block(const __nv_bfloat16* block, __nv_fp8_e4m3* payload,
+                                               float* scale_out, int lane) {
+    const float4 values = ar_wire_lane_values(block, lane);
+    const float amax    = ar_wire_amax(values);
+    const float inv     = ar_wire_inv(amax);
+    const __nv_fp8_storage_t bytes[4] = {
+        __nv_cvt_float_to_fp8(__fmul_rn(values.x, inv), __NV_SATFINITE, __NV_E4M3),
+        __nv_cvt_float_to_fp8(__fmul_rn(values.y, inv), __NV_SATFINITE, __NV_E4M3),
+        __nv_cvt_float_to_fp8(__fmul_rn(values.z, inv), __NV_SATFINITE, __NV_E4M3),
+        __nv_cvt_float_to_fp8(__fmul_rn(values.w, inv), __NV_SATFINITE, __NV_E4M3)};
+    *reinterpret_cast<std::uint32_t*>(payload + lane * kArWireLaneElements) =
+        static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8) |
+        (static_cast<std::uint32_t>(bytes[2]) << 16) | (static_cast<std::uint32_t>(bytes[3]) << 24);
+    if (lane == 0) { *scale_out = ar_wire_scale(amax); }
+}
+
+// Q(local) + Q(peer) for two consecutive elements, rounded exactly as the producer staged it.
+__device__ __forceinline__ __nv_bfloat162 ar_wire_add_pair(float mine0, float mine1, float inv,
+                                                           float scale, const __nv_fp8_e4m3* peer,
+                                                           int index, float peer_scale) {
+    // Every product and the final add are explicitly rounded: an FMA from Q(local)*scale + Q(peer)
+    // would disagree with the producer's separately rounded product and the two shards would then
+    // differ by one ulp on exact ties.
+    const float mine_q0 =
+        __fmul_rn(static_cast<float>(__nv_fp8_e4m3(__fmul_rn(mine0, inv))), scale);
+    const float mine_q1 =
+        __fmul_rn(static_cast<float>(__nv_fp8_e4m3(__fmul_rn(mine1, inv))), scale);
+    const float peer0 = __fmul_rn(static_cast<float>(peer[index]), peer_scale);
+    const float peer1 = __fmul_rn(static_cast<float>(peer[index + 1]), peer_scale);
+    return __floats2bfloat162_rn(__fadd_rn(mine_q0, peer0), __fadd_rn(mine_q1, peer1));
+}
+
+// Adds one block of the peer's payload to the local half, four elements per lane.
+__device__ __forceinline__ void ar_consume_block(const __nv_bfloat16* mine,
+                                                 const __nv_fp8_e4m3* peer,
+                                                 const float* peer_scales, __nv_bfloat16* dst, int b,
+                                                 int lane) {
+    const float4 values    = ar_wire_lane_values(mine, lane);
+    const float amax       = ar_wire_amax(values);
+    const float inv        = ar_wire_inv(amax);
+    const float scale      = ar_wire_scale(amax);
+    const float peer_scale = peer_scales[b];
+    const __nv_fp8_e4m3* staged = peer + b * kArWireBlockElements + lane * kArWireLaneElements;
+    auto* out = reinterpret_cast<__nv_bfloat162*>(dst + b * kArWireBlockElements +
+                                                  lane * kArWireLaneElements);
+    out[0] = ar_wire_add_pair(values.x, values.y, inv, scale, staged, 0, peer_scale);
+    out[1] = ar_wire_add_pair(values.z, values.w, inv, scale, staged, 2, peer_scale);
+}
+
+template <bool kAdd, ArCodec kCodec = ArCodec::Bf16>
 __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
                             char* host_mine_base, const char* host_other_base, int count,
                             unsigned long long* arrival_mine, unsigned long long* arrival_other,
@@ -272,6 +361,9 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     __shared__ int prefetch_stop;
     const unsigned long long deadline = timeout_ns == 0ULL ? 0ULL : ar_now_ns() + timeout_ns;
     const int stride                 = blockDim.x;
+    const int lane                   = threadIdx.x & 31u;
+    const int warp                   = static_cast<int>(threadIdx.x >> 5);
+    const int warps                  = static_cast<int>(blockDim.x >> 5);
     const int blocks                 = ar_blocks;
     // This block's contiguous slice of the 16-byte groups. Slice bounds are derived from the block
     // index alone, so every block on this device and its peer agree on which slot covers which data.
@@ -317,7 +409,18 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     }
     if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     const unsigned long long token = shared_token;
-    const int tail   = groups * 8;
+    constexpr bool kFp8            = kCodec == ArCodec::Fp8E4m3;
+    static_assert(!kFp8 || kAdd, "the fp8 codec has no byte-exact copy form");
+    // Fp8 stages whole 128-element blocks (one E4M3 byte each) with a trailing f32 scale array, so
+    // its ownership bounds are block indices; the bf16 path keeps the 16-byte group bounds below.
+    const int wire_blocks = kFp8 ? count / kArWireBlockElements : 0;
+    const int wire_begin =
+        kFp8 ? static_cast<int>((static_cast<long long>(wire_blocks) * blockIdx.x) / blocks) : 0;
+    const int wire_end = kFp8 ? static_cast<int>((static_cast<long long>(wire_blocks) *
+                                                 (blockIdx.x + 1)) /
+                                                blocks)
+                              : 0;
+    const int tail   = kFp8 ? 0 : groups * 8;
     // This collective's arrival bank. Consecutive collectives rotate banks, so the id a slow side is
     // waiting for is still in the bank it published under when it finally looks, even though the peer
     // has already published the next collective into another bank.
@@ -326,10 +429,12 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     auto* arrival_mine_bank        = arrival_mine + bank_offset;
     const auto* arrival_other_bank = arrival_other + bank_offset;
     auto* order_mine_bank          = order_mine + bank_offset;
-    auto* host_mine        = reinterpret_cast<__nv_bfloat16*>(
-        host_mine_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes));
-    const auto* host_other = reinterpret_cast<const __nv_bfloat16*>(
-        host_other_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes));
+    char* const mine_base =
+        host_mine_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes);
+    const char* const other_base =
+        host_other_base + static_cast<std::size_t>(token & 1) * static_cast<std::size_t>(slot_bytes);
+    auto* host_mine        = reinterpret_cast<__nv_bfloat16*>(mine_base);
+    const auto* host_other = reinterpret_cast<const __nv_bfloat16*>(other_base);
     auto* mine_groups         = reinterpret_cast<uint4*>(host_mine);
     const auto* local_groups  = reinterpret_cast<const uint4*>(local);
     const auto* other_groups  = reinterpret_cast<const uint4*>(host_other);
@@ -347,9 +452,18 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
         __syncthreads();
         if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     }
-    for (int i = begin + threadIdx.x; i < end; i += stride) { mine_groups[i] = local_groups[i]; }
-    if (blockIdx.x == 0) {
-        for (int i = tail + threadIdx.x; i < count; i += stride) { host_mine[i] = local[i]; }
+    if constexpr (kFp8) {
+        auto* payload = reinterpret_cast<__nv_fp8_e4m3*>(mine_base);
+        auto* scales  = reinterpret_cast<float*>(mine_base + count);
+        for (int b = wire_begin + warp; b < wire_end; b += warps) {
+            ar_stage_block(local + b * kArWireBlockElements, payload + b * kArWireBlockElements,
+                           scales + b, lane);
+        }
+    } else {
+        for (int i = begin + threadIdx.x; i < end; i += stride) { mine_groups[i] = local_groups[i]; }
+        if (blockIdx.x == 0) {
+            for (int i = tail + threadIdx.x; i < count; i += stride) { host_mine[i] = local[i]; }
+        }
     }
     __threadfence_system();
     __syncthreads();
@@ -383,23 +497,32 @@ __global__ void ar_exchange(const __nv_bfloat16* local, __nv_bfloat16* out,
     __syncthreads();
     if (stalled != 0) { ar_abandon_output(out_groups, begin, end, stride, threadIdx.x); return; }
     __threadfence_system();
-    int i = begin + threadIdx.x;
-    for (; i + 3 * stride < end; i += 4 * stride) {
-        const uint4 o0 = other_groups[i];
-        const uint4 o1 = other_groups[i + stride];
-        const uint4 o2 = other_groups[i + 2 * stride];
-        const uint4 o3 = other_groups[i + 3 * stride];
-        out_groups[i]              = kAdd ? add_bf16x8(local_groups[i], o0) : o0;
-        out_groups[i + stride]     = kAdd ? add_bf16x8(local_groups[i + stride], o1) : o1;
-        out_groups[i + 2 * stride] = kAdd ? add_bf16x8(local_groups[i + 2 * stride], o2) : o2;
-        out_groups[i + 3 * stride] = kAdd ? add_bf16x8(local_groups[i + 3 * stride], o3) : o3;
-    }
-    for (; i < end; i += stride) {
-        out_groups[i] = kAdd ? add_bf16x8(local_groups[i], other_groups[i]) : other_groups[i];
-    }
-    if (blockIdx.x == 0) {
-        for (int j = tail + threadIdx.x; j < count; j += stride) {
-            out[j] = kAdd ? __hadd(local[j], host_other[j]) : host_other[j];
+    if constexpr (kFp8) {
+        const auto* peer_payload = reinterpret_cast<const __nv_fp8_e4m3*>(other_base);
+        const auto* peer_scales  = reinterpret_cast<const float*>(other_base + count);
+        for (int b = wire_begin + warp; b < wire_end; b += warps) {
+            ar_consume_block(local + b * kArWireBlockElements, peer_payload, peer_scales, out, b,
+                             lane);
+        }
+    } else {
+        int i = begin + threadIdx.x;
+        for (; i + 3 * stride < end; i += 4 * stride) {
+            const uint4 o0 = other_groups[i];
+            const uint4 o1 = other_groups[i + stride];
+            const uint4 o2 = other_groups[i + 2 * stride];
+            const uint4 o3 = other_groups[i + 3 * stride];
+            out_groups[i]              = kAdd ? add_bf16x8(local_groups[i], o0) : o0;
+            out_groups[i + stride]     = kAdd ? add_bf16x8(local_groups[i + stride], o1) : o1;
+            out_groups[i + 2 * stride] = kAdd ? add_bf16x8(local_groups[i + 2 * stride], o2) : o2;
+            out_groups[i + 3 * stride] = kAdd ? add_bf16x8(local_groups[i + 3 * stride], o3) : o3;
+        }
+        for (; i < end; i += stride) {
+            out_groups[i] = kAdd ? add_bf16x8(local_groups[i], other_groups[i]) : other_groups[i];
+        }
+        if (blockIdx.x == 0) {
+            for (int j = tail + threadIdx.x; j < count; j += stride) {
+                out[j] = kAdd ? __hadd(local[j], host_other[j]) : host_other[j];
+            }
         }
     }
 }
@@ -472,7 +595,7 @@ int ar_prefetch_blocks(std::size_t bytes) { return bytes == 0 ? 0 : kArPrefetchB
 void require_bytes(std::size_t count_bytes) {
     if (count_bytes == 0) { return; }
     if (count_bytes % 16 != 0) {
-        throw std::invalid_argument("tp allreduce: byte count must be a multiple of 16");
+        throw std::invalid_argument(std::string("tp allreduce: byte count ") + std::to_string(count_bytes) + " must be a multiple of 16");
     }
 }
 
@@ -902,6 +1025,25 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         const long long requested = std::strtoll(divisor, nullptr, 10);
         if (requested >= 2) { ar_payload_divisor_ = static_cast<int>(requested > 64 ? 64 : requested); }
     }
+    // Wire codec for the prefill call sites (see ArCodec). Read once: the decision changes the
+    // arithmetic every collective returns, so it must not change between capture and replay. The
+    // e4m3 wire is the default; "bf16" opts out and an unavailable in-kernel transport (the only
+    // transport the codec has) is resolved below, once that fact is known.
+    if (const char* codec = std::getenv("NINFER_TP2_AR_CODEC")) {
+        const std::string_view requested(codec);
+        if (requested.empty()) {
+            // Unset-equivalent: keep the default.
+        } else if (requested == "bf16") {
+            ar_codec_          = ArCodec::Bf16;
+            ar_codec_explicit_ = true;
+        } else if (requested == "fp8" || requested == "fp8_e4m3") {
+            ar_codec_          = ArCodec::Fp8E4m3;
+            ar_codec_explicit_ = true;
+        } else {
+            throw std::runtime_error("NINFER_TP2_AR_CODEC must be bf16 or fp8, got '" +
+                                     std::string(codec) + "'");
+        }
+    }
     // Diagnostics: keep every collective on the host-staging fallback (see force_host_staging_).
     // This is the only way to qualify that transport where the in-kernel one takes every call.
     if (const char* forced = std::getenv("NINFER_TP2_AR_FORCE_HOST_STAGING")) {
@@ -1058,6 +1200,28 @@ DevicePair::DevicePair(int device_a, int device_b) : a_(device_a), b_(device_b) 
         watch_->banks     = static_cast<unsigned int>(ar_banks());
         start_ar_watchdog();
     }
+    // The codec has no host-staging form: that transport reduces on the host and would have to
+    // quantize both halves there, which is exactly the fallback the prefill route must not take. An
+    // unset request therefore degrades to bf16 on such a host (with the line below); an explicit
+    // request is a caller error, not something to override.
+    if (ar_codec_ == ArCodec::Fp8E4m3 && !in_kernel_available_) {
+        if (ar_codec_explicit_) {
+            throw std::runtime_error(
+                "NINFER_TP2_AR_CODEC=fp8 needs the in-kernel allreduce transport; this host mapped "
+                "none (see the [mem] TP-2 in-kernel allreduce staging line)");
+        }
+        ar_codec_ = ArCodec::Bf16;
+        std::fprintf(stderr,
+                     "[tp2] prefill allreduce wire codec: bf16 (the default e4m3 wire needs the "
+                     "in-kernel transport, which this host did not map)\n");
+    }
+    if (ar_codec_ == ArCodec::Fp8E4m3) {
+        std::fprintf(stderr,
+                     "[tp2] prefill allreduce wire codec: fp8-e4m3, 128-element blocks "
+                     "(decode, logits, embeddings and captures stay bf16)\n");
+    } else if (ar_codec_explicit_) {
+        std::fprintf(stderr, "[tp2] prefill allreduce wire codec: bf16 (NINFER_TP2_AR_CODEC)\n");
+    }
 }
 
 DevicePair::~DevicePair() {
@@ -1099,7 +1263,8 @@ DevicePair::DevicePair(DevicePair&& other) noexcept
       ar_fault_skip_call_(other.ar_fault_skip_call_),
       ar_fault_hold_call_(other.ar_fault_hold_call_), ar_fault_hold_ns_(other.ar_fault_hold_ns_),
       ar_fault_hold_peer_(other.ar_fault_hold_peer_), ar_bank_mask_(other.ar_bank_mask_),
-      ar_payload_divisor_(other.ar_payload_divisor_),
+      ar_payload_divisor_(other.ar_payload_divisor_), ar_codec_(other.ar_codec_),
+      ar_codec_explicit_(other.ar_codec_explicit_),
       ar_channel_capacity_(other.ar_channel_capacity_), base_host_(other.base_host_),
       base_dev_a_(other.base_dev_a_), base_dev_b_(other.base_dev_b_),
       ar_channels_(std::move(other.ar_channels_)), capturing_(other.capturing_),
@@ -1272,12 +1437,44 @@ void DevicePair::require_capturable_payload(std::size_t count_bytes) const {
     }
 }
 
+template <ArCodec kCodec>
+void DevicePair::launch_ar_side(const ArSideCall& side) {
+    const int extra = ar_prefetch_blocks(side.prefetch_bytes);
+    side.device->bind_to_current_thread();
+    ar_exchange<true, kCodec><<<side.blocks + extra, kArThreads, 0, side.stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(side.data),
+        reinterpret_cast<__nv_bfloat16*>(side.data), side.mine, side.other, side.count,
+        side.arrival_mine, side.arrival_other, side.order_mine, side.base_dev, side.call_index,
+        side.base_value, side.slot_bytes, side.groups, side.stall_mine, side.stall_peer,
+        side.timeout_ns, side.bank_mask, side.hold_ns, side.prefetch, side.prefetch_bytes,
+        side.blocks);
+}
+
 void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
                            cudaStream_t stream_a, cudaStream_t stream_b,
-                           const ArPrefetchWindow& prefetch) {
+                           const ArPrefetchWindow& prefetch, ArCodec codec) {
     require_bytes(count_bytes);
     require_capturable_payload(count_bytes);
     if (count_bytes == 0) { return; }
+    if (codec == ArCodec::Fp8E4m3) {
+        // The codec has no host-staging or captured form: prefill is eager and always fits the
+        // staging, so a request that would take another path is a caller bug, not a fallback.
+        if (!in_kernel_available_ || count_bytes > in_kernel_bytes_) {
+            throw std::runtime_error("TP-2 fp8 allreduce needs the in-kernel transport and a "
+                                     "payload within the staging buffer");
+        }
+        if (capturing_) {
+            throw std::runtime_error(
+                "TP-2 fp8 allreduce cannot run inside a CUDA Graph capture (decode stays bf16)");
+        }
+        if (ar_payload_divisor_ > 1) {
+            throw std::runtime_error(
+                "TP-2 fp8 allreduce cannot be combined with NINFER_TP2_AR_PAYLOAD_DIVISOR");
+        }
+        if ((count_bytes / 2) % kArWireBlockElements != 0) {
+            throw std::runtime_error("TP-2 fp8 allreduce needs whole 128-element blocks");
+        }
+    }
     // In-kernel path (WSL2, no P2P, mapped pinned available): both devices run
     // ar_exchange<true> on their compute streams. Each writes its delta to its own
     // mapped host buffer, signals an arrival id, spins on the peer's id,
@@ -1314,56 +1511,53 @@ void DevicePair::allreduce(void* data_a, void* data_b, std::size_t count_bytes,
             exchange_groups = groups / ar_payload_divisor_;
             exchange_count  = exchange_groups * 8;
         }
-        if (small_available_ && count_bytes <= kArSmallBytes) {
-            // Decode-sized: one block, one launch. About 128 calls ride each decode round, so the
-            // launch the retired token bump used to add was pure latency at this payload. The thread
-            // count stays at kArThreads: a smaller block regressed, because the payload's cost is
-            // the mapped-host round trip and the group loops want the parallelism.
-            const ArFaults faults = ar_faults();
-            const int extra_a     = ar_prefetch_blocks(prefetch.bytes_a);
-            a_.bind_to_current_thread();
-            ar_exchange<true><<<1 + extra_a, kArThreads, 0, stream_a>>>(
-                reinterpret_cast<const __nv_bfloat16*>(data_a),
-                reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(small_dev_a_),
-                static_cast<const char*>(small_dev_b_), exchange_count, arrival_a_, arrival_b_, order_a,
-                id.base_a, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                stall_a_, stall_b_, ar_timeout_ns_, ar_bank_mask_, faults.hold_self_ns,
-                static_cast<const char*>(prefetch.base_a), prefetch.bytes_a, 1);
-            if (!faults.skip_peer) {
-                const int extra_b = ar_prefetch_blocks(prefetch.bytes_b);
-                b_.bind_to_current_thread();
-                ar_exchange<true><<<1 + extra_b, kArThreads, 0, stream_b>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(data_b),
-                    reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(small_dev_b_),
-                    static_cast<const char*>(small_dev_a_), exchange_count, arrival_b_, arrival_a_, order_b,
-                    id.base_b, id.call_index, id.value, static_cast<int>(kArSmallBytes), exchange_groups,
-                    stall_b_, stall_a_, ar_timeout_ns_, ar_bank_mask_, faults.hold_peer_ns,
-                    static_cast<const char*>(prefetch.base_b), prefetch.bytes_b, 1);
-            }
-            return;
-        }
         const int slices      = ar_slices(count_bytes);
-        const int slot_bytes  = static_cast<int>(in_kernel_bytes_);
         const ArFaults faults = ar_faults();
-        const int extra_a     = ar_prefetch_blocks(prefetch.bytes_a);
-        a_.bind_to_current_thread();
-        ar_exchange<true><<<slices + extra_a, kArThreads, 0, stream_a>>>(
-            reinterpret_cast<const __nv_bfloat16*>(data_a),
-            reinterpret_cast<__nv_bfloat16*>(data_a), static_cast<char*>(dev_a_),
-            static_cast<const char*>(dev_b_), exchange_count, arrival_a_, arrival_b_, order_a, id.base_a,
-            id.call_index, id.value, slot_bytes, exchange_groups, stall_a_, stall_b_, ar_timeout_ns_,
-            ar_bank_mask_, faults.hold_self_ns, static_cast<const char*>(prefetch.base_a),
-            prefetch.bytes_a, slices);
-        if (!faults.skip_peer) {
-            const int extra_b = ar_prefetch_blocks(prefetch.bytes_b);
-            b_.bind_to_current_thread();
-            ar_exchange<true><<<slices + extra_b, kArThreads, 0, stream_b>>>(
-                reinterpret_cast<const __nv_bfloat16*>(data_b),
-                reinterpret_cast<__nv_bfloat16*>(data_b), static_cast<char*>(dev_b_),
-                static_cast<const char*>(dev_a_), exchange_count, arrival_b_, arrival_a_, order_b, id.base_b,
-                id.call_index, id.value, slot_bytes, exchange_groups, stall_b_, stall_a_, ar_timeout_ns_,
-                ar_bank_mask_, faults.hold_peer_ns, static_cast<const char*>(prefetch.base_b),
-                prefetch.bytes_b, slices);
+        const bool small      = small_available_ && count_bytes <= kArSmallBytes;
+        ArSideCall side_a;
+        side_a.data           = data_a;
+        side_a.mine           = static_cast<char*>(small ? small_dev_a_ : dev_a_);
+        side_a.other          = static_cast<const char*>(small ? small_dev_b_ : dev_b_);
+        side_a.count          = exchange_count;
+        side_a.groups         = exchange_groups;
+        side_a.slot_bytes     = static_cast<int>(small ? kArSmallBytes : in_kernel_bytes_);
+        side_a.blocks         = small ? 1 : slices;
+        side_a.arrival_mine   = arrival_a_;
+        side_a.arrival_other  = arrival_b_;
+        side_a.order_mine     = order_a;
+        side_a.base_dev       = id.base_a;
+        side_a.call_index     = id.call_index;
+        side_a.base_value     = id.value;
+        side_a.stall_mine     = stall_a_;
+        side_a.stall_peer     = stall_b_;
+        side_a.timeout_ns     = ar_timeout_ns_;
+        side_a.bank_mask      = ar_bank_mask_;
+        side_a.hold_ns        = faults.hold_self_ns;
+        side_a.prefetch       = static_cast<const char*>(prefetch.base_a);
+        side_a.prefetch_bytes = prefetch.bytes_a;
+        side_a.stream         = stream_a;
+        side_a.device         = &a_;
+        ArSideCall side_b     = side_a;
+        side_b.data           = data_b;
+        side_b.mine           = static_cast<char*>(small ? small_dev_b_ : dev_b_);
+        side_b.other          = static_cast<const char*>(small ? small_dev_a_ : dev_a_);
+        side_b.arrival_mine   = arrival_b_;
+        side_b.arrival_other  = arrival_a_;
+        side_b.order_mine     = order_b;
+        side_b.base_dev       = id.base_b;
+        side_b.stall_mine     = stall_b_;
+        side_b.stall_peer     = stall_a_;
+        side_b.hold_ns        = faults.hold_peer_ns;
+        side_b.prefetch       = static_cast<const char*>(prefetch.base_b);
+        side_b.prefetch_bytes = prefetch.bytes_b;
+        side_b.stream         = stream_b;
+        side_b.device         = &b_;
+        if (codec == ArCodec::Fp8E4m3) {
+            launch_ar_side<ArCodec::Fp8E4m3>(side_a);
+            if (!faults.skip_peer) { launch_ar_side<ArCodec::Fp8E4m3>(side_b); }
+        } else {
+            launch_ar_side<ArCodec::Bf16>(side_a);
+            if (!faults.skip_peer) { launch_ar_side<ArCodec::Bf16>(side_b); }
         }
         return;
     }

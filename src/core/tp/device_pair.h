@@ -12,6 +12,14 @@
 
 namespace ninfer::tp {
 
+// Wire format of an all-reduce. Bf16 is the qualified default: the two shards exchange their bf16
+// partial sums and the receiver adds them, which is exact for this transport (both cards read the
+// same host sum). Fp8E4m3 halves the payload by quantizing each 128-element block to E4M3 with one
+// f32 scale per block before the transfer, then dequantizing both halves and adding in f32. Both
+// halves are quantized, so both shards still consume the identical sum. Only the prefill deltas use
+// it: a decode collective is a few KiB and latency-bound, where the codec costs more than it saves.
+enum class ArCodec { Bf16, Fp8E4m3 };
+
 // Two independent DeviceContexts executing the same Op sequence in lockstep.
 // The owning Program (Phase 3) drives both streams; this type owns the device
 // facts and the inter-device communication path only.
@@ -50,6 +58,10 @@ public:
     // this: a payload past the staging buffer silently takes the host-staging fallback, which
     // synchronizes both compute streams on every collective.
     std::size_t in_kernel_allreduce_bytes() const noexcept { return in_kernel_bytes_; }
+    // Wire codec selected by NINFER_TP2_AR_CODEC ("bf16" opts out; unset: the E4M3 prefill codec,
+    // or bf16 where the in-kernel transport is unavailable). The TP-2 prefill call sites pass this
+    // to allreduce; every other route keeps the bf16 default.
+    ArCodec ar_codec() const noexcept { return ar_codec_; }
 
     // Bounded-spin safety for the in-kernel transport. Every rendezvous spin carries a wall-clock
     // deadline (NINFER_TP2_AR_TIMEOUT_MS, default 10000, 0 disables it): a spin that can never be
@@ -147,9 +159,13 @@ public:
         std::size_t bytes_b = 0;
     };
 
+    // `codec` selects the wire format. Fp8E4m3 is only valid on the in-kernel transport with a
+    // payload of whole 128-element blocks and never inside a capture; it throws otherwise rather
+    // than silently falling back, because a silent fallback would mix two precisions inside one
+    // layer chain.
     void allreduce(void* data_a, void* data_b, std::size_t count_bytes,
                    cudaStream_t stream_a, cudaStream_t stream_b,
-                   const ArPrefetchWindow& prefetch = {});
+                   const ArPrefetchWindow& prefetch = {}, ArCodec codec = ArCodec::Bf16);
 
     // Byte-exact exchange of count_bytes (multiple of 16): on return recv_a holds send_b's bytes and
     // recv_b holds send_a's bytes, bit for bit. The in-kernel route reuses the all-reduce transport -
@@ -174,6 +190,33 @@ private:
     // Returns this call's parity slot, growing the buffer (after synchronizing both compute streams)
     // when the payload is the largest so far.
     char* host_staging(std::size_t count_bytes, cudaStream_t stream_a, cudaStream_t stream_b);
+    // One side of an in-kernel collective; kCodec selects the wire format (see ArCodec).
+    struct ArSideCall {
+        void* data = nullptr;
+        char* mine = nullptr;
+        const char* other = nullptr;
+        int count = 0;
+        int groups = 0;
+        int slot_bytes = 0;
+        int blocks = 0;
+        unsigned long long* arrival_mine = nullptr;
+        unsigned long long* arrival_other = nullptr;
+        unsigned long long* order_mine = nullptr;
+        const unsigned long long* base_dev = nullptr;
+        unsigned int call_index = 0;
+        unsigned long long base_value = 0;
+        int* stall_mine = nullptr;
+        int* stall_peer = nullptr;
+        unsigned long long timeout_ns = 0;
+        unsigned int bank_mask = 0;
+        unsigned long long hold_ns = 0;
+        const char* prefetch = nullptr;
+        std::size_t prefetch_bytes = 0;
+        cudaStream_t stream = nullptr;
+        DeviceContext* device = nullptr;
+    };
+    template <ArCodec kCodec>
+    void launch_ar_side(const ArSideCall& side);
     // In-kernel allreduce (WSL2, no P2P): mapped pinned host staging + arrival ids. Each device's
     // kernel writes its delta to its own mapped host buffer, signals an arrival id, spins on the
     // peer's id, then reads the peer's buffer and sums in place - all inside the kernel, so the host
@@ -223,6 +266,13 @@ private:
     // which for an in-place all-reduce is the local partial) and bounds what compressing the
     // exchanged payload could buy. Set by NINFER_TP2_AR_PAYLOAD_DIVISOR.
     int ar_payload_divisor_ = 1;
+    // Wire codec requested by NINFER_TP2_AR_CODEC. Read once at construction: the TP-2 prefill call
+    // sites query it per collective, so a pair never mixes codecs inside one layer chain unless the
+    // caller explicitly asks for bf16 at sendrecv.
+    ArCodec ar_codec_ = ArCodec::Fp8E4m3;
+    // True when the environment chose the codec, which makes an unusable request a startup error
+    // instead of a quiet bf16 fallback.
+    bool ar_codec_explicit_ = false;
     // Rendezvous ids (see create_ar_channel). All channels share one pinned cell block and one
     // device scalar block per device; a channel's memcpy node copies its 8-byte cell into its own
     // scalar inside the captured graph.

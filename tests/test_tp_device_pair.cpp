@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -109,6 +110,108 @@ int check_allreduce(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int i
                 break;
             }
         }
+    }
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
+// The fp8 wire format: both shards consume the same staged sum, so they must land on the identical
+// Q(a)+Q(b) for every element, and each element has to stay inside the e4m3 block-relative bound.
+// The format is a prefill-only setting, so the sizes are the per-layer delta of a 256-token stage and
+// of a short tail chunk.
+int check_allreduce_fp8(ninfer::tp::DevicePair& pair, std::size_t count_bytes, int iterations) {
+    if (!pair.in_kernel_allreduce() || count_bytes > pair.in_kernel_allreduce_bytes()) {
+        std::cout << "SKIP fp8 allreduce[" << count_bytes
+                  << "]: the in-kernel transport is unavailable\n";
+        return 0;
+    }
+    const std::size_t elements = count_bytes / 2;
+    pair.a().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_a(count_bytes);
+    pair.b().bind_to_current_thread();
+    ninfer::DeviceBuffer buf_b(count_bytes);
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+
+    std::mt19937 rng(0xF8E4u + static_cast<unsigned>(count_bytes % 65521u));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<__nv_bfloat16> bf_a(elements), bf_b(elements);
+    std::vector<__nv_bfloat16> got_a(elements), got_b(elements);
+
+    int failures = 0;
+    for (int iteration = 0; iteration < iterations && failures == 0; ++iteration) {
+        for (std::size_t i = 0; i < elements; ++i) {
+            bf_a[i] = __float2bfloat16(dist(rng));
+            bf_b[i] = __float2bfloat16(dist(rng));
+        }
+        pair.a().bind_to_current_thread();
+        buf_a.copy_from_host(bf_a.data(), count_bytes);
+        pair.b().bind_to_current_thread();
+        buf_b.copy_from_host(bf_b.data(), count_bytes);
+        pair.allreduce(buf_a.p, buf_b.p, count_bytes, stream_a, stream_b, {},
+                       ninfer::tp::ArCodec::Fp8E4m3);
+        pair.a().bind_to_current_thread();
+        cudaStreamSynchronize(stream_a);
+        pair.b().bind_to_current_thread();
+        cudaStreamSynchronize(stream_b);
+        pair.a().bind_to_current_thread();
+        buf_a.copy_to_host(got_a.data(), count_bytes);
+        pair.b().bind_to_current_thread();
+        buf_b.copy_to_host(got_b.data(), count_bytes);
+
+        for (std::size_t i = 0; i < elements; ++i) {
+            const float a   = __bfloat162float(bf_a[i]);
+            const float b   = __bfloat162float(bf_b[i]);
+            const float got = __bfloat162float(got_a[i]);
+            // Two e4m3 half-ulps (2^-4 relative each) plus the BF16 rounding of the sum, with slack.
+            const float bound = 0.125f * (std::fabs(a) + std::fabs(b)) + 1.0e-4f;
+            const bool same_shards = bits_of(got_a[i]) == bits_of(got_b[i]);
+            if (!same_shards || !(std::fabs(got - (a + b)) <= bound)) {
+                if (failures < 4) {
+                    std::cerr << "fp8 allreduce[" << count_bytes << "] iteration " << iteration
+                              << " element " << i << ": a=" << a << " b=" << b
+                              << " got a=" << __bfloat162float(got_a[i])
+                              << " got b=" << __bfloat162float(got_b[i])
+                              << " bound=" << bound << '\n';
+                }
+                ++failures;
+                break;
+            }
+        }
+    }
+    pair.a().bind_to_current_thread();
+    cudaStreamDestroy(stream_a);
+    pair.b().bind_to_current_thread();
+    cudaStreamDestroy(stream_b);
+    return failures;
+}
+
+// The codec's contract: a payload of whole 128-element blocks is required, and a pair without the
+// in-kernel transport must refuse instead of silently taking the bf16 host-staging path.
+int check_allreduce_fp8_contract(ninfer::tp::DevicePair& pair) {
+    const bool in_kernel = pair.in_kernel_allreduce();
+    const std::size_t bytes = in_kernel ? 208 : 2048;
+    ninfer::DeviceBuffer buf_a(bytes), buf_b(bytes);
+    cudaStream_t stream_a = nullptr, stream_b = nullptr;
+    pair.a().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_a, cudaStreamNonBlocking);
+    pair.b().bind_to_current_thread();
+    cudaStreamCreateWithFlags(&stream_b, cudaStreamNonBlocking);
+    int failures = 0;
+    try {
+        pair.allreduce(buf_a.p, buf_b.p, bytes, stream_a, stream_b, {},
+                       ninfer::tp::ArCodec::Fp8E4m3);
+        std::cerr << "fp8 allreduce[" << bytes << "] was accepted by a pair that cannot run it\n";
+        ++failures;
+    } catch (const std::exception& expected) {
+        std::cout << "fp8 contract[" << bytes << "]: refused as expected: " << expected.what()
+                  << '\n';
     }
     pair.a().bind_to_current_thread();
     cudaStreamDestroy(stream_a);
@@ -1057,7 +1160,7 @@ int check_reserve_channels(ninfer::tp::DevicePair& pair) {
     return failures;
 }
 
-int main() {
+int run_all_checks() {
     int count = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
     if (err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver || count < 2) {
@@ -1088,6 +1191,11 @@ int main() {
         // into five slices).
         failures += check_allreduce(pair, 81920, 64);
         failures += check_allreduce(pair, 2433024, 64);
+        // The prefill wire format: the 256-token stage delta (5120 x 256 BF16), a short tail chunk,
+        // and the codec's refusals.
+        failures += check_allreduce_fp8(pair, 2621440, 4);
+        failures += check_allreduce_fp8(pair, 8253440, 2);
+        failures += check_allreduce_fp8_contract(pair);
         // Past the retired 24 MiB staging bound and inside the current 48 MiB one: the payload has to
         // stay on the in-kernel transport, which is what the wider buffer buys.
         failures += check_allreduce(pair, 25 << 20, 8);
@@ -1151,6 +1259,9 @@ int main() {
         failures += check_allreduce(fallback, (3 << 20) + 16, 8);
         // Past the staging buffer: the fallback carries it, and the reduction splits into strips.
         failures += check_allreduce(fallback, 50 << 20, 2);
+        // Without the in-kernel transport the fp8 codec has nowhere to run: it must refuse, not fall
+        // back to a bf16 host staging that would silently change the wire contract.
+        failures += check_allreduce_fp8_contract(fallback);
         // A deep queue reuses the pinned staging: every call's D2H is ordered after the previous
         // call's uploads on the same streams.
         failures += check_allreduce_queue(fallback, 20480, 32);
@@ -1237,4 +1348,13 @@ int main() {
     if (failures == 0) { std::cout << "PASS\n"; return 0; }
     std::cerr << failures << " failures\n";
     return 1;
+}
+
+int main() {
+    try {
+        return run_all_checks();
+    } catch (const std::exception& error) {
+        std::cerr << "fatal: " << error.what() << '\n';
+        return 3;
+    }
 }

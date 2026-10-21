@@ -31,6 +31,13 @@ prefill interleaving, the item 10 Ops fix, P3 batched prefill, pageable host che
 0.587 ms/lane-token, **batching is 2.1× slower** ⇒ definitively not doing it (breaking even needs W×B≈1216 columns/round, which is
 19× the ops limit width ≤ 16). The only remaining headroom is "first relax the ops batch domain before talking about batched prefill" plus hardware (card 2's PCIe slot).
 
+> Later note (2026-10-20): that last sentence is now incomplete. The §4.1 residual has a pending,
+> purely software design that does not touch the ops batch domain or the hardware:
+> [tp2-prefill-wavefront.md](tp2-prefill-wavefront.md) pipelines layer L+1's mixer under layer L's
+> allreduce with one compute stream per 256-token sub-block. It is not implemented; its modeled band is
+> +8-15% (0.516 → 0.45-0.48 ms/token) at +128 MiB/card of workspace, and its Step 1 gate decides
+> whether it opens.
+
 ## 1. Current implementation (the structures used by this report)
 
 - One compact decode batch per round, lane count = `--max-concurrency` (1..4), lane identity = position in the batch.
@@ -261,6 +268,93 @@ which both hinders further optimization and makes production problems hard to lo
   that optimization is inside `forward_tp2_prefill` (text.cpp:2661), so the batch route's inline prefill benefits equally.
 - Remaining headroom: 0.498 − 0.368 ≈ **0.13 ms/token (26%)**, i.e. hiding AR completely under compute.
   That corresponds to a single-lane ceiling of ~2.7k tok/s.
+- That residual is the target of a pending design (not implemented): a cross-layer + cross-sub-block
+  wavefront on four compute streams, see [tp2-prefill-wavefront.md](tp2-prefill-wavefront.md).
+
+### Wire-format headroom, re-measured on the current build (2026-10-20)
+
+`NINFER_TP2_AR_PAYLOAD_DIVISOR=2` moves half of the allreduce payload, which bounds from above what
+any wire codec can win. Re-measured on the shipped plain route (`--max-context 131072 --kv-dtype fp8
+--max-concurrency 1`, default `--prefill-chunk 1024 --prefill-overlap 256`, `--host-kv-mib 0`);
+three fresh server runs per arm, median, 2,048/8,192/32,768-token prompts from
+`tools/win_port/bench_serve.ps1`:
+
+| prompt tokens | bf16 tok/s | divisor=2 tok/s | gain | bf16 ms/token | divisor=2 ms/token |
+|---|---|---|---|---|---|
+| 1,830 | 1,839.9 | 2,390.5 | +29.9% | 0.5435 | 0.4179 |
+| 7,155 | 1,950.6 | 2,507.2 | +28.5% | 0.5142 | 0.3987 |
+| 28,530 | 1,799.1 | 2,243.8 | +24.7% | 0.5555 | 0.4457 |
+
+Decode does not move (37.9-38.1 tok/s short prompts, 37.0-37.6 at 8k in both arms), so the effect is
+the prefill wire only and a codec has no reason to touch decode. The **exposed** allreduce term is
+therefore ~0.115 ms/token (0.514 -> 0.399), not the 0.368 ms/token of total link traffic: more than
+half of the link time is already hidden under the 4x256 overlap. That makes the realistic band for an
+e4m3 payload with per-block scales **0.40-0.45 ms/token (2.24-2.5k tok/s, +25-29%)**, not the
+0.33 ms/token a naive "payload halved, allreduce fully exposed" model predicts. Quality and staging
+cost still gate whether any of it is worth implementing.
+
+The codec itself was qualified before any implementation by simulating fp8 e4m3 with per-128 block
+scales inside the host reduction, so the simulation is exactly the codec's effect on the wire:
+
+- wire error on the design payload (2.62 MB per stage, 8,256 calls): the summed delta moves by 2.41%
+  RMS (p99 2.70%). That is what three mantissa bits give by construction; a 0.5% RMS gate would need
+  seven or eight bits and is not attainable by any float8 payload, so the binding criterion is the
+  end-to-end one below.
+- end-to-end, 9,489-token wikitext + Chinese slice (`--text`, `--kv-dtype fp8`, two shards): mean NLL
+  -0.001135 (-0.057%), PPL -0.113%, i.e. inside the band the same binary shows against itself. The
+  vocabulary-parallel logits merge, which the design keeps on bf16, costs +0.145% when it is
+  quantized as well, so it must stay exact.
+- cost: 8.8 us per 2.62 MB stage in a standalone kernel (quantize 8.2 us, dequantize + add 13.0 us
+  against a 12.5 us bf16 add), 2.7 ms per 1,024-token chunk.
+- the two transports are bit-identical on this route (default in-kernel bf16 vs host-staged bf16:
+  mean NLL 1.5774172119169165 in both, byte-identical per-token NLL), so these deltas are the
+  codec's alone and no transport noise floor hides them.
+
+#### Implemented and measured (2026-10-21)
+
+The codec above ships by default: an e4m3 payload with one f32 scale per 128-element block laid out
+after the payload inside the same mapped staging slot, selected once at `DevicePair` construction
+(`NINFER_TP2_AR_CODEC=bf16` opts out; a host without the in-kernel transport falls back to bf16 with
+a startup line). Both shards rebuild the quantized local half from their own bf16 operand, so the
+in-place sum stays bit-identical across cards (`ninfer_tp_device_pair_test` checks bit
+equality at 2.6 MB and 8.25 MB), and the codec refuses a capture, a host-staging transport, a
+payload that is not whole 128-element blocks, and `NINFER_TP2_AR_PAYLOAD_DIVISOR` rather than falling
+back silently. Decode, the logits merge, the embedding/vision handoffs and every captured graph stay
+bf16.
+
+Same build, one fresh server run per arm:
+
+| prompt tokens | bf16 tok/s | fp8 tok/s | gain | bf16 ms/token | fp8 ms/token |
+|---|---|---|---|---|---|
+| 1,832 | 1,750.8 | 2,084.3 | +19.0% | 0.5712 | 0.4797 |
+| 7,153 | 1,924.7 | 2,321.3 | +20.6% | 0.5196 | 0.4308 |
+| 28,531 | 1,799.6 | 2,145.2 | +19.2% | 0.5557 | 0.4661 |
+
+Decode does not move (38.1 tok/s on both arms for the short prompt, 37.6 -> 37.3 at 8k, inside the
+run-to-run noise), as designed. The result sits in the middle of the 0.40-0.45 ms/token band
+predicted above: 1.03125 B/element instead of 2, minus the 8.8 us per 2.62 MB stage the codec adds.
+The two-lane batch route shows the same effect on one request at a time (1,831 tokens 1,778.5 ->
+2,107.1 tok/s, +18.5%; 7,156 tokens 2,004.0 -> 2,433.6, +21.4%; decode 36.7 -> 36.9 and 37.6 ->
+37.3), because a lane's inline prefill goes through the same layer loop.
+
+Quality on the full quick corpus (261,223 scored tokens, two shards, `--kv-dtype fp8`): mean NLL
+1.577417 -> 1.577671 (+0.0161%), PPL 4.842433 -> 4.843661 (+0.0254%). Per domain the deltas are
+-0.28% to +0.27% with mixed sign (Chinese -0.28%, English long-form +0.06%, English reference
++0.27%, code +0.08%), and two runs of the same arm agree in every per-domain mean, so the codec is
+deterministic on this route. Both end-to-end gates (|d mean NLL| <= 3e-3, d PPL <= 0.3%) pass with
+more than ten times the margin.
+
+One implementation constraint is worth keeping: the wire mapping must give a whole 128-element block
+to one warp, with four consecutive elements per lane and one 32-bit store per lane. The first version
+gave one block to one thread, which turned a warp's mapped-host write into 32 scattered 32-byte
+sectors instead of one coalesced run and ran about four times slower than bf16 end to end; the warp
+mapping removed that regression and the numbers above come from it.
+
+The model-dependent `ninfer_qwen3_5_tp2_forward_test --artifact …` passes in both arms on the
+artifact the plan records for it (`qwen3_8_27b_swift15_dflash2_final.ninfer`; `overlap 256x2 vs
+2x256 chunks` stays exact, `max_logit_diff=0`). It is not a usable reference on the nvfp4 artifact:
+the bf16 arm already trips the duplicated-lane assertion there, before the wire format is involved.
+
 
 ### 4.2 Why "batched prefill" cannot raise the aggregate throughput of long prompts
 

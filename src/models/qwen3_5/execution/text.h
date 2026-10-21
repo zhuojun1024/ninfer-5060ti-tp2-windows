@@ -604,6 +604,10 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block      = parameters_.text.layers[layer];
         const auto& block_peer = peer.parameters_.text.layers[layer];
+        // A quantized wire format is a prefill-only setting: decode payloads are latency-bound, so
+        // they keep bf16 (and the captured decode graphs are built for it).
+        const tp::ArCodec delta_codec =
+            ph == Phase::Prefill ? pair.ar_codec() : tp::ArCodec::Bf16;
         // Rotation across the two collectives of this layer: each one waits on the peer with the
         // memory system idle, so it pulls the bytes the next op is about to want. The mixer's window
         // fetches this layer's FFN, the FFN's window fetches the next layer's mixer. Prefill keeps
@@ -662,7 +666,7 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
         // kernels, H2D before residual_add), so no pre-sync is needed.
         ctx_.bind_to_current_thread();
         pair.allreduce(mixer_delta.data, mixer_delta_peer.data, mixer_delta.bytes(), ctx_.stream,
-                       peer.ctx_.stream, mixer_window);
+                       peer.ctx_.stream, mixer_window, delta_codec);
         ctx_.bind_to_current_thread();
         ops::residual_add(mixer_delta, x, ctx_.stream);
         peer.ctx_.bind_to_current_thread();
@@ -675,7 +679,7 @@ void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor
         peer.tp_mlp_delta(block_peer, x_peer, delta_peer, layer, ph);
         ctx_.bind_to_current_thread();
         pair.allreduce(delta.data, delta_peer.data, delta.bytes(), ctx_.stream, peer.ctx_.stream,
-                       ffn_window);
+                       ffn_window, delta_codec);
         ctx_.bind_to_current_thread();
         ops::residual_add(delta, x, ctx_.stream);
         peer.ctx_.bind_to_current_thread();

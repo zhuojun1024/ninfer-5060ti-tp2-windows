@@ -2944,7 +2944,7 @@ void TextContext::run_layers_tp2_overlap(TextContext& peer, tp::DevicePair& pair
             peer.ctx_.bind_to_current_thread();
             CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.collective_stream, ev_peer.produced(s), 0));
             pair.allreduce(mix[s].data, mix_peer[s].data, mix[s].bytes(), ctx_.collective_stream,
-                           peer.ctx_.collective_stream);
+                           peer.ctx_.collective_stream, {}, pair.ar_codec());
             ctx_.bind_to_current_thread();
             CUDA_CHECK(cudaEventRecord(ev_local.done(s), ctx_.collective_stream));
             peer.ctx_.bind_to_current_thread();
@@ -2973,7 +2973,7 @@ void TextContext::run_layers_tp2_overlap(TextContext& peer, tp::DevicePair& pair
             peer.ctx_.bind_to_current_thread();
             CUDA_CHECK(cudaStreamWaitEvent(peer.ctx_.collective_stream, ev_peer.produced(s), 0));
             pair.allreduce(ffn[s].data, ffn_peer[s].data, ffn[s].bytes(), ctx_.collective_stream,
-                           peer.ctx_.collective_stream);
+                           peer.ctx_.collective_stream, {}, pair.ar_codec());
             ctx_.bind_to_current_thread();
             CUDA_CHECK(cudaEventRecord(ev_local.done(s), ctx_.collective_stream));
             peer.ctx_.bind_to_current_thread();

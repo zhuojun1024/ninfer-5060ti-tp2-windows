@@ -131,6 +131,11 @@ RTX 5060 Ti cards but not one.
   `avg_round`/`rest`/`prefill_chunks`/`pump_rounds` with `mtp`/`verify`/`accept`/`copy`, where
   `rest` is the round remainder (`round - mtp - verify - accept - copy`), which carries the fold
   and any wait behind a prefill chunk.
+  Prefill allreduce payloads travel as e4m3 by default (one f32 scale per 128-element block): +19%
+  prefill at 2k-28k tokens, decode unchanged, at a measured +0.025% PPL on the 261,223-token quick
+  corpus. `NINFER_TP2_AR_CODEC=bf16` opts out, and a host without the in-kernel allreduce transport
+  falls back to bf16 with a startup line. The wire format changes the numerics without changing the
+  distribution: decode, the logits merge and every captured graph stay bf16.
   A round is also the unit of failure: when one lane's step fails, every request still running in that
   round fails with the same error, and every lane's reusable state - the sessions it recalled and its
   host checkpoints - is discarded, because the device state a failed round leaves behind cannot be

@@ -49,6 +49,30 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   vision→shard 1); images above the cap are rejected at request time with a
   pointer to the `[mem] vision` ledger. (worklog §11.4)
 
+## Shipped optimizations (measured)
+
+- **Prefill allreduce wire codec (e4m3, 2026-10-21): shipped and on by default.** The per-layer
+  prefill deltas travel as e4m3 with one f32 scale per 128-element block laid out after the payload
+  in the same mapped staging slot (`NINFER_TP2_AR_CODEC=bf16` opts out, `ArCodec` on
+  `DevicePair::allreduce`); on a host without the in-kernel transport the default falls back to bf16
+  with a startup line, while an explicit fp8 request there is a startup error. Both shards rebuild
+  the quantized half from their own bf16 operand, so the sum stays bit-identical across cards; the
+  codec refuses captures, the host-staging transport,
+  payloads that are not whole 128-element blocks, and `NINFER_TP2_AR_PAYLOAD_DIVISOR` rather than
+  falling back silently. Decode, the vocabulary-parallel logits merge, the embedding/vision handoffs
+  and every captured graph stay bf16. Measured on the plain route at 1,832/7,153/28,531 tokens:
+  1,750.8/1,924.7/1,799.6 -> 2,084.3/2,321.3/2,145.2 tok/s (+19.0/+20.6/+19.2%), decode unchanged;
+  the full 261,223-token quick corpus moves mean NLL 1.577417 -> 1.577671 (+0.016%) and PPL +0.025%,
+  deterministic across runs. Two constraints came out of the measurement: the logits merge must stay
+  bf16 (+0.145% when quantized, against -0.057% for the deltas), and the wire mapping must be one
+  warp per 128-element block with four consecutive elements per lane - a byte-per-thread mapping
+  scattered a warp's mapped-host writes into 32 sectors and ran about four times slower than bf16.
+  int8 was rejected on analysis: a uniform grid lets one outlier in a block compress the rest to a
+  couple of levels, and the cancellation terms that matter are small values whose relative error then
+  explodes. The model-dependent `tp2_forward` test passes in both arms on the dflash2 artifact the
+  plan records for it (chunk-split invariant exact), while the nvfp4 artifact fails it in bf16 too,
+  so that artifact is not a reference for this test. (headroom §4.1, "Implemented and measured")
+
 ## Rejected optimizations (measured)
 
 - **FP8 PV (2026-09-27): implemented, passed every quality gate, reverted.** It
@@ -350,6 +374,15 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
 - **Draft-quantization overrides are cumulative by design** — each arm must be
   the cumulative artifact, otherwise it falls back to the official Q8 recipe
   and the test is not of the product path. (worklog §8.6)
+- **A wire codec's microbenchmark must preserve the real access mapping.** The
+  e4m3 stage codec measured 8.8 us per 2.62 MB stage in a standalone kernel
+  (faster than the bf16 add it replaced per byte), yet the first integrated
+  version ran ~4x slower than bf16 end to end: a thread-per-block mapping turned
+  each warp's mapped-host store into 32 scattered sectors. The microbenchmark
+  was written with one thread per block too, so it reproduced the defect as a
+  latency curve rather than exposing it. Map blocks to warps in both the
+  microbenchmark and the kernel, and treat a per-stage cost that does not scale
+  with the number of issued store transactions as unmeasured.
 
 ## Root causes (settled)
 
@@ -492,6 +525,19 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   serving profile; the effort is a full-weight PP binding, a 1F1B PP prefill
   program, a KV/GDN swap-back permutation and a serving gate.
   (docs/maintainer/tp2-pp-prefill-pivot.md)
+- **Cross-layer + cross-sub-block prefill pipeline (wavefront): pending design, not scheduled.** The
+  §4.1 residual of the headroom report (0.13-0.15 ms/token exposed above the 0.368-0.375 ms/token link
+  floor) would be attacked by keeping the four 256-token sub-blocks on four compute streams and running
+  layer L+1's mixer while layer L's allreduce is on the link. The only dependencies are `(L-1,s)` and
+  `(L,s-1)`, so the per-stage arithmetic and allreduce payloads are unchanged and bit-identity is the
+  design target: modeled +8-15% (0.516 -> 0.45-0.48 ms/token; +39% would be the no-contention limit,
+  unreachable because in-kernel allreduce occupies SMs and four stages contend). Cost: +128 MiB/card
+  of workspace (192 -> 320 MiB; 384 if a stage needs 48 MiB), four compute streams, three invariants
+  (head layout, drain-before-return, ring parity by payload order). Dense-only (the overlap gate
+  rejects gather mixers), no decode gain, and the 2.67k link ceiling is unchanged. Reopen only through
+  the document's Step 0/Step 1 gates (Step 0: per-stage arena peak and the real AR/compute split at
+  256 tokens; Step 1: a 2-stream prototype must be bit-identical and >=2% faster than 0.516 ms/token).
+  (docs/maintainer/tp2-prefill-wavefront.md)
 - **Conversation identity and one catalog entry per conversation (2026-10-17).** The
   private-continuation catalog keyed slots only by token prefix: any perturbation of a conversation
   - folding, a trimmed tail, a re-render - appended a new entry and merely demoted the old one to
