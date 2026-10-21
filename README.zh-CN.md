@@ -105,7 +105,8 @@ pwsh -File tools/win_port/serve.ps1 -Stop      # stop every ninfer-serve process
 脚本会把 FFmpeg 与 libcurl 的 `bin` 目录加到 `PATH` 上，因为要加载的 DLL 就在那里；已经在跑
 服务器时它会拒绝启动。`-MaxConcurrency 4` 最多合批四个排队请求，`-Context 262144` 提高 KV
 容量，`-Plain` 去掉 MTP 与视觉，`-Spec dflash2 -DraftTokens 7` 选择掩码草稿路线，
-`-HostKvMiB 0` 关闭跨会话的 KV 保留。`-Model`（或 `NINFER_MODEL`）选择另一个工件。
+`-HostKvMiB 0` 关闭跨会话的 KV 保留，`-EmbeddingHost` 把 token 嵌入表放在映射的主机内存里，
+`-Model`（或 `NINFER_MODEL`）选择另一个工件。
 
 发送一个 OpenAI 风格的请求：
 
@@ -157,10 +158,11 @@ Python 3 解释器。两个 preset 都用 `build/`，且会显式重置构建选
 ## 显存与配置
 
 `--max-context` 是每条序列的逻辑上限，`--kv-capacity` 决定活跃请求与保留前缀共用的主文本
-KV 池大小；`auto` 在启动时按权重之后剩余的内存解析出最大的合法容量，并留出 1 GiB 的容量
-余量。TP-2 的各个 lane（请求通道）动态共享这一个池：只要该请求自己的提示词加输出预算所需的
-页可用，它就被接纳，因此单独运行的 lane 可以使用整个上限，而不是固定的 1/lanes 切片；
-只有比池的接纳上限更长的提示词才会以 `context_length_exceeded` 被拒绝。
+KV 池大小；`auto` 在启动时按权重之后剩余的内存解析出最大的合法容量，并留出
+`--kv-headroom-mib`（默认 1024 MiB，只在 `auto` 下有意义）的容量余量。TP-2 的各个 lane（请求
+通道）动态共享这一个池：只要该请求自己的提示词加输出预算所需的页可用，它就被接纳，因此单独
+运行的 lane 可以使用整个上限，而不是固定的 1/lanes 切片；只有比池的接纳上限更长的提示词才会
+以 `context_length_exceeded` 被拒绝。
 
 两张 16 GiB 卡在 fp8 KV 下实测的余量：
 
@@ -255,33 +257,52 @@ python3 -m tools.convert --model /path/to/NVFP4/W4A4-W8A8 --recipe my_recipe.py 
 
 ### 单请求服务
 
-在 2026-10-11 的构建上用 [`tools/win_port/bench_serve.ps1`](tools/win_port/bench_serve.ps1)
+在 2026-10-21 的构建上用 [`tools/win_port/bench_serve.ps1`](tools/win_port/bench_serve.ps1)
 测得，工件为 `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer`（即上文的
-Coder390 工件加上视觉组件），参数 `--max-context 225280 --kv-dtype fp8`，一次一个请求。
-预填充是在填充提示词上发一个 token 的请求；解码是在 7,200 token 提示词之后生成 128 token 的
-答案。所有数字都取自服务器自身的 `timings` 块，且每个提示词都带 nonce，因此前缀复用无法伪造
-预填充。每个档位跑四次。
+Coder390 工件加上视觉组件），参数 `--max-context 225280 --kv-dtype fp8 --host-kv-mib 0`，
+一次一个请求。预填充是在填充提示词上发一个 token 的请求；解码是在 7,200 token 提示词之后
+生成 128 token 的答案。所有数字都取自服务器自身的 `timings` 块，且每个提示词都带 nonce，
+因此前缀复用无法伪造预填充。每个档位跑四次。
 
 | 路线 | 预填充 1.9k | 7.2k | 28.6k | 解码 | 相对 plain |
 |---|---:|---:|---:|---:|---:|
-| plain，无草稿（`-Plain`） | 1,796 | 1,943 | 1,772 | 35.9 | 1.0x |
-| MTP K=3 `--lm-head-draft` | 1,797 | 1,917 | 1,753 | 71-79 | ~2.1x |
-| DFlash2 K=5 `--lm-head-draft` | 1,618 | 1,629 | 1,557 | 81-96 | ~2.5x |
-| DFlash2 K=7 `--lm-head-draft` | 1,595 | 1,626 | 1,556 | 87-90 | ~2.5x |
+| plain，无草稿（`-Plain`） | 2,217 | 2,378 | 2,130 | 36.9-37.1 | 1.0x |
+| MTP K=3 `--lm-head-draft` | 2,191 | 2,347 | 2,096 | 65.8-74.7 | ~1.9x |
+| DFlash2 K=5 `--lm-head-draft` | 1,959 | 1,968 | 1,856 | 81.4-90.0 | ~2.3x |
+| DFlash2 K=7 `--lm-head-draft` | 1,969 | 1,972 | 1,848 | 82.9-92.0 | ~2.4x |
 
-所有数字单位都是 tok/s。预填充各格是多次运行的均值（1.9k 列为四次，其余为两次），离散度低于
-2%；解码各格是那些完整产出 128 token 的运行的区间。这个区间来自随文本变化的草稿接受率，
-而不是测量噪声：短提示词的答案实测为 66-84（MTP K=3）、84-104（DFlash2 K=5）与
-85-97（DFlash2 K=7）tok/s，输出长度 43-181 token。草稿是用预填充换解码——DFlash2 自身的前向
-在每种提示词长度下都要花掉约 15% 的预填充吞吐，MTP 约 1%——而 DFlash2 K=5 与 K=7 落在彼此的
-离散区间内。
+所有数字单位都是 tok/s。预填充各格是四次运行的均值，离散度 0.1-2.7%；解码各格是四次运行的
+区间，这些答案在 68 到 128 token 之间停止。这个区间来自随文本变化的草稿接受率，而不是测量
+噪声：短提示词的答案实测为 73-78（MTP K=3）、88-104（DFlash2 K=5）与 94-111（DFlash2 K=7）
+tok/s，输出长度 69-256 token。草稿是用预填充换解码——DFlash2 自身的前向在这些提示词长度下
+要花掉 12-17% 的预填充吞吐，MTP 为 1-2%——而 DFlash2 K=5 与 K=7 落在彼此的离散区间内。
 
-该容量下的显存，`nvidia-smi` 每卡：plain 档 13,688 MiB（`-Plain` 同时关掉视觉与采样覆盖），
-MTP K=3 为 14,820 / 14,638 MiB，DFlash2 K=5 为 14,954 / 14,884 MiB，K=7 为
-14,960 / 14,886 MiB。引擎加载是一次性的 40 s（plain）到 44 s（DFlash2），不计入上述数字。
-更早、在别的协议下取得的数字——16,057 token 的 TTFT、前缀复用延迟以及 llama.cpp 跨引擎
-对比——都在 [TP-2 说明](docs/tp2-dual-5060ti.md) 里，那份文档把每个测量与它所属的协议放在
-一起。
+预填充比 bf16 线路快 19-21%，因为自 2026-10-21 起 TP-2 的预填充 allreduce 线路默认走 e4m3：每
+128 个元素一个 f32 缩放系数，跟在载荷之后放在同一块暂存区里；两个分片各自用自己的 bf16 半边
+重建本地的量化值，因此求和结果在两张卡上逐位一致。同一条路线、同一协议下用
+`NINFER_TP2_AR_CODEC=bf16` 可单独量出这项编码的收益：
+
+| plain 预填充线路 | 1.9k | 7.2k | 28.6k | 解码 |
+|---|---:|---:|---:|---:|
+| bf16（`NINFER_TP2_AR_CODEC=bf16`） | 1,835 | 1,964 | 1,792 | 36.9-37.2 |
+| e4m3，默认 | 2,217 | 2,378 | 2,130 | 36.9-37.1 |
+
+代价只体现在数值上：261,223 token 的快速语料上困惑度 +0.025%，实测最差的是 32k 中文（PPL
++1.70%），其余都在 ±0.3% 以内。[HTTP 服务](docs/serving.md) 记录了代价边界，
+[线路格式余量的重新测量](docs/maintainer/tp2-concurrency-headroom.md) 记录了合格性判定；
+`NINFER_TP2_AR_CODEC=bf16` 可关掉它，没有内核内 allreduce 传输的主机会回退到 bf16 并在启动
+时打印一行说明。解码同样留在 bf16，logits 合并、嵌入与视觉交接以及所有已捕获的图也是如此，
+解码数字的变化则另有原因：交换集合通信现在会把下一个权重区间预取进 L2
+（`NINFER_TP2_DECODE_PREFETCH_MIB`，默认 32 MiB，`0` 关闭），在 plain 路线上实测 +1.8%。
+
+该容量下的显存，`nvidia-smi` 每卡：plain 档 13,687 MiB（`-Plain` 同时关掉视觉与采样覆盖），
+MTP K=3 为 14,819 / 14,635 MiB，DFlash2 K=5 为 14,953 / 14,881 MiB，K=7 为
+14,959 / 14,883 MiB。引擎加载是一次性的 24-27 s，不计入上述数字。表格用
+`--host-kv-mib 0` 跑，因为保留的会话不属于预填充速率：用随仓库发布的 `--host-kv-mib 32768`
+且会话目录已满时，1.9k 那格实测为 1,834-1,916（一次运行里的第一个请求为 2,206，此时还没有
+任何保留），而 7.2k 与 28.6k 两格的变化在 2% 以内。更早、在别的协议下取得的数字——16,057
+token 的 TTFT、前缀复用延迟以及 llama.cpp 跨引擎对比——都在
+[TP-2 说明](docs/tp2-dual-5060ti.md) 里，那份文档把每个测量与它所属的协议放在一起。
 
 ### 多请求服务
 

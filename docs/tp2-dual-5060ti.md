@@ -38,32 +38,54 @@ prompt token and one per MTP step.
 
 ## Current measurement
 
-The four serving routes on the current build, measured 2026-10-11 with
+The four serving routes on the 2026-10-21 build, measured with
 [`tools/win_port/bench_serve.ps1`](../tools/win_port/bench_serve.ps1) against
 `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer`, started through
 [`tools/win_port/serve.ps1`](../tools/win_port/serve.ps1) with `--max-context 225280 --kv-dtype fp8
---vision-item-tokens 8192 --host-kv-mib 32768`, one request at a time. Prefill is a one-token
+--vision-item-tokens 8192 --host-kv-mib 0`, one request at a time. Prefill is a one-token
 request over a filler prompt (1.9k / 7.2k / 28.6k prompt tokens); decode is a 128-token answer
 after a 7.2k-token prompt. Every number is the server's own `timings` block, and every prompt
 carries a nonce, so prefix reuse cannot fake prefill. Each arm ran four times.
 
 | Route | Prefill 1.9k | 7.2k | 28.6k | Decode | VRAM shard 0 / 1 | Load |
 |---|---:|---:|---:|---:|---|---:|
-| plain, no draft (`-Plain`) | 1,796 | 1,943 | 1,772 | 35.9 | 13,688 MiB | 40-41 s |
-| MTP K=3 `--lm-head-draft` | 1,797 | 1,917 | 1,753 | 70.6-79.1 | 14,820/14,638 MiB | 43 s |
-| DFlash2 K=5 `--lm-head-draft` | 1,618 | 1,629 | 1,557 | 80.8-95.6 | 14,954/14,884 MiB | 43 s |
-| DFlash2 K=7 `--lm-head-draft` | 1,595 | 1,626 | 1,556 | 87.2-90.1 | 14,960/14,886 MiB | 43-44 s |
+| plain, no draft (`-Plain`) | 2,217 | 2,378 | 2,130 | 36.9-37.1 | 13,687 MiB | 24 s |
+| MTP K=3 `--lm-head-draft` | 2,191 | 2,347 | 2,096 | 65.8-74.7 | 14,819/14,635 MiB | 27 s |
+| DFlash2 K=5 `--lm-head-draft` | 1,959 | 1,968 | 1,856 | 81.4-90.0 | 14,953/14,881 MiB | 26 s |
+| DFlash2 K=7 `--lm-head-draft` | 1,969 | 1,972 | 1,848 | 82.9-92.0 | 14,959/14,883 MiB | 25-26 s |
 
-Prefill and decode are tok/s; the prefill cells are the mean of the runs - four for the 1.9k column,
-two for the others - which spread by under 2%, and the decode cells are the range over the runs that
-produced the full 128 tokens. The spread
-inside an arm is the accepted-draft rate following the text: answers from a short prompt measured
-66-84 (MTP K=3), 84-104 (DFlash2 K=5) and 85-97 (DFlash2 K=7) tok/s over outputs of 43-181 tokens.
-DFlash2's own forward pass costs about 15% of prefill throughput at every prompt size; MTP's costs
-about 1%.
+Prefill and decode are tok/s; the prefill cells are the mean of the four runs, which spread by
+0.1-2.7%, and the decode cells are the range over the four runs, whose answers stop between 68 and
+128 tokens. The spread inside an arm is the accepted-draft rate following the text: answers from a
+short prompt measured 73-78 (MTP K=3), 88-104 (DFlash2 K=5) and 94-111 (DFlash2 K=7) tok/s over
+outputs of 69-256 tokens. DFlash2's own forward pass costs 12-17% of prefill throughput at these
+prompt sizes; MTP's costs 1-2%.
+
+Prefill is 19-21% higher than on the bf16 wire because the prefill allreduce wire moved to e4m3 by
+default on 2026-10-21: one f32 scale per 128-element block follows the payload in the same mapped
+staging slot, and both shards rebuild their own half from their bf16 operand, so the sum stays
+bit-identical across cards. The same route and protocol with the wire pinned to bf16 isolates the
+codec:
+
+| plain prefill wire | 1.9k | 7.2k | 28.6k | Decode |
+|---|---:|---:|---:|---:|
+| bf16 (`NINFER_TP2_AR_CODEC=bf16`) | 1,835 | 1,964 | 1,792 | 36.9-37.2 |
+| e4m3, default | 2,217 | 2,378 | 2,130 | 36.9-37.1 |
+
+That is +20.8 / +21.1 / +18.9% with decode unchanged, because decode, the logits merge, the
+embedding and vision handoffs and every captured graph stay on bf16. The wire only changes the
+numerics of the prefill sum: the 261,223-token quick corpus measured +0.025% perplexity, the worst
+regime found is 32k-token Chinese at +1.70% PPL, and the qualification record with the per-domain
+breakdown is the [wire-format
+re-measurement](maintainer/tp2-concurrency-headroom.md#wire-format-headroom-re-measured-on-the-current-build-2026-10-20).
+
+This table runs with `--host-kv-mib 0` because retained sessions are not part of a prefill rate: the
+same protocol with the shipped `--host-kv-mib 32768` measured the 7.2k and 28.6k cells within 2%,
+but 1,834-1,916 at 1.9k once the session catalog is full (2,206 on a run's first request, before
+anything is retained yet).
 
 The engine's memory ledger at `--max-context 225280` puts the artifact at 9.51 GiB of weights
-(plain), 10.1 GiB (MTP K=3) and 10.6 GiB (DFlash2), and leaves 1,602 / 478 / 340 / 334 MiB free on
+(plain), 10.1 GiB (MTP K=3) and 10.6 GiB (DFlash2), and leaves 1,616 / 492 / 354 / 348 MiB free on
 shard 0 for the four routes in table order. DFlash2 K=5 and K=7 are the fastest decode of the four
 and are what the draft's memory buys; at this capacity the plain route is the only one that could
 still reach 262,144 tokens, which is why the configuration above is an MTP one. The plain arm runs
@@ -78,8 +100,8 @@ read → split → per-upload-sync chain: 2026-10-17, six interleaved A/B sample
 (22.09 GB NVFP4 artifact, `--max-context 131072`, one instance at a time, engine `ready` line,
 stash/rebuild arm switch): baseline 45.0/47.0/47.1 s, pipelined 29.8/37.9/38.3 s (median 47.0 vs
 37.9 s), with the startup report showing `staging peak` 256 MiB (`four-slot portable-pinned ring`,
-[`docs/windows.md`](windows.md#verified-behavior-on-windows)). The `Load` column above predates
-this change.
+[`docs/windows.md`](windows.md#verified-behavior-on-windows)). The `Load` column above is measured
+after this change; the earlier reading's 40-44 s predates it.
 
 ## Benchmarks
 

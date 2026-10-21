@@ -116,8 +116,9 @@ Keep that terminal open: a `-Background` child belongs to the launching shell's 
 with it. The script puts the FFmpeg and libcurl `bin` directories on `PATH`, because that is where
 the loading DLLs live, and it refuses to start when a server is already running. `-MaxConcurrency 4`
 batches up to four queued requests, `-Context 262144` raises the KV capacity, `-Plain` drops MTP and
-vision, `-Spec dflash2 -DraftTokens 7` selects the masked-draft route, and `-HostKvMiB 0` disables
-cross-session KV retention. `-Model` (or `NINFER_MODEL`) selects another artifact.
+vision, `-Spec dflash2 -DraftTokens 7` selects the masked-draft route, `-HostKvMiB 0` disables
+cross-session KV retention, `-EmbeddingHost` keeps the token embedding table in mapped host memory,
+and `-Model` (or `NINFER_MODEL`) selects another artifact.
 
 Send an OpenAI-style request:
 
@@ -173,7 +174,8 @@ configuration](docs/maintainer/build-system.md).
 
 `--max-context` is each sequence's logical ceiling, and `--kv-capacity` sizes the shared Main Text
 KV pool that active requests and retained prefixes draw from; `auto` resolves the largest legal
-capacity at startup from the memory left after weights, keeping 1 GiB of sizing headroom. The TP-2
+capacity at startup from the memory left after weights, keeping `--kv-headroom-mib` (1024 MiB by
+default, and only meaningful with `auto`) of sizing headroom. The TP-2
 lanes share that one pool dynamically: a request is admitted once the pages its own prompt plus
 output budget need are free, so a lane that runs alone may use the whole ceiling instead of a fixed
 1/lanes slice, and only a prompt longer than the pool's admission ceiling is rejected as
@@ -278,33 +280,56 @@ index](docs/performance.md) holds upstream's single-GPU measurements on an RTX 5
 
 ### Single-request serving
 
-Measured on the 2026-10-11 build with
+Measured on the 2026-10-21 build with
 [`tools/win_port/bench_serve.ps1`](tools/win_port/bench_serve.ps1) against
 `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-Vision.ninfer` (the Coder390 artifact above with its
-vision component) at `--max-context 225280 --kv-dtype fp8`, one request at a time. Prefill is a
-one-token request over a filler prompt; decode is a 128-token answer after a 7,200-token prompt.
-Every number comes from the server's own `timings` block, and every prompt carries a nonce, so
-prefix reuse cannot fake prefill. Each arm ran four times.
+vision component) at `--max-context 225280 --kv-dtype fp8 --host-kv-mib 0`, one request at a time.
+Prefill is a one-token request over a filler prompt; decode is a 128-token answer after a
+7,200-token prompt. Every number comes from the server's own `timings` block, and every prompt
+carries a nonce, so prefix reuse cannot fake prefill. Each arm ran four times.
 
 | Route | Prefill 1.9k | 7.2k | 28.6k | Decode | vs plain |
 |---|---:|---:|---:|---:|---:|
-| plain, no draft (`-Plain`) | 1,796 | 1,943 | 1,772 | 35.9 | 1.0x |
-| MTP K=3 `--lm-head-draft` | 1,797 | 1,917 | 1,753 | 71-79 | ~2.1x |
-| DFlash2 K=5 `--lm-head-draft` | 1,618 | 1,629 | 1,557 | 81-96 | ~2.5x |
-| DFlash2 K=7 `--lm-head-draft` | 1,595 | 1,626 | 1,556 | 87-90 | ~2.5x |
+| plain, no draft (`-Plain`) | 2,217 | 2,378 | 2,130 | 36.9-37.1 | 1.0x |
+| MTP K=3 `--lm-head-draft` | 2,191 | 2,347 | 2,096 | 65.8-74.7 | ~1.9x |
+| DFlash2 K=5 `--lm-head-draft` | 1,959 | 1,968 | 1,856 | 81.4-90.0 | ~2.3x |
+| DFlash2 K=7 `--lm-head-draft` | 1,969 | 1,972 | 1,848 | 82.9-92.0 | ~2.4x |
 
-All figures are tok/s. Prefill cells are the mean of the runs (four for the 1.9k column, two for the
-others) and spread by under 2%; the decode cells are the range over the runs that produced the full
-128 tokens. That range is the accepted-draft rate moving with the text, not measurement noise:
-answers from a short prompt measured 66-84 (MTP K=3), 84-104 (DFlash2 K=5) and 85-97 (DFlash2 K=7)
-tok/s over outputs of 43-181 tokens. The draft buys decode with prefill - DFlash2's own forward pass
-costs about 15% of prefill throughput at every prompt size, MTP's about 1% - and DFlash2 K=5 and K=7
-are within each other's spread.
+All figures are tok/s. Prefill cells are the mean of the four runs and spread by 0.1-2.7%; decode
+cells are the range over the four runs, whose answers stop between 68 and 128 tokens. That range is
+the accepted-draft rate moving with the text, not measurement noise: answers from a short prompt
+measured 73-78 (MTP K=3), 88-104 (DFlash2 K=5) and 94-111 (DFlash2 K=7) tok/s over outputs of 69-256
+tokens. The draft buys decode with prefill - DFlash2's own forward pass costs 12-17% of prefill
+throughput at these prompt sizes, MTP's 1-2% - and DFlash2 K=5 and K=7 are within each other's
+spread.
 
-Memory at this capacity, `nvidia-smi` per card: 13,688 MiB for the plain arm (`-Plain` also drops
-vision and the sampling overrides), 14,820 / 14,638 MiB for MTP K=3, 14,954 / 14,884 MiB for DFlash2
-K=5 and 14,960 / 14,886 MiB for K=7. Engine load is a one-off 40 s (plain) to 44 s (DFlash2) and is
-outside these numbers. Earlier figures taken under other protocols - the 16,057-token TTFT, the
+Prefill is 19-21% faster than on the bf16 wire, because the TP-2 prefill allreduce wire is e4m3 by
+default since 2026-10-21: one f32 scale per 128-element block follows the payload in the same staging
+slot, and both shards rebuild their own half from their bf16 operand, so the sum stays bit-identical
+across cards. The same route and protocol with `NINFER_TP2_AR_CODEC=bf16` isolates the codec:
+
+| plain prefill wire | 1.9k | 7.2k | 28.6k | Decode |
+|---|---:|---:|---:|---:|
+| bf16 (`NINFER_TP2_AR_CODEC=bf16`) | 1,835 | 1,964 | 1,792 | 36.9-37.2 |
+| e4m3, default | 2,217 | 2,378 | 2,130 | 36.9-37.1 |
+
+The cost is numerical, not structural: +0.025% perplexity on the 261,223-token quick corpus, with the
+worst measured regime 32k-token Chinese at +1.70% PPL and everything else within +-0.3%. [HTTP
+serving](docs/serving.md) has the cost boundary and the [wire-format
+re-measurement](docs/maintainer/tp2-concurrency-headroom.md) the qualification record;
+`NINFER_TP2_AR_CODEC=bf16` opts out, and a host without the in-kernel allreduce transport falls back
+to bf16 with a startup line. Decode stays on bf16 too, as do the logits merge, the embedding and
+vision handoffs and every captured graph, and it moved for a different reason: the exchange
+collectives prefetch the next weight range into L2 (`NINFER_TP2_DECODE_PREFETCH_MIB`, 32 MiB by
+default, `0` disables), measured +1.8% on the plain route.
+
+Memory at this capacity, `nvidia-smi` per card: 13,687 MiB for the plain arm (`-Plain` also drops
+vision and the sampling overrides), 14,819 / 14,635 MiB for MTP K=3, 14,953 / 14,881 MiB for DFlash2
+K=5 and 14,959 / 14,883 MiB for K=7. Engine load is a one-off 24-27 s and is outside these numbers.
+The table runs with `--host-kv-mib 0` because retained sessions are not part of a prefill rate: with
+the shipped `--host-kv-mib 32768` and a full session catalog the 1.9k cell measured 1,834-1,916
+(2,206 on the first request of a run, when nothing is retained yet), while the two larger prompts
+stayed within 2%. Earlier figures taken under other protocols - the 16,057-token TTFT, the
 prefix-reuse latency and the llama.cpp cross-engine comparison - are in the [TP-2
 note](docs/tp2-dual-5060ti.md), which keeps every measurement next to the protocol it was taken
 under.
