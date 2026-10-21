@@ -2739,13 +2739,17 @@ void TextContext::forward_tp2_prefill(TextContext& peer, tp::DevicePair& pair,
             }
         }
     }
+    // The quantized wire format is this forward's setting: it applies to the prompt-shaped prefill
+    // chunk and to nothing else (decode, draft and verify collectives stay bf16).
+    const tp::ArCodec delta_codec =
+        phase == Phase::Prefill ? pair.ar_codec() : tp::ArCodec::Bf16;
     auto run_layers = [&] {
         if (overlap_ok) {
             run_layers_tp2_overlap(peer, pair, x, x_peer, phase, overlap_width, first_position);
         } else if (sink != nullptr) {
-            run_layers_tp2(peer, pair, x, x_peer, phase, *sink);
+            run_layers_tp2(peer, pair, x, x_peer, phase, *sink, delta_codec);
         } else {
-            run_layers_tp2(peer, pair, x, x_peer, phase, tap);
+            run_layers_tp2(peer, pair, x, x_peer, phase, tap, delta_codec);
         }
     };
     if (sink != nullptr) { sink->begin(x); }
@@ -3154,11 +3158,13 @@ void TextContext::forward_tp2_window_batch(TextContext& peer, tp::DevicePair& pa
     embedding_tp2(peer, pair, bind0.ids, &bind1.ids, x, &x_peer);
 
     NullTap tap;
+    // Phase::Prefill here only picks the prompt-shaped kernels: a window batch is a decode-side
+    // computation (verify or draft), so its collectives stay bf16 like every other captured graph.
     if (sink != nullptr) {
         sink->begin(x);
-        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, *sink);
+        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, *sink, tp::ArCodec::Bf16);
     } else {
-        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, tap);
+        run_layers_tp2(peer, pair, x, x_peer, Phase::Prefill, tap, tp::ArCodec::Bf16);
     }
 
     ctx_.bind_to_current_thread();

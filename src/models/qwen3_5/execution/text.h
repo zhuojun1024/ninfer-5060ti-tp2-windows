@@ -164,7 +164,7 @@ public:
     // shards at the FFN input and no all-reduce is needed after the mixer.
     template <class Tap>
     void run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
-                        Phase ph, Tap& tap);
+                        Phase ph, Tap& tap, tp::ArCodec delta_codec = tp::ArCodec::Bf16);
     // The bytes this shard's next op streams from HBM, which decode's collective windows prefetch.
     // Decode has no compute to overlap with a collective (the layer chain is strictly sequential),
     // but it does have an idle memory system for the whole rendezvous, and these bytes are
@@ -600,14 +600,13 @@ private:
 
 template <class Tap>
 void TextContext::run_layers_tp2(TextContext& peer, tp::DevicePair& pair, Tensor& x, Tensor& x_peer,
-                                 Phase ph, Tap& tap) {
+                                 Phase ph, Tap& tap, tp::ArCodec delta_codec) {
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block      = parameters_.text.layers[layer];
         const auto& block_peer = peer.parameters_.text.layers[layer];
-        // A quantized wire format is a prefill-only setting: decode payloads are latency-bound, so
-        // they keep bf16 (and the captured decode graphs are built for it).
-        const tp::ArCodec delta_codec =
-            ph == Phase::Prefill ? pair.ar_codec() : tp::ArCodec::Bf16;
+        // A quantized wire format is the prefill forward's setting only: it arrives as a parameter
+        // from the caller, because the verify window reuses Phase::Prefill for its prompt-shaped
+        // kernels while running captured decode-side graphs that must stay bf16.
         // Rotation across the two collectives of this layer: each one waits on the peer with the
         // memory system idle, so it pulls the bytes the next op is about to want. The mixer's window
         // fetches this layer's FFN, the FFN's window fetches the next layer's mixer. Prefill keeps
