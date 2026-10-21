@@ -71,7 +71,12 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   couple of levels, and the cancellation terms that matter are small values whose relative error then
   explodes. The model-dependent `tp2_forward` test passes in both arms on the dflash2 artifact the
   plan records for it (chunk-split invariant exact), while the nvfp4 artifact fails it in bf16 too,
-  so that artifact is not a reference for this test. (headroom §4.1, "Implemented and measured")
+  so that artifact is not a reference for this test. Context length moves the cost, non-monotonically:
+  on one 65k-token Chinese file the delta is -0.28% at 4k, +2.77% at 32k and -0.04% at 64k, and both
+  128k concatenations land on zero, because the cost tracks near-tie density rather than length. The
+  worst measured regime is 32k Chinese (+0.99% NLL / +1.70% PPL over four files); 4k, 64k and 128k
+  stay within +-0.3%, and token-level flips persist at every length. (headroom §4.1, "Implemented and
+  measured" and "Context-length dependence")
 
 ## Rejected optimizations (measured)
 

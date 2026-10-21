@@ -337,7 +337,8 @@ The two-lane batch route shows the same effect on one request at a time (1,831 t
 2,107.1 tok/s, +18.5%; 7,156 tokens 2,004.0 -> 2,433.6, +21.4%; decode 36.7 -> 36.9 and 37.6 ->
 37.3), because a lane's inline prefill goes through the same layer loop.
 
-Quality on the full quick corpus (261,223 scored tokens, two shards, `--kv-dtype fp8`): mean NLL
+Quality on the full quick corpus (261,223 scored tokens in 4,096-token windows, two shards,
+`--kv-dtype fp8`; the cost depends on the context the model is given, see the next subsection): mean NLL
 1.577417 -> 1.577671 (+0.0161%), PPL 4.842433 -> 4.843661 (+0.0254%). Per domain the deltas are
 -0.28% to +0.27% with mixed sign (Chinese -0.28%, English long-form +0.06%, English reference
 +0.27%, code +0.08%), and two runs of the same arm agree in every per-domain mean, so the codec is
@@ -355,6 +356,47 @@ artifact the plan records for it (`qwen3_8_27b_swift15_dflash2_final.ninfer`; `o
 2x256 chunks` stays exact, `max_logit_diff=0`). It is not a usable reference on the nvfp4 artifact:
 the bf16 arm already trips the duplicated-lane assertion there, before the wire format is involved.
 
+#### Context-length dependence of the codec's quality cost (2026-10-21)
+
+The corpus above is scored in 4,096-token windows. The cost is not a property of the codec alone: it
+follows how close the model's own predictions sit to a decision boundary, and that changes with the
+context the model is given. Measured on one 65k-token stream file per domain (`--text`, both arms,
+same build), plus two 131k-token concatenations at 128k:
+
+| context | text | bf16 mean NLL | fp8 mean NLL | dNLL | dPPL |
+|---|---|---|---|---|---|
+| 4k | wikitext/pg19/zhwiki 00, 3x65k | 1.9297 | 1.9300 | +0.010% | +0.03% |
+| 4k | zhwiki 00 only | 1.961992 | 1.956415 | -0.284% | -0.556% |
+| 32k | wikitext 00 | 1.851199 | 1.857169 | +0.323% | +0.599% |
+| 32k | pg19 00 | 1.916849 | 1.917619 | +0.040% | +0.077% |
+| 32k | zhwiki 00 | 1.701590 | 1.748743 | +2.771% | +4.829% |
+| 32k | zhwiki 01 / 02 / 03 | - | - | +0.097 / +0.267 / +0.875% | +0.174 / +0.479 / +1.388% |
+| 32k | zhwiki 00-03 weighted | 1.71172 | 1.72858 | +0.985% | +1.701% |
+| 64k | zhwiki 00+01, 131k tokens | 1.662860 | 1.662229 | -0.038% | -0.063% |
+| 128k | zhwiki 00+01, 131k tokens | 1.653469 | 1.653457 | -0.001% | -0.001% |
+| 128k | zhwiki 02+03, 131k tokens | 1.654673 | 1.654864 | +0.012% | +0.023% |
+
+Two 128k texts (different files) both land on zero, so the 128k result is not one passage's luck. The
+mechanism is visible in the one region that moves: tokens 49k-64k of `zhwiki/00.txt` are the model's
+least certain window at 32k context (bf16 NLL 2.07/2.27 against 1.52/2.00 at 4k and 1.44/1.91 with
+64k), so 7.5% of them move by more than one nat (1.43% at 4k) and the region contributes +0.283 and
++0.107 nats at 32k, but -0.0002 and +0.0041 at 64k. Token-level flips never disappear (4.6-4.8% of
+tokens move by more than 0.5 nats, up to about 10 nats, at every length); at 4k, 64k and 128k they
+cancel in aggregate, at 32k on Chinese they do not. Both arms are deterministic across reruns, so
+these deltas are the codec's alone.
+
+The honest boundary for the shipped default is therefore: **worst measured case 32k Chinese, +0.99%
+NLL / +1.70% PPL over four files; 4k, 64k and 128k within +-0.3%** (the single worst file at 32k,
+`zhwiki/00.txt`, reaches +4.83% PPL on its own hardship window). The cost tracks near-tie density, not
+length, so a clean 128k result does not make 32k clean, and `NINFER_TP2_AR_CODEC=bf16` remains the
+opt-out for deployments whose traffic sits in that regime.
+
+The original acceptance gate (`|d mean NLL| <= 3e-3`, `dPPL <= 0.3%`) was defined on the 4k aggregate
+and keeps about twelve times its margin there; the 32k Chinese regime exceeds it (about 5.7x on the
+four-file aggregate, 16x on the worst single file) and ships as a documented boundary rather than a
+gate pass. Task-level quality - the 24-question eval set and any long-context retrieval check - was
+not re-measured at 32k, so PPL is the only evidence in that regime and a deployment that needs task
+accuracy there should opt out with `NINFER_TP2_AR_CODEC=bf16`.
 
 ### 4.2 Why "batched prefill" cannot raise the aggregate throughput of long prompts
 

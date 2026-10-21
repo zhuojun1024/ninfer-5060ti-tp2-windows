@@ -133,9 +133,11 @@ RTX 5060 Ti cards but not one.
   and any wait behind a prefill chunk.
   Prefill allreduce payloads travel as e4m3 by default (one f32 scale per 128-element block): +19%
   prefill at 2k-28k tokens, decode unchanged, at a measured +0.025% PPL on the 261,223-token quick
-  corpus. `NINFER_TP2_AR_CODEC=bf16` opts out, and a host without the in-kernel allreduce transport
-  falls back to bf16 with a startup line. The wire format changes the numerics without changing the
-  distribution: decode, the logits merge and every captured graph stay bf16.
+  corpus. Quality cost depends on the model's near-tie density rather than context length: 32k Chinese
+  is the measured worst regime (+1.70% PPL over four files), while 4k, 64k and 128k stay within +-0.3%
+  (headroom §4.1). `NINFER_TP2_AR_CODEC=bf16` opts out, and a host without the in-kernel allreduce
+  transport falls back to bf16 with a startup line. The wire format changes the numerics without
+  changing the distribution: decode, the logits merge and every captured graph stay bf16.
   A round is also the unit of failure: when one lane's step fails, every request still running in that
   round fails with the same error, and every lane's reusable state - the sessions it recalled and its
   host checkpoints - is discarded, because the device state a failed round leaves behind cannot be
