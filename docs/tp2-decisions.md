@@ -80,6 +80,34 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
 
 ## Rejected optimizations (measured)
 
+- **Per-layer codec whitelist (2026-10-21): measured, rejected as a control knob.** The codec is
+  already a per-collective argument, so routing individual layers back to bf16 is cheap to build
+  (a measurement-only `NINFER_TP2_AR_CODEC_LAYERS` bitmask was added for this experiment and
+  reverted afterwards; mask 0 and mask all-ones reproduced the bf16 and fp8 baselines to the last
+  digit, so the switch itself introduced no numeric drift). Splitting the 64 layers into four
+  groups of 16 and quantizing one group per run on `zhwiki/00.txt`, against the same-build bf16
+  baseline:
+
+  | group | layers | Δ mean NLL @4k | Δ mean NLL @32k |
+  |---|---|---|---|
+  | G0 | 0–15 | −0.00734 (−0.374%) | +0.02526 (+1.484%) |
+  | G1 | 16–31 | −0.01718 (−0.876%) | −0.01020 (−0.599%) |
+  | G2 | 32–47 | +0.00133 (+0.068%) | +0.00358 (+0.210%) |
+  | G3 | 48–63 | +0.00052 (+0.026%) | +0.00133 (+0.078%) |
+  | all | 0–63 | −0.00558 (−0.284%) | +0.04715 (+2.771%) |
+
+  Three properties make a whitelist unusable. (1) **Not additive**: the four single-group
+  deltas sum to −0.0227 at 4k against −0.0056 for all layers together (4.1× cancellation),
+  and to +0.0200 at 32k against +0.0472 jointly (2.4× amplification in the other direction),
+  so a group's measured cost is not its marginal cost in the stack. (2) **Not transferable**:
+  G0 is the cheapest group at 4k and the most expensive at 32k (+1.86 pp swing), and the
+  ordering inverts (Spearman 0.4 over four points), so the classification is not a property
+  of the layer. (3) A whitelist derived at 4k therefore keeps exactly the groups that are
+  worst at 32k. The cost tracks how many tokens the input pushes onto a decision boundary,
+  which is a property of the input rather than of a layer, so the two global modes remain the
+  only sensible control (`NINFER_TP2_AR_CODEC=bf16` opts the whole route out). Cost of the
+  experiment: ten runs, about fourteen minutes. Cross-reference: the headroom report's
+  "Context-length dependence of the codec's quality cost" section.
 - **FP8 PV (2026-09-27): implemented, passed every quality gate, reverted.** It
   cleared G0-G3 (short-prompt acceptance Δ=+0.29 pp, deep-context Δ=−0.88 pp, both
   within the 30-rep noise) but reached only **1.176×** at the op level against the
