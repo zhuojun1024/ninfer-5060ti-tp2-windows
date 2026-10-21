@@ -56,3 +56,4 @@ tools/freq_corpus/fixtures/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+_temp/
