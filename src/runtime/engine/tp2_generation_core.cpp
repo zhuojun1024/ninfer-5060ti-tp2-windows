@@ -2700,6 +2700,7 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         }
         const DecideResult decision = reuse_ledger_->decide(conversation, token_ids);
         reuse_reason                = decision.reason;
+        result.reuse_reason         = decision.reason;
         if (decision.reason == ReuseReason::Used && decision.anchor != nullptr) {
             for (const Reachable& item : reachable) {
                 if (item.position != decision.reuse) { continue; }
@@ -3827,6 +3828,12 @@ void TP2GenerationCore::execute_plain_batch(
 
         lane.result.reused_prompt_tokens = reuse;
         lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
+                lane.result.reuse_source         = lane_retention_[lane_id].reuse_source == ReuseSource::DeviceSnapshot ? ReuseSourceKind::Device
+                                                   : lane_retention_[lane_id].reuse_source == ReuseSource::HostCheckpoint ? ReuseSourceKind::HostSlab
+                                                   : lane_retention_[lane_id].reuse_source == ReuseSource::LiveState      ? ReuseSourceKind::LiveState
+                                                                                                                          : ReuseSourceKind::None;
+                lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used ? ReuseReasonKind::Used
+                                                                                                : ReuseReasonKind::NoAnchorAtOrBefore;
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -5185,6 +5192,12 @@ void TP2GenerationCore::execute_spec_batch(
         capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
         lane.result.reused_prompt_tokens           = reuse;
         lane.result.prefix_reuse_path              = reuse_path(reuse, anchors.block_frontier, lane_id);
+                lane.result.reuse_source                   = lane_retention_[lane_id].reuse_source == ReuseSource::DeviceSnapshot ? ReuseSourceKind::Device
+                                                             : lane_retention_[lane_id].reuse_source == ReuseSource::HostCheckpoint ? ReuseSourceKind::HostSlab
+                                                             : lane_retention_[lane_id].reuse_source == ReuseSource::LiveState      ? ReuseSourceKind::LiveState
+                                                                                                                                    : ReuseSourceKind::None;
+                lane.result.reuse_reason                   = lane_reuse.reuse_reason == ReuseReason::Used ? ReuseReasonKind::Used
+                                                                                                         : ReuseReasonKind::NoAnchorAtOrBefore;
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});

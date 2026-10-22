@@ -939,6 +939,9 @@ private:
         // divergence anchor is planned against it, so the prefill that follows the scan needs it
         // without re-deriving the comparison.
         std::uint32_t shared_prefix = 0;
+        // Why the scan ended where it did, carried out of it so the plan summary can report the
+        // decision the ledger made rather than re-deriving it from the chosen position.
+        ReuseReason reuse_reason = ReuseReason::NoAnchorAtOrBefore;
     };
     // Scans this lane's own lineage for the deepest boundary at or before the shared prefix, tags
     // the checkpoints the coming prefill will write, and records the source in the lane's retention

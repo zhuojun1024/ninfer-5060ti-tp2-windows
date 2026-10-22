@@ -55,6 +55,10 @@ struct RequestPlanSummary {
     std::uint32_t requested_output_tokens = 0;
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
+    // The redesign's own account of the decision, filled next to the legacy path so both schemas can
+    // be read at once until the old one goes.
+    ReuseSourceKind reuse_source = ReuseSourceKind::None;
+    ReuseReasonKind reuse_reason = ReuseReasonKind::NoAnchorAtOrBefore;
     PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
     std::uint64_t service_work_quanta     = 0;
     bool publish_continuation             = true;

@@ -769,6 +769,20 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
+// Which kind of anchor served a request's prefix, and whether one was found at all. These replace
+// PrefixReusePath in the redesign: a request is described by where its state came from and by why the
+// decision went the way it did, not by naming one of five internal sub-rings.
+enum class ReuseSourceKind : std::uint8_t {
+    None,
+    Device,
+    HostSlab,
+    LiveState,
+};
+
+enum class ReuseReasonKind : std::uint8_t {
+    Used,
+    NoAnchorAtOrBefore,
+};
 // Why bounded pressure planning stopped for the materialization decision committed to one request.
 enum class MaterializationStopReason : std::uint8_t {
     NoPressure,
@@ -870,6 +884,9 @@ struct GenerationResult {
     std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
+    // The decision in the redesign's own terms, filled beside the legacy path.
+    ReuseSourceKind reuse_source       = ReuseSourceKind::None;
+    ReuseReasonKind reuse_reason       = ReuseReasonKind::NoAnchorAtOrBefore;
     MaterializationDiagnostics materialization;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
