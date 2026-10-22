@@ -51,7 +51,7 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
-    failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
+    failures += check(defaults.context_cache.host_state_images == ninfer::kDefaultHostStateImages &&
                           defaults.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
                       "Host context-cache defaults mismatch");
@@ -203,7 +203,7 @@ int main() {
                                            "6"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
-    failures += check(configured.context_cache.host_state_slots == 0 &&
+    failures += check(configured.context_cache.host_state_images == 0 &&
                           configured.context_cache.host_kv_capacity_bytes == 0,
                       "root-only server mode retained default Host capacities");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
@@ -231,12 +231,12 @@ int main() {
                       "log level did not reach serving options");
 
     const ServeOptions context_cache =
-        parse({"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots",
+        parse({"ninfer-serve", "model.ninfer", "--device-state-images", "3", "--host-state-images",
                "5", "--host-kv-mib", "64", "--max-private-continuations", "9",
                "--max-shared-prefixes", "4", "--max-long-anchors-per-continuation", "2"});
     failures += check(context_cache.context_cache.enabled &&
-                          context_cache.context_cache.device_state_slots == 3 &&
-                          context_cache.context_cache.host_state_slots == 5 &&
+                          context_cache.context_cache.device_state_images == 3 &&
+                          context_cache.context_cache.host_state_images == 5 &&
                           context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
                           context_cache.context_cache.max_private_continuations == 9 &&
                           context_cache.context_cache.max_shared_prefixes == 4 &&

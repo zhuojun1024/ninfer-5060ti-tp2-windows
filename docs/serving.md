@@ -13,8 +13,8 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
+  --device-state-images 2 \
+  --host-state-images 8 \
   --host-kv-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
@@ -974,8 +974,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-item-tokens N` | merged Vision tokens one media item may occupy (`2048..16384`); the Vision workspace is planned from it and larger media is resized into the matching pixel budget | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, that ring is pageable so it spends no page-lock budget, and the core adds one slot of its own for the divergence anchor | `8` |
+| `--device-state-images N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
+| `--host-state-images N` | Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, that ring is pageable so it spends no page-lock budget, and the core adds one slot of its own for the divergence anchor | `8` |
 | `--host-kv-mib N` | shared Host Main/Backend KV byte capacity in MiB; the backing is pageable, so the OS may evict it | `8192` |
 | `--host-kv-pinned` | pin the Host KV backing for faster transfers; a refused pin falls back to pageable | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
@@ -1008,7 +1008,7 @@ non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
-For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
+For `C=--max-concurrency` and `H=--device-state-images`, total Device StateImage capacity is `C+H`:
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
 independent startup-fixed host capacities - the Main route's state images are pinned while the
 TP-2 checkpoint ring is pageable; Host KV is shared by Main and the selected

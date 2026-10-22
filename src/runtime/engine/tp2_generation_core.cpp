@@ -448,7 +448,7 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
     // (~73 MiB), so the ring is enough to cover the whole context at kReuseCheckpointStride or
     // coarser; a zero budget keeps the ring disabled, which is what --no-prefix-reuse selects.
     {
-        const std::uint32_t host_slots = options_.context_cache.host_state_slots;
+        const std::uint32_t host_slots = options_.context_cache.host_state_images;
         session_retention_floor_tokens_ = options_.context_cache.session_retention_floor_tokens;
         // tp2-plan-concurrency.md 12.6: a checkpoint is one compact single-lane state image, and
         // each lane owns its own slice of the ring, so the pinned budget is the lanes=1 budget

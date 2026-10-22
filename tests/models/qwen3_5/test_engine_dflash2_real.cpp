@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
         options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots     = argc > 7 ? std::stoul(argv[7]) : 3U;
+        options.context_cache.device_state_images     = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                       = graph;
         options.enable_vision                        = argc > 6 && std::stoi(argv[6]) != 0;
         options.kv_cache                             = argc > 5 && std::string(argv[5]) == "int8"

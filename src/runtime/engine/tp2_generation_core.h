@@ -58,12 +58,12 @@ public:
     // round scratch, which is not a reuse boundary. Every plane costs another whole-pool state image
     // per shard (73.4 MiB per lane), and the host checkpoint ring holds the same states in pinned
     // host memory, so a boundary the ring can serve does not also get a device plane: with the ring
-    // enabled (--host-state-slots, on by default) the reuse boundaries are not carved at all and only
+    // enabled (--host-state-images, on by default) the reuse boundaries are not carved at all and only
     // the round scratch stays on the device. Chat templates render the previous assistant turn and
     // the generation tail differently, so two consecutive prompts share everything up to a point a
     // little before the earlier prompt's end; the dense host tail ring covers that rewind, which is
     // why this count is the floor rather than a choice. A configuration without the ring
-    // (--no-prefix-reuse, --host-state-slots 0) keeps every plane, because it has nowhere else to put
+    // (--no-prefix-reuse, --host-state-images 0) keeps every plane, because it has nowhere else to put
     // the prompt-end image the session slabs read (see session_store_active).
     static constexpr std::size_t kReuseSnapshotCount = 1;
     // Extra state slot (beyond the reuse snapshots) holding the pre-verify state of the current MTP
@@ -197,7 +197,7 @@ private:
         // of the frontier they were taken at, so a prompt whose shared prefix ends *inside* the
         // previous prompt restarts at the deepest checkpoint at or before that prefix instead of
         // recomputing from zero. The ring is sized from the host state-image budget
-        // (--host-state-slots) and costs no device memory.
+        // (--host-state-images) and costs no device memory.
         //
         // A slot holds one compact single-lane image and belongs to the lane whose slice of the ring
         // it is, so the host budget is the lanes=1 budget whatever the lane count; the prompt-end
@@ -1129,7 +1129,7 @@ private:
     std::uint64_t prefill_host_writes_        = 0;
     // Slots appended to the end of every shard's ring for the divergence anchor, the stable block's
     // own anchor and one prompt-end image per lane. They sit outside the configured
-    // --host-state-slots budget: the anchors answer a different question than the position grid, and
+    // --host-state-images budget: the anchors answer a different question than the position grid, and
     // carving them out of the grid would coarsen the stride that covers the whole context. They cost
     // pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;

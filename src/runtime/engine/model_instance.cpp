@@ -153,14 +153,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // than building a context cache, so the host state-image budget survives this reset. The
         // host KV budget and the session count are the inputs of its cross-session retention, so
         // they survive too: a zero host KV budget disables that retention.
-        const std::uint32_t host_state_slots = options.context_cache.host_state_slots;
+        const std::uint32_t host_state_images = options.context_cache.host_state_images;
         const std::size_t host_kv_capacity   = options.context_cache.host_kv_capacity_bytes;
         const bool host_kv_pinned            = options.context_cache.host_kv_pinned;
         const std::uint32_t session_capacity =
             options.context_cache.max_private_continuations.value_or(kTp2DefaultSessions);
         const std::uint32_t retention_floor = options.context_cache.session_retention_floor_tokens;
         options.context_cache = ContextCacheOptions{.enabled        = false,
-                                                    .host_state_slots = host_state_slots,
+                                                    .host_state_images = host_state_images,
                                                     .host_kv_capacity_bytes = host_kv_capacity,
                                                     .session_retention_floor_tokens = retention_floor,
                                                     .host_kv_pinned = host_kv_pinned,
@@ -194,7 +194,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     // disabled-cache route has no user for them and drops them.
     const bool tp2_generation = is_tp2_generation(options);
     if (!cache.enabled) {
-        if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
+        if ((cache.device_state_images && *cache.device_state_images != 0) ||
             (!tp2_generation && cache.max_private_continuations &&
              *cache.max_private_continuations != concurrency) ||
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
@@ -202,9 +202,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              *cache.max_long_anchors_per_continuation != 0)) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
-        cache.device_state_slots = 0;
+        cache.device_state_images = 0;
         if (!tp2_generation) {
-            cache.host_state_slots       = 0;
+            cache.host_state_images       = 0;
             cache.host_kv_capacity_bytes = 0;
             cache.max_private_continuations = concurrency;
         }
@@ -213,7 +213,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    cache.device_state_images            = cache.device_state_images.value_or(concurrency);
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
@@ -225,9 +225,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument(
             "context cache max_private_continuations must cover every active request");
     }
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
+    const std::uint64_t total_device_state_images =
+        static_cast<std::uint64_t>(concurrency) + *cache.device_state_images;
+    if (total_device_state_images > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache Device state capacity exceeds uint32");
     }
     const std::uint64_t address_spaces =

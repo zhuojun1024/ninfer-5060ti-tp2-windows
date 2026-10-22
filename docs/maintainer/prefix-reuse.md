@@ -567,6 +567,9 @@ context cache 的通用容量（TP-2 上它实际只管 prefix-reuse 的镜像�
   the divergence anchor"，那个 `+1` 在新模型里不存在）、`docs/maintainer/resource-scheduling-and-context-cache.md`；
 - `tools/win_port/serve.ps1` 目前并不传这个参数，因此不需要改；`_temp/` 下的复现脚本随任务清理，不跟改。
 
+**已执行**：代码、公共头文件、测试与当前权威文档已按上表改名；`--help` 显示 `--host-state-images N` / `--device-state-images N`。
+受影响的四个测试（serve_options、engine_options、request_log、resource_manager）均通过。`docs/maintainer/` 下的 worklog 与 plan 文档按下面这条规则保持原样。
+
 **不改**：`docs/maintainer/` 下的 worklog 与 plan 文档。它们记录的是当时实际敲过的命令，把新名字写进去等于篡改
 历史记录；新名字只出现在当前权威文档里。
 

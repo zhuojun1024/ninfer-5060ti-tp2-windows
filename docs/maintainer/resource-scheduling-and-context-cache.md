@@ -983,8 +983,8 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 
 | 配置轴 | 架构含义 |
 |---|---|
-| `device_state_slots` | active guarantee 之外可保留的 Device checkpoint StateImages |
-| `host_state_slots` | 完整 Host StateImages |
+| `device_state_images` | active guarantee 之外可保留的 Device checkpoint StateImages |
+| `host_state_images` | 完整 Host StateImages |
 | `host_kv_capacity_bytes` | typed packed Host KV arena 总容量 |
 | `max_private_continuations` | private owner/catalog 容量 |
 | `max_shared_prefixes` | shared immutable owner/catalog 容量 |
@@ -998,7 +998,7 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 配置必须满足：
 
 - private continuation capacity 至少覆盖全部 active requests；
-- Device State 总容量为 `max_concurrency + device_state_slots`；
+- Device State 总容量为 `max_concurrency + device_state_images`；
 - Host State 与 Host KV 独立计费；
 - logical counts、address-space counts 和 storage sizes 可表示；
 - Program 可以兑现最小 active capacity 与 selected backend requirements。

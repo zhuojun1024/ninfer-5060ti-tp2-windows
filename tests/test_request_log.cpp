@@ -73,8 +73,8 @@ int main() {
     engine_options.speculative                                     = options.speculative;
     engine_options.enable_vision                                   = options.enable_vision;
     engine_options.use_cuda_graph                                  = options.use_cuda_graph;
-    engine_options.context_cache.device_state_slots                = 2;
-    engine_options.context_cache.host_state_slots                  = 3;
+    engine_options.context_cache.device_state_images                = 2;
+    engine_options.context_cache.host_state_images                  = 3;
     engine_options.context_cache.host_kv_capacity_bytes            = 64ULL << 20;
     engine_options.context_cache.max_private_continuations         = 4;
     engine_options.context_cache.max_shared_prefixes               = 2;
@@ -133,7 +133,7 @@ int main() {
     memory.cuda_graph_allowance_bytes        = 600;
     memory.kv_payload_bytes                  = 400;
     memory.host_state_capacity_slots         = 3;
-    memory.host_state_occupied_slots         = 1;
+    memory.host_state_occupied_images         = 1;
     memory.host_kv_capacity_bytes            = 64ULL << 20;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
 
@@ -207,9 +207,9 @@ int main() {
         "resolved context-cost layers missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
     failures += check(
-        server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
-            server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
-            server.at("engine").at("context_cache").at("host_state_slots") == 3 &&
+        server.at("engine").at("context_cache").at("device_state_images") == 2 &&
+            server.at("engine").at("context_cache").at("total_device_state_images") == 4 &&
+            server.at("engine").at("context_cache").at("host_state_images") == 3 &&
             server.at("engine").at("context_cache").at("host_kv_capacity_bytes") == (64ULL << 20) &&
             server.at("engine").at("context_cache").at("max_private_continuations") == 4 &&
             server.at("engine").at("context_cache").at("max_shared_prefixes") == 2,
@@ -242,7 +242,7 @@ int main() {
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
-                          server.at("memory").at("host_state_occupied_slots") == 1 &&
+                          server.at("memory").at("host_state_occupied_images") == 1 &&
                           server.at("memory").at("host_kv_capacity_bytes") == (64ULL << 20) &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
                       "Host context-cache memory ledger missing");
@@ -587,8 +587,8 @@ int main() {
     throughput.current.state_h2d_count                  = 1;
     throughput.current.state_h2d_bytes                  = 132;
     throughput.current.state_h2d_seconds                = 0.25;
-    throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.device_state_occupied_images      = 3;
+    throughput.current.host_state_occupied_images        = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
@@ -685,7 +685,7 @@ int main() {
     failures += check(
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
             throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
-            throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
+            throughput_json.at("context_cache").at("occupancy").at("device_state_images") == 3 &&
             throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),

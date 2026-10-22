@@ -1128,8 +1128,8 @@ public:
         out.actual_context_transfer_seconds  = context_stats_.actual_context_transfer_seconds;
 
         const auto usage                     = program.physical_usage();
-        out.device_state_occupied_slots      = usage.device_state_slots;
-        out.host_state_occupied_slots        = usage.host_state_slots;
+        out.device_state_occupied_images      = usage.device_state_images;
+        out.host_state_occupied_images        = usage.host_state_images;
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;

@@ -528,8 +528,8 @@ struct FakeDiscardResult {
 };
 
 struct FakePhysicalUsage {
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
+    std::uint32_t device_state_images      = 0;
+    std::uint32_t host_state_images        = 0;
     std::uint32_t device_main_kv_pages    = 0;
     std::uint32_t device_backend_kv_pages = 0;
     std::size_t host_kv_bytes             = 0;
@@ -3332,15 +3332,15 @@ void test_backfill_proof_and_stats_follow_program_revision() {
     require(!proof, "resource revision change did not invalidate persistent proof");
 
     program.usage = FakePhysicalUsage{
-        .device_state_slots      = 3,
-        .host_state_slots        = 2,
+        .device_state_images      = 3,
+        .host_state_images        = 2,
         .device_main_kv_pages    = 11,
         .device_backend_kv_pages = 5,
         .host_kv_bytes           = 4096,
     };
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
-    require(stats.device_state_occupied_slots == 3 && stats.host_state_occupied_slots == 2 &&
+    require(stats.device_state_occupied_images == 3 && stats.host_state_occupied_images == 2 &&
                 stats.device_main_kv_occupied_pages == 11 &&
                 stats.device_backend_kv_occupied_pages == 5 && stats.host_kv_occupied_bytes == 4096,
             "runtime physical gauges did not come directly from Program");

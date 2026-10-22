@@ -26,7 +26,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.enable_vision                    = true;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
-    options.context_cache.device_state_slots = 4;
+    options.context_cache.device_state_images = 4;
     return options;
 }
 
@@ -41,8 +41,8 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
-    options.context_cache.device_state_slots     = 1;
-    options.context_cache.host_state_slots       = 2;
+    options.context_cache.device_state_images     = 1;
+    options.context_cache.host_state_images       = 2;
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
@@ -61,8 +61,8 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
-    options.context_cache.device_state_slots     = 1;
-    options.context_cache.host_state_slots       = 4;
+    options.context_cache.device_state_images     = 1;
+    options.context_cache.host_state_images       = 4;
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 1;
@@ -81,8 +81,8 @@ ninfer::EngineOptions anthropic_prefix_regression_engine_options(const char* art
     options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
-    options.context_cache.device_state_slots = 1;
-    options.context_cache.host_state_slots   = 4;
+    options.context_cache.device_state_images = 1;
+    options.context_cache.host_state_images   = 4;
     options.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
     options.context_cache.max_private_continuations         = 1;
     options.context_cache.max_long_anchors_per_continuation = 0;
@@ -101,8 +101,8 @@ ninfer::EngineOptions shared_rewrite_materialization_engine_options(const char* 
     options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
-    options.context_cache.device_state_slots = 2;
-    options.context_cache.host_state_slots   = 0;
+    options.context_cache.device_state_images = 2;
+    options.context_cache.host_state_images   = 0;
     options.context_cache.host_kv_capacity_bytes            = 0;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 2;
@@ -119,8 +119,8 @@ ninfer::EngineOptions private_long_anchor_engine_options(const char* artifact) {
     options.speculative.backend                  = ninfer::SpeculativeBackend::None;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
-    options.context_cache.device_state_slots     = 4;
-    options.context_cache.host_state_slots       = 0;
+    options.context_cache.device_state_images     = 4;
+    options.context_cache.host_state_images       = 0;
     options.context_cache.host_kv_capacity_bytes = 0;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
@@ -139,8 +139,8 @@ ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
     options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
     options.max_concurrency                      = 1;
     options.max_pending_requests                 = 1;
-    options.context_cache.device_state_slots     = 3;
-    options.context_cache.host_state_slots       = 0;
+    options.context_cache.device_state_images     = 3;
+    options.context_cache.host_state_images       = 0;
     options.context_cache.host_kv_capacity_bytes = 0;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
@@ -159,8 +159,8 @@ ninfer::EngineOptions concurrent_engine_options(const char* artifact) {
     options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
     options.max_concurrency                  = 8;
     options.max_pending_requests             = 8;
-    options.context_cache.device_state_slots = 16;
-    options.context_cache.host_state_slots   = 0;
+    options.context_cache.device_state_images = 16;
+    options.context_cache.host_state_images   = 0;
     options.context_cache.host_kv_capacity_bytes            = 0;
     options.context_cache.max_private_continuations         = 8;
     options.context_cache.max_shared_prefixes               = 0;
@@ -178,8 +178,8 @@ ninfer::EngineOptions pressure_resume_engine_options(const char* artifact) {
     options.speculative.backend              = ninfer::SpeculativeBackend::None;
     options.max_concurrency                  = 2;
     options.max_pending_requests             = 2;
-    options.context_cache.device_state_slots = 2;
-    options.context_cache.host_state_slots   = 0;
+    options.context_cache.device_state_images = 2;
+    options.context_cache.host_state_images   = 0;
     options.context_cache.host_kv_capacity_bytes            = 8ULL << 30;
     options.context_cache.max_private_continuations         = 4;
     options.context_cache.max_shared_prefixes               = 0;
@@ -197,8 +197,8 @@ ninfer::EngineOptions private_checkpoint_pressure_engine_options(const char* art
     options.speculative.backend              = ninfer::SpeculativeBackend::None;
     options.max_concurrency                  = 2;
     options.max_pending_requests             = 2;
-    options.context_cache.device_state_slots = 2;
-    options.context_cache.host_state_slots   = 0;
+    options.context_cache.device_state_images = 2;
+    options.context_cache.host_state_images   = 0;
     options.context_cache.host_kv_capacity_bytes            = 0;
     options.context_cache.max_private_continuations         = 4;
     options.context_cache.max_shared_prefixes               = 0;
@@ -1380,7 +1380,7 @@ private:
 int exercise_cancelled_turn_rollback(const char* artifact) {
     auto options                                            = engine_options(artifact);
     options.enable_vision                                   = false;
-    options.context_cache.device_state_slots                = 3;
+    options.context_cache.device_state_images                = 3;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
     ninfer::Engine engine(std::move(options));
@@ -1493,7 +1493,7 @@ int exercise_rewrite_branch(const char* artifact) {
     };
 
     ninfer::EngineOptions configured             = engine_options(artifact);
-    configured.context_cache.device_state_slots  = 2;
+    configured.context_cache.device_state_images  = 2;
     configured.context_cache.max_shared_prefixes = 0;
     ninfer::Engine engine(std::move(configured));
     const ninfer::GenerationResult source =
@@ -2187,7 +2187,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 int exercise_artifact(const char* artifact) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
-        options.context_cache.device_state_slots  = 2;
+        options.context_cache.device_state_images  = 2;
         options.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(options));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
@@ -2278,7 +2278,7 @@ int main() {
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::SharedAlias);
     } else if (scenario == "rewrite-checkpoint") {
         auto options                              = engine_options(artifact);
-        options.context_cache.device_state_slots  = 2;
+        options.context_cache.device_state_images  = 2;
         options.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);

@@ -124,19 +124,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
-    if (plan.context_cache.host_state_slots != 0) {
+    if (plan.context_cache.host_state_images != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-            plan.context_cache.host_state_slots;
+            plan.context_cache.host_state_images;
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+            state_images->host_layout(), plan.context_cache.host_state_images);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
         static_cast<std::uint64_t>(state_images->slot_count()) +
-        plan.context_cache.host_state_slots;
+        plan.context_cache.host_state_images;
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
@@ -551,7 +551,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
-        out.host_state_occupied_slots = host_state_images->occupied();
+        out.host_state_occupied_images = host_state_images->occupied();
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();

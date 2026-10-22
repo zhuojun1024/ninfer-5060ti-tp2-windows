@@ -2636,8 +2636,8 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
     return qwen3_5::PhysicalUsageSnapshot{
         .resource_revision       = resource_revision_,
-        .device_state_slots      = usage.device.state_slots,
-        .host_state_slots        = usage.host.state_slots,
+        .device_state_images      = usage.device.state_slots,
+        .host_state_images        = usage.host.state_slots,
         .device_main_kv_pages    = usage.device.main_kv_pages,
         .device_backend_kv_pages = usage.device.backend_kv_pages,
         .host_kv_bytes           = usage.host.kv_bytes,

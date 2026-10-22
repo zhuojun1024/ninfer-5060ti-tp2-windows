@@ -32,7 +32,7 @@ int main() {
         options.device_b                        = 1;
         options.max_concurrency                 = 6;
         options.max_pending_requests            = 7;
-        options.context_cache.host_state_slots  = 16;
+        options.context_cache.host_state_images  = 16;
         const ninfer::EngineOptions resolved = ninfer::runtime::normalize_engine_options(options);
         failures += check(resolved.device_b == 1, "TP-2 route lost its second device");
         // The core's batch capacity, not a hardcoded one, bounds the route; the queue depth in front
@@ -42,9 +42,9 @@ int main() {
         failures += check(resolved.max_pending_requests == 7,
                           "TP-2 route dropped the configured pending-request depth");
         failures += check(!resolved.context_cache.enabled, "TP-2 route kept the context cache");
-        failures += check(resolved.context_cache.host_state_slots == 16,
+        failures += check(resolved.context_cache.host_state_images == 16,
                           "TP-2 route dropped the host state-image budget");
-        failures += check(resolved.context_cache.device_state_slots.value_or(1) == 0,
+        failures += check(resolved.context_cache.device_state_images.value_or(1) == 0,
                           "TP-2 route kept device state-image slots");
         failures += check(resolved.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
@@ -77,7 +77,7 @@ int main() {
         ninfer::EngineOptions options = generation_options();
         options.device_b              = 1;
         const ninfer::EngineOptions resolved = ninfer::runtime::normalize_engine_options(options);
-        failures += check(resolved.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots,
+        failures += check(resolved.context_cache.host_state_images == ninfer::kDefaultHostStateImages,
                           "TP-2 route did not keep the default host state-image budget");
     }
     {
@@ -85,9 +85,9 @@ int main() {
         ninfer::EngineOptions options          = generation_options();
         options.purpose                        = ninfer::EnginePurpose::CausalScoring;
         options.device_b                       = 1;
-        options.context_cache.host_state_slots = 16;
+        options.context_cache.host_state_images = 16;
         const ninfer::EngineOptions resolved = ninfer::runtime::normalize_engine_options(options);
-        failures += check(resolved.context_cache.host_state_slots == 0,
+        failures += check(resolved.context_cache.host_state_images == 0,
                           "a non-TP-2 disabled-cache route kept the host state-image budget");
     }
 

@@ -460,9 +460,9 @@ std::string format_server_start_json(
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
-    const std::uint64_t total_device_state_slots =
+    const std::uint64_t total_device_state_images =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
-        cache.device_state_slots.value();
+        cache.device_state_images.value();
     record["engine"] =
         Json{{"device", engine_options.device},
              {"max_context", engine_options.max_context},
@@ -494,9 +494,9 @@ std::string format_server_start_json(
                                    {"preset_path", context_cost.preset_path.string()}}},
              {"context_cache",
               Json{{"enabled", cache.enabled},
-                   {"device_state_slots", cache.device_state_slots.value()},
-                   {"total_device_state_slots", total_device_state_slots},
-                   {"host_state_slots", cache.host_state_slots},
+                   {"device_state_images", cache.device_state_images.value()},
+                   {"total_device_state_images", total_device_state_images},
+                   {"host_state_images", cache.host_state_images},
                    {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
                    {"max_private_continuations", cache.max_private_continuations.value()},
                    {"max_shared_prefixes", cache.max_shared_prefixes.value()},
@@ -523,7 +523,7 @@ std::string format_server_start_json(
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
-             {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_state_occupied_images", memory.host_state_occupied_images},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
@@ -781,8 +781,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                               current.pressure_maximal_fallback_selections)},
              {"historical_fork_hits",
               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
-        {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
-                           {"host_state_slots", current.host_state_occupied_slots},
+        {"occupancy", Json{{"device_state_images", current.device_state_occupied_images},
+                           {"host_state_images", current.host_state_occupied_images},
                            {"device_main_kv_pages", current.device_main_kv_occupied_pages},
                            {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
                            {"host_kv_bytes", current.host_kv_occupied_bytes},

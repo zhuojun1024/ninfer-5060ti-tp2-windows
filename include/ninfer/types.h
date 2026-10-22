@@ -29,7 +29,7 @@ inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 // maximum image/video resolution for device memory instead of rejecting oversized media.
 inline constexpr std::uint32_t kMaximumVisionItemTokens = 16'384;
 inline constexpr std::uint32_t kMinimumVisionItemTokens = 2'048;
-inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
+inline constexpr std::uint32_t kDefaultHostStateImages    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
@@ -136,9 +136,9 @@ struct ContextCacheOptions {
     // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
-    std::optional<std::uint32_t> device_state_slots;
+    std::optional<std::uint32_t> device_state_images;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
-    std::uint32_t host_state_slots     = kDefaultHostStateSlots;
+    std::uint32_t host_state_images     = kDefaultHostStateImages;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
     // A conversation whose whole committed history is shorter than this is served but not retained.
     // A corpus this short is cheaper to prefill again than a place in the private catalog is worth,
@@ -919,7 +919,7 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
-    std::uint32_t host_state_occupied_slots       = 0;
+    std::uint32_t host_state_occupied_images       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
 };
@@ -1019,8 +1019,8 @@ struct RuntimeStats {
 
     std::uint64_t pressure_spill_pages                 = 0;
     std::uint64_t partial_tail_cow_pages               = 0;
-    std::uint32_t device_state_occupied_slots          = 0;
-    std::uint32_t host_state_occupied_slots            = 0;
+    std::uint32_t device_state_occupied_images          = 0;
+    std::uint32_t host_state_occupied_images            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;

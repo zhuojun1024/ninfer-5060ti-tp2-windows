@@ -103,11 +103,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
 
-    if (!plan.context_cache.device_state_slots) {
+    if (!plan.context_cache.device_state_images) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
+        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_images,
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));

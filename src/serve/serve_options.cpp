@@ -75,7 +75,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] [--host-kv-pinned] "
+           "[--device-state-images N] [--host-state-images N] [--host-kv-mib N] [--host-kv-pinned] "
 "[--session-retention-floor N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
@@ -124,7 +124,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --lane-context caps how much context one TP-2 lane may admit so the first "
            "request cannot take the whole shared KV pool (0 = the whole pool); a "
            "--max-concurrency 1 route ignores it\n"
-           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
+           "       --device-state-images is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
@@ -248,13 +248,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
-        } else if (arg == "--device-state-slots") {
-            options.context_cache.device_state_slots = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
+        } else if (arg == "--device-state-images") {
+            options.context_cache.device_state_images = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--device-state-images"), "device-state-images"));
             context_capacity_explicit = true;
-        } else if (arg == "--host-state-slots") {
-            options.context_cache.host_state_slots = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+        } else if (arg == "--host-state-images") {
+            options.context_cache.host_state_images = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-state-images"), "host-state-images"));
             context_capacity_explicit = true;
         } else if (arg == "--session-retention-floor") {
             options.context_cache.session_retention_floor_tokens = static_cast<std::uint32_t>(
@@ -419,7 +419,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");
         }
         options.context_cache.enabled                = false;
-        options.context_cache.host_state_slots       = 0;
+        options.context_cache.host_state_images       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
     }
     if (options.port <= 0 || options.port > 65535) {
