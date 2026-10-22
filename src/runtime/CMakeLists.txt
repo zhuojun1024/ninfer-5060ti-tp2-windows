@@ -3,6 +3,7 @@ add_library(ninfer_runtime_support STATIC
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/kv_capacity.cpp
+  engine/prefix_reuse.cpp
   engine/public_types.cpp
 )
 ninfer_internal_includes(ninfer_runtime_support)
