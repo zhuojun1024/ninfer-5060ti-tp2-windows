@@ -18,6 +18,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/prefix_reuse.h"
 #include "ninfer/tp2_capacity.h"
 #include "ninfer/types.h"
 
@@ -1014,6 +1015,10 @@ private:
         std::vector<MediaSpan> cached_media;
         std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries{};
         bool cached_state_valid = false;
+        // The next committed frontier at which this lane's answer writes a tail checkpoint. The decode
+        // writes them at a fixed spacing from the prompt end so a re-rendered answer has a boundary
+        // inside it instead of only the prompt end behind it; zero means none is scheduled.
+        std::uint32_t next_generated_checkpoint = 0;
         // The catalog entry this lane's device pools hold, if any.
         std::size_t active_session = kNoSession;
         // The catalog entry whose history the running prefill compares this prompt against, and
@@ -1101,6 +1106,11 @@ private:
     // pinned host memory only.
     std::uint32_t host_checkpoint_divergence_slots_ = 0;
     std::uint32_t host_checkpoint_block_slots_      = 0;
+    // Prefix-reuse bookkeeping: the positions this core can restart from, and the one place that
+    // decides between them. The images themselves still live in the host ring; the ledger tracks
+    // their positions and slots, so the decision has a single authority (prefix_reuse.h). Null when
+    // the ring is disabled.
+    std::unique_ptr<ReuseLedger> reuse_ledger_;
     // Committed history below this many tokens is not worth a catalog slot; 0 retains everything.
     std::uint32_t session_retention_floor_tokens_ = 0;
 

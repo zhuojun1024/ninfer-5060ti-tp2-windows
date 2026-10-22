@@ -245,6 +245,14 @@ constexpr std::uint32_t kReuseTailWindow = 8192;
 // ring with them (each prefill leaves up to one per chunk) and evicts the position grid, which is
 // exactly the coverage a divergence deep inside the history needs.
 constexpr std::uint32_t kReuseTailCheckpointCount = 8;
+// Spacing of the anchors written while an answer is generated. The position grid only fires on
+// absolute stride multiples, so an answer that never crosses one leaves the prompt end as the only
+// boundary behind it: a client that re-renders that answer then re-prefills the whole thing (an
+// observed 20,319-token answer crossed no grid point and fell back 22,989 tokens). One anchor per
+// this many committed tokens, written into the tail ring the prefill already reserves, bounds that
+// fallback to a few thousand tokens without spending a slot. The ring's tail count widens the
+// coverage: seven slots cover 57K generated tokens before the oldest anchor rotates out.
+constexpr std::uint32_t kReuseGeneratedTailStride = 8192;
 // Host ring slots reserved for the divergence anchor: the position where the last prefill's prompt
 // stopped matching the lineage it inherited. A new session - and a context compression - shares only
 // the client's stable system prompt and tool definitions with the conversation before it, so its
@@ -465,6 +473,11 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                 host_checkpoint_grid_slots_;
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
+            // The decision layer. It owns the positions and their slots; the ring above owns the
+            // images. The slot count is the ring's, because for now the ring allocates them.
+            reuse_ledger_ = std::make_unique<ReuseLedger>(
+                ReuseBudget{host_checkpoint_stride_, lanes_ * host_checkpoint_slots_per_lane_ +
+                                                         lanes_});
         }
         // The masked-draft route carries its draft context through this same ring (stage B6): each
         // checkpoint holds the target state image and the draft ring at the same frontier, so a
@@ -2599,6 +2612,7 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                                                                bool adopted, bool trace) {
     RetentionState& lane_state = retention(lane);
     LaneReuse result;
+    ReuseReason reuse_reason  = ReuseReason::NoAnchorAtOrBefore;
     std::size_t shared_prefix = 0;
     lane_state.reuse_source   = ReuseSource::None;
     if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
@@ -2620,28 +2634,74 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                 if (checkpoint.position[lane] > shared_prefix) { checkpoint.valid[lane] = false; }
             }
         }
-        const auto take = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source) {
-            if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
-                position <= result.tokens) {
-                return;
-            }
-            result.tokens           = position;
-            result.slot             = slot;
-            lane_state.reuse_source = source;
+        // Every image this lane can reach is registered in the ledger, which then makes the one
+        // decision. Registration replaces the old "take the deepest" scan; the order below is the
+        // priority that scan used, so an equal position still resolves to the same source.
+        const std::uint64_t conversation_key =
+            lane_state.active_session != kNoSession
+                ? static_cast<std::uint64_t>(lane_state.active_session)
+                : (0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane));
+        ConversationLog& conversation = reuse_ledger_->conversation(conversation_key);
+        conversation.anchors.clear();
+        // Only the part this prompt agrees with is comparable, and the media identity already capped
+        // it: registering the rest would let the decision answer with a position the prompt left.
+        conversation.tokens.assign(lane_state.cached_prompt_tokens.begin(),
+                                   lane_state.cached_prompt_tokens.begin() +
+                                       static_cast<std::ptrdiff_t>(shared_prefix));
+        conversation.device_extent = static_cast<std::uint32_t>(shared_prefix);
+        conversation.host_extent   = static_cast<std::uint32_t>(shared_prefix);
+
+        struct Reachable {
+            std::uint32_t position;
+            std::uint32_t slot;
+            ReuseSource source;
+        };
+        std::vector<Reachable> reachable;
+        const auto offer = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source,
+                               AnchorStorage storage) {
+            if (position == 0 || position > shared_prefix || position >= prompt_tokens) { return; }
+            reachable.push_back(Reachable{position, slot, source});
+            ReuseLedger::AnchorRequest request;
+            request.position   = position;
+            request.provenance = source == ReuseSource::LiveState ? AnchorProvenance::PromptEnd
+                                                                  : AnchorProvenance::Grid;
+            request.policy     = source == ReuseSource::LiveState ? AnchorPolicy::Pinned
+                                                                  : AnchorPolicy::Lru;
+            request.storage    = storage;
+            request.kv_source  = storage == AnchorStorage::Host ? AnchorKvSource::HostSlab
+                                                                : AnchorKvSource::Device;
+            request.lane       = static_cast<std::int32_t>(lane);
+            request.slot       = storage == AnchorStorage::Host ? static_cast<std::int32_t>(slot)
+                                                                : kNoSlot;
+            reuse_ledger_->record(conversation, request);
         };
         if (lane_state.live_state_valid && lane_state.active_session != kNoSession) {
-            take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
+            offer(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState,
+                  AnchorStorage::Device);
         }
         for (std::uint32_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
             // A slot the host ring serves has no device plane; the same boundary is offered below
             // through its checkpoint instead.
             if (shard_a_.state_snapshots[slot].data == nullptr) { continue; }
-            take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
+            offer(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot,
+                  AnchorStorage::Device);
         }
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             const auto& checkpoint = shard_a_.host_checkpoints[slot];
             if (checkpoint.valid[lane]) {
-                take(checkpoint.position[lane], slot, ReuseSource::HostCheckpoint);
+                offer(checkpoint.position[lane], slot, ReuseSource::HostCheckpoint,
+                      AnchorStorage::Host);
+            }
+        }
+        const DecideResult decision = reuse_ledger_->decide(conversation, token_ids);
+        reuse_reason                = decision.reason;
+        if (decision.reason == ReuseReason::Used && decision.anchor != nullptr) {
+            for (const Reachable& item : reachable) {
+                if (item.position != decision.reuse) { continue; }
+                result.tokens           = item.position;
+                result.slot             = item.slot;
+                lane_state.reuse_source = item.source;
+                break;
             }
         }
     }
@@ -2657,11 +2717,12 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         std::fprintf(stderr,
                      "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
                      "adopted=%d prefill_end=%u host=%zu/%zu stride=%u -> reuse=%u slot=%u "
-                     "src=%s\n",
+                     "src=%s reason=%s\n",
                      lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
                      valid_checkpoints, shard_a_.host_checkpoints.size(), host_checkpoint_stride_,
-                     result.tokens, result.slot, source);
+                     result.tokens, result.slot, source,
+                     reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
     }
     // Tag the checkpoints this prefill leaves behind and start the ring at the first stride multiple
     // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
@@ -2912,6 +2973,9 @@ void TP2GenerationCore::publish_lane_prefill(
     // checkpoint in the ring's prompt-end slot, and the catalog entry is this lane's own too.
     lane_state.cached_prompt_tokens.assign(tokens.begin(), tokens.end());
     lane_state.cached_media.assign(media.begin(), media.end());
+    // The answer this prefill starts is anchored from here on: everything the walk just did is
+    // covered by its grid and tail checkpoints, so the span these anchors fill is the generated one.
+    lane_state.next_generated_checkpoint = prompt_tokens + kReuseGeneratedTailStride;
     lane_state.cached_boundaries.fill(0);
     lane_state.cached_state_valid = true;
     session_publish(tokens, prompt_tokens, cache_hints, media, lane);
@@ -3434,6 +3498,9 @@ void TP2GenerationCore::execute_plain_batch(
             history.insert(history.end(), request.generated.begin(), request.generated.end());
             session_publish(history, static_cast<std::uint32_t>(lane.position), data.context_cache,
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
+            // The anchors this answer wrote sit past a state the walk committed, so they become
+            // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
+            publish_lane_checkpoints(lane.slot);
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -4232,6 +4299,9 @@ void TP2GenerationCore::execute_spec_batch(
             history.insert(history.end(), request.generated.begin(), request.generated.end());
             session_publish(history, static_cast<std::uint32_t>(lane.position), data.context_cache,
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
+            // The anchors this answer wrote sit past a state the walk committed, so they become
+            // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
+            publish_lane_checkpoints(lane.slot);
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -4866,6 +4936,34 @@ void TP2GenerationCore::execute_spec_batch(
             } else {
                 // The next round appends exactly the columns this round committed.
                 retention(lane.slot).dflash_context_frontier = base;
+            }
+            // Anchors inside the answer. The position grid only fires on absolute stride multiples,
+            // so an answer that never crosses one leaves the prompt end as the only boundary behind
+            // it and a client that re-renders that answer re-prefills all of it. The tail ring
+            // already holds the prefill's last chunk ends, so these anchors cost no extra slot; the
+            // draft half has to reach the frontier the anchor names, exactly as the grid write in
+            // the serial walk makes it, or a restore refuses the checkpoint.
+            if (host_checkpoint_tail_slots_ != 0 && !decision.finished()) {
+                const std::uint32_t frontier = lane.position - 1U;
+                std::uint32_t& next          = retention(lane.slot).next_generated_checkpoint;
+                if (next != 0 && frontier >= next) {
+                    const std::uint32_t draft_frontier =
+                        retention(lane.slot).dflash_context_frontier;
+                    if (dflash2_enabled_ && frontier > draft_frontier) {
+                        // Hand the pending window to the draft ring for this lane alone, then keep
+                        // the frontier it now reaches: the round-level append below only carries the
+                        // lanes that finished, and it also resets every other lane to `base`.
+                        const std::int32_t flush_slot  = static_cast<std::int32_t>(lane.slot);
+                        const std::int32_t flush_start = static_cast<std::int32_t>(draft_frontier);
+                        const std::int32_t flush_end   = static_cast<std::int32_t>(frontier);
+                        round->append_pending_batch(dflash_execution, &flush_slot, &flush_start,
+                                                    &flush_end, 1);
+                        retention(lane.slot).dflash_context_frontier = frontier;
+                    }
+                    snapshot_host_checkpoint(shard_a_, frontier, HostRing::Tail, lane.slot);
+                    snapshot_host_checkpoint(shard_b_, frontier, HostRing::Tail, lane.slot);
+                    next = frontier + kReuseGeneratedTailStride;
+                }
             }
         }
 
@@ -7738,6 +7836,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // walk never reached keeps its zero and is never taken.
     lane_state.cached_prompt_tokens.assign(token_ids.begin(), token_ids.end());
     lane_state.cached_media.assign(prompt_media.begin(), prompt_media.end());
+    // The generated span is anchored from here on: the prefill's own boundaries stop at this end.
+    lane_state.next_generated_checkpoint = prompt_tokens + kReuseGeneratedTailStride;
     for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
         lane_state.cached_boundaries[slot] = snapshot_at[slot];
     }
