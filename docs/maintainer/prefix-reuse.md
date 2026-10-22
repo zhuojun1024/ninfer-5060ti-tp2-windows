@@ -536,7 +536,13 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）；
 - 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
 - `session_publish` 的三条分支与字段清零；
-- `reuse_path` 及其只服务日志的枚举（`SharedStablePrefix` 等），由 §16.1 的 `reuse_source` 取代；
+- `reuse_path` 及 `PrefixReusePath` 枚举，由 §16.1 的 `reuse_source` 取代。**注意：这一项不是"只服务日志"的清理。**
+  实施时核对发现，该枚举驱动 `record_prefix_selection()` 里六个累计计数器（`root_selections`、`private_endpoint_selections`、
+  `private_turn_closure_selections`、`private_response_replay_selections`、`private_long_anchor_selections`、
+  `shared_stable_prefix_selections`），它们进 `RuntimeStats`、被 `request_log.cpp` 与 `operational_log.cpp` 输出、
+  并被 `test_resource_manager` 与 `test_engine_prefix_real` 断言。删枚举等于删掉这六个复用选择指标，
+  因此必须**先加替代再删旧**：新指标按 `ReuseSource`（device/host/live/none）× `ReuseReason`（used/no-anchor）定义，
+  两个 schema 并行一段时间，验证后再删旧计数器、枚举与那个 switch；
 - `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）；
 - device/host 双份代码路径。
 
