@@ -536,13 +536,13 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）；
 - 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
 - `session_publish` 的三条分支与字段清零；
-- `reuse_path` 及 `PrefixReusePath` 枚举，由 §16.1 的 `reuse_source` 取代。**注意：这一项不是"只服务日志"的清理。**
+- `reuse_path` 及 `PrefixReusePath` 枚举，由 §17 的 `reuse_source`/`reuse_reason` 取代。**注意：这一项不是"只服务日志"的清理。**
   实施时核对发现，该枚举驱动 `record_prefix_selection()` 里六个累计计数器（`root_selections`、`private_endpoint_selections`、
   `private_turn_closure_selections`、`private_response_replay_selections`、`private_long_anchor_selections`、
-  `shared_stable_prefix_selections`），它们进 `RuntimeStats`、被 `request_log.cpp` 与 `operational_log.cpp` 输出、
+  `shared_stable_prefix_selections`），它们进 `RuntimeStats`、只在单卡路线上被累加（双卡恒零，见 §17.5）、
   并被 `test_resource_manager` 与 `test_engine_prefix_real` 断言。删枚举等于删掉这六个复用选择指标，
-  因此必须**先加替代再删旧**：新指标按 `ReuseSource`（device/host/live/none）× `ReuseReason`（used/no-anchor）定义，
-  两个 schema 并行一段时间，验证后再删旧计数器、枚举与那个 switch；
+  因此必须**先加替代再删旧**：新指标按 §17 定义（`source` × `reason` 两个轴），
+  双卡先装上（它今天一个都没有），单卡接线后再删旧计数器、枚举与那个 switch；
 - `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）；
 - device/host 双份代码路径。
 
@@ -650,7 +650,7 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 | 测试 | 现在断言什么 | 处置 |
 |---|---|---|
 | `test_engine_prefix_real.cpp` 的 `reused_prompt_tokens`（78 处） | 追加式复用、零后缀复用、跨会话恢复、媒体前缀各自的命中 token 数 | **保留结构，逐个更新期望值**。数值会变（栅格从"按预算反推的 32,768"变成 8192），但"命中多少"仍是行为契约；每条期望值旁注明它落在哪个锚点上 |
-| 同文件的 `prefix_reuse_path`（54 处） | 复用来源枚举（`SharedStablePrefix`、`Root` 等） | **改写**。`GenerationResult` 保留一个最小来源字段 `reuse_source`（`None/PromptEnd/Divergence/Block/Grid/Generated/Shared`）；`SharedStablePrefix` 这类名字不带语义，删 |
+| 同文件的 `prefix_reuse_path`（54 处） | 复用来源枚举（`SharedStablePrefix`、`Root` 等） | **改写**。`GenerationResult` 保留 `reuse_source`（存储轴 `None/Device/HostSlab/LiveState`）与 `reuse_reason`，定义见 §17；旧枚举的五个非 `Root` 值描述的是**锚点角色**，不提升为公开字段（§17.6），替代判据是"命中多少 token、命中哪种存储" |
 | `test_turn_replay.cpp` | `same_rendered_turn` / `adoption_candidates` 的逐字节判等与候选筛选 | **阶段 1 不动**；§5 落地时一起改写（它是 §5 的被替换对象） |
 | `test_tp2_sessions.cpp` | catalog 行为、跨会话回落、adoption 读 catalog | **保留**（阶段 1 保留 catalog）；只删依赖 ring 槽位布局的断言 |
 | `test_resource_manager.cpp` 的 `host_state_occupied_*` | 设备侧 context cache 占用 | **随分配器改写**；设备侧语义不变的部分保留 |
@@ -666,49 +666,176 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 
 ---
 
-## 附：指标迁移（`PrefixReusePath` → `ReuseSourceKind`/`ReuseReasonKind`）的接线现状
+## 17. 指标：维度与生命周期
 
-已落地（提交 `78790d9a`）：两个公开枚举、`GenerationResult` 与 `RequestPlanSummary` 的字段、`LaneReuse.reuse_reason`、
-walk 两处（`tp2_generation_core.cpp:3830` / `:5194`）的结果侧填充。构建通过，**但统计尚未读到**。
+> 代码先于定义存在：提交 `78790d9a` 落了两个枚举和结果侧字段，但没回答"这些数字各自由谁定义、何时定稿、算给谁"。
+> 这一节是那份定义，同时纠正实施过程中查出的两处错判（§17.5、§17.6）。
 
-数据流（已核实，三处写入、两个方向）：
+### 17.1 一条记录 = 一个完成的请求
+
+统计单位是请求，不是 lane，不是锚点，不是字节。
+
+- TP-2 一个 round 批两个 lane ⇒ 两条记录。
+- 已 admit、随后被取消的请求**要计**：它省下的 prefill 是真实省下的。
+- 排队期就被丢弃的请求**不计**：它从未看过锚点。
+- 一个请求只产生一条记录：扫描在第一个 chunk 之前做一次，此后的 chunk 不再重算。
+
+### 17.2 两个轴，四个合法组合
+
+| 轴 | 类型 | 取值 | 回答的问题 |
+|---|---|---|---|
+| `source` | `ReuseSourceKind` | `None` / `Device` / `HostSlab` / `LiveState` | 状态从哪种存储来 |
+| `reason` | `ReuseReasonKind` | `Used` / `NoAnchorAtOrBefore` | 决策为什么是它 |
+
+`source` 的准确含义（写死，不靠字面猜）：
+
+| 值 | 含义 | 生产点 |
+|---|---|---|
+| `Device` | 状态从一张绑在本 lane 上的设备镜像恢复（`ReuseSource::DeviceSnapshot`）：KV 本来就在设备上，只有 GDN 状态做了一次 D2D | `scan_lane_reuse` |
+| `HostSlab` | 状态从 host 镜像恢复（`ReuseSource::HostCheckpoint`）：有 D2H → H2D 往返 | `scan_lane_reuse` |
+| `LiveState` | lane 的活状态本来就停在这个前沿，**没有从镜像槽恢复过状态** | `scan_lane_reuse` |
+| `None` | 共享前缀上没有锚点，从 token 0 全量 prefill | `scan_lane_reuse` |
+
+`LiveState` 有一条必须写下来的边界：它**不承诺零拷贝**。会话目录把别的会话召回本 lane 时，`session_restore()`
+在扫描之前就把 KV 从 host slab 拷回了设备（`tp2_generation_core.cpp:6571`），随后扫描把这份活状态当作
+`LiveState` 报出来。那次 H2D 已经由 `context_cache.state_transfers` 计数，这里再报一次只会让两个数字打架。
+所以：`source` 只描述**状态镜像来自哪**，传输量归传输计数器。
+
+### 17.3 不变量
+
+合法的组合只有四对：`(None, NoAnchorAtOrBefore)`、`(Device, Used)`、`(HostSlab, Used)`、`(LiveState, Used)`。
+其余五对自相矛盾，在累加处断言：
 
 ```
-planning      request_plan.cpp:683   plan->summary.prefix_reuse_path = plan->reuse
-                                     （同处已知 plan->reuse_base / plan->selected_checkpoint）
-   │
-   ├─► engine_core.h:1657  BeginSummary → engine_core.h:866 → result.prefix_reuse_path
-   └─► engine_core.h:561   record_prefix_selection(summary)  ← 六个计数器读这里
-
-prefill.cpp:977 / tp2_generation_core.cpp:3830,5194 / generation_service.cpp:461 是结果侧的另一条支路
+reused_prompt_tokens > 0   ⟺   source != None
+source       != None       ⟺   reason == Used
 ```
 
-**下一步的准确落点**是 `request_plan.cpp:683`。已核实：`plan->selected_checkpoint` 的类型是
-`std::optional<runtime::CheckpointRef>`（`program_impl.h:218`），而
+今天两个轴是 1:1 的，`reason` 只多带一个 bit。**这是有意的成本**：`reason` 的存在理由是要长（超预算、
+存储在覆盖范围之外、媒体身份不符——2026-10-22 量到的 boundary tag 不匹配就是这一类），而 `source` 只有三种存储。
+第一个与 `source` 不再 1:1 的 reason 出现时，改写本节；在此之前**不许**从 `source` 反推 `reason`，
+也不许把 reason 列表当成 `source` 的别名。
+
+### 17.4 生命周期
+
+| | `source` | `reason` |
+|---|---|---|
+| 生产 | 执行器。TP-2：`scan_lane_reuse()` 把 `ReuseSource` 映射成公开枚举（`:3831`、`:5195`）。单卡：Program 侧 checkpoint 的驻留（**尚未接线**，见 §17.9） | `ReuseLedger::decide()` 的返回值（TP-2：`:2701`；单卡同样尚未接线） |
+| 定稿 | admit 之后、第一个 prefill chunk 之前；此后只读 | 同左 |
+| 载体 | `GenerationResult.reuse_source` | `GenerationResult.reuse_reason` |
+| 消费 | 每请求日志；累计计数器 | 同左 |
+| 终点 | 请求销毁 | 请求销毁 |
+
+**累加规则：计数器在请求完成时按 `GenerationResult` 累加，不在 plan 侧按 `RequestPlanSummary` 累加。**
+
+这是本节最重要的一条，理由可验证：
+
+1. `RequestPlanSummary.reusable_prompt_tokens` 是 plan 的**估计**。双卡上 core 用自己的扫描覆盖它
+   （`tp2_generation_core.cpp:3829`），单卡沿用 plan 值（`engine_core.h:865` ← `:1656`）：
+   同一个字段名下挂着两个来源。
+2. 双卡上客户端从 `GenerationStart.reused_prompt_tokens` 拿到的是 core 的实际值（`:3839`），
+   而 `record_prefix_selection()` 累加的是 plan 值——同一个请求会报出两个数。
+3. plan 阶段不知道 `reuse_source`（§17.5）。
+
+代价：plan 侧不再有"预计复用"这个观测点。需要它的时候另开名字（`planned_reuse_tokens`），不要复用
+`reused_prompt_tokens`。
+
+### 17.5 现状：TP-2 上这套指标恒为零
+
+实施时核对出来的事实，它解释了为什么"接线"反复打滑：
+
+- `TP2GenerationCore::runtime_stats()`（`tp2_generation_core.cpp:8906`）新建一个 `RuntimeStats`，
+  只填 `computed_prefill_tokens`、`committed_decode_tokens`、`decode_rounds`、`decode_row_rounds` 四个字段，
+  其余全默认 0；它不读 `cumulative_stats_`。
+- `Engine::runtime_stats()`（`engine.cpp:426`）直接 `return core->runtime_stats()`，**不做合并**。
+- 六个 `*_selections` 唯一的累加点是 `record_prefix_selection()`，它挂在 `engine_core.h:1549` 的
+  `EngineCore` admission 路径上；TP-2 由 `Tp2GenerationCore` 执行，走自己的 `PendingRequest` 队列与 driver。
+
+所以双卡上六个 `*_selections`、`reused_prompt_tokens`、`last_selected_frontier_tokens` **全是恒零**，
+它们今天只在单卡路线上有值。
+
+结论：这次不是"改名迁移"，是**首次给主路线装表**。定义因此必须先写（本节），再写代码。
+
+### 17.6 旧枚举是"角色"，不是"存储"
+
+`PrefixReusePath` 的五个非 `Root` 值区分的是**锚点的角色**（端点、轮次收尾、响应重放、长锚、共享稳定前缀），
+对应设计里的 `AnchorProvenance`（`PromptEnd/Divergence/Block/Grid/Generated`），而不是 `AnchorStorage`
+（`Device/Host`）。把它映射成 `Device/HostSlab/LiveState` 会丢信息，这是有意的：
+
+- 角色留在 trace 与 `AnchorProvenance`：`[tp2-reuse] src=...`、`[tp2-session] via=frontier|prompt-end|shared|boundary`；
+- 公开字段只报存储。理由：用户能观察到的是"重算了多少"，角色是引擎内部的事；而单卡的 `Private*` 词汇
+  （轮次收尾 / 响应重放 / 长锚）与 TP-2 的 `AnchorProvenance` 并不一一对应，硬凑一个公开枚举会变成第三种方言。
+
+对外映射只剩一条：
+
+| 旧 | 新 |
+|---|---|
+| `Root` | `(None, NoAnchorAtOrBefore)` |
+| 其余五个 | 只有 `source`，没有公开的 provenance 对等物 |
+
+代价要写清楚：`test_engine_prefix_real.cpp` 里 20+ 处 `Private*` 断言（§16.1）失去对等物，替代判据是
+"命中多少 token + 哪种存储"。这些断言在单卡上仍有约束力，所以删它们必须和单卡的 storage 接线同批做。
+
+### 17.7 计数器的形状
+
+`RuntimeStats` 增：
 
 ```cpp
-struct CheckpointRef {              // src/runtime/.../resources.h:214
-    CheckpointKind kind = CheckpointKind::SessionEndpoint;   // ← 判别依据
-    std::uint32_t frontier = 0;
-    std::uint32_t ordinal  = 0;      // LongAnchor 用非零 slot
-};
+// 复用决策：一个请求一条记录，两个轴。定义见 docs/maintainer/prefix-reuse.md §17。
+std::uint64_t reuse_source_device     = 0;
+std::uint64_t reuse_source_host_slab  = 0;
+std::uint64_t reuse_source_live_state = 0;
+std::uint64_t reuse_source_none       = 0;
+std::uint64_t reuse_reason_used       = 0;
+std::uint64_t reuse_reason_no_anchor  = 0;
+// 最近一次决策的观测（gauge，不做区间相减）。
+std::uint32_t last_reuse_tokens       = 0;
+ReuseSourceKind last_reuse_source     = ReuseSourceKind::None;
+ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 ```
 
-**更正**：`CheckpointKind` 是 `SessionEndpoint / TurnClosure / ResponseReplay / SharedStablePrefix / LongAnchor`，
-它描述的是**锚点的角色**，不是状态存放的位置。因此 plan 阶段**并不知道**状态来自 device 还是 host slab——
-那是运行期事实，只有 core 的 `lane_retention_[lane].reuse_source` 知道。
+`request_log.cpp` 用它替换 `context_cache.selections` 整块：
 
-这条改变了接线方案：`reuse_source` **不能**在 `request_plan.cpp:683` 填，它必须从结果侧（`GenerationResult`，
-已在 walk 两处填好）在"结果与统计同时可见"的位置回填，或让新计数器直接在完成时按结果累加，而不是走
-`record_prefix_selection(summary)`。`reuse_reason` 仍可在 plan 侧由 `plan->reuse == ReusePath::Root` 判定。
-
-三行落点：
-
-```cpp
-plan->summary.prefix_reuse_path = plan->reuse;
-plan->summary.reuse_reason      = plan->reuse == ReusePath::Root ? ReuseReasonKind::NoAnchorAtOrBefore
-                                                                : ReuseReasonKind::Used;
-plan->summary.reuse_source      = /* 由 plan->selected_checkpoint->kind 映射，PrivateEndpoint 归 LiveState */;
+```json
+"context_cache": {
+  "reuse": {
+    "by_source": {"device": 0, "host_slab": 0, "live_state": 0, "none": 0},
+    "by_reason": {"used": 0, "no_anchor_at_or_before": 0},
+    "reused_prompt_tokens": 0,
+    "last": {"tokens": 0, "source": "none", "reason": "no_anchor_at_or_before"}
+  }
+}
 ```
 
-其余四处（`RuntimeStats` 计数器、`record_prefix_selection()` 并行累加、两个 log writer、两个测试）都是机械接线。
+三条约束：
+
+1. 两个 partition 的和都等于区间内完成的请求数。单卡接线（§17.9）之前这条不成立，所以单卡上两个 partition
+   先保持全 0，而不是填一半。
+2. `last` 是 gauge；其余六个与 `reused_prompt_tokens` 是单调计数器，消费方照现有约定做区间相减。
+3. `report_has_activity()`（`http_server.cpp:84`）里六个旧计数器兼作"这条区间有没有发生事"的触发器之一。
+   删它们时必须换成新的六个，否则纯复用区间不再触发报告。
+
+### 17.8 明确不做的
+
+- **不按锚点 / 槽位 / per-lane 计数**：槽号会随分配器重排，锚点是内部对象；这些是 trace 的事。
+- **不报字节**：`context_cache.state_transfers` 已有 d2h/h2d/d2d 的 count/bytes/seconds，重复一份必然不同步。
+- **不按路线分桶**：一个进程只有一条路线，路线的区分在启动参数里。
+- **不把 `AnchorProvenance` 提升为公开字段**（§17.6）。
+- **不新增"预计复用"计数器**：真需要时叫 `planned_reuse_tokens`，别和 `reused_prompt_tokens` 混名。
+
+### 17.9 接线顺序
+
+1. `RuntimeStats` 加 §17.7 的字段（`include/ninfer/types.h`）。
+2. 两个执行器各自在自己的"事实定稿"处累加：TP-2 在 `computed_prefill_tokens_` 旁边（`:4083`、`:5461`、`:8031`），
+   单卡在 `finish_request`（`engine_core.h:853-895`）。
+3. 删 `record_prefix_selection()` 与 plan 侧那两行累加。
+4. 两个 log writer（`request_log.cpp`、`operational_log.cpp`）与 `report_has_activity()`。
+5. 测试：`test_request_log.cpp` 的 throughput 夹具、`test_resource_manager.cpp` 的断言。
+
+两个未定项，接线时决定：
+
+- **单卡的 `source` 怎么填**：`StateReplicaResidency`（`DeviceOnly/HostOnly/Both`，`request_plan.cpp:652`）是现成的判别依据，
+  `DeviceOnly → Device`、`HostOnly → HostSlab`；`Both` 归哪边未定（保守做法是 `HostSlab`，它一定经历过 H2D）。
+  定下来之前单卡的两个 partition 保持 0。
+- **catalog 召回之后算不算 `HostSlab`**：按 §17.2 的定义不算，扫描报 `LiveState`。如果运维想知道"这次请求是不是走了
+  catalog 召回"，那是 `[tp2-session] recall` 这条 trace 的事，不是这个字段的事。
