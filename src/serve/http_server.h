@@ -3,6 +3,7 @@
 #include "serve/generation_service.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
+#include "serve/request_capture.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -107,6 +108,8 @@ private:
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
+    // Diagnostic only: --capture-requests, disabled unless a directory was configured.
+    RequestCapture request_capture_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

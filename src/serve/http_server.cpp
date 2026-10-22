@@ -46,7 +46,7 @@ void ensure_openai_request_id(const httplib::Request& request, httplib::Response
 // here keeps the documented contract that a 413 means exactly "the raw request body exceeds
 // --max-request-mib".
 void buffer_request_body(const httplib::Request& request, httplib::Response& response,
-                         const httplib::ContentReader& content_reader,
+                         const httplib::ContentReader& content_reader, RequestCapture* capture,
                          const httplib::Server::Handler& handler) {
     httplib::Request buffered = request;
     buffered.body.clear();
@@ -57,6 +57,11 @@ void buffer_request_body(const httplib::Request& request, httplib::Response& res
     // An aborted read already carries httplib's own status (413 for the payload limit). Leaving it
     // alone lets the unrendered-error handler render the documented payload-limit envelope.
     if (!complete) { return; }
+    // Captured before the endpoint parses anything: the file has to record the bytes as delivered,
+    // not a round trip through the request model.
+    if (capture != nullptr) {
+        capture->write(buffered.path, RequestCapture::from_request(buffered), buffered.body);
+    }
     handler(buffered, response);
 }
 
@@ -241,7 +246,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)),
+      request_capture_(options_.capture_requests_dir) {
     // Thread-pool sizing is an invariant, not a tuning knob (P3.3). Two facts make it safe:
     //   * the thread that accepts connections is not a pool worker, so it never consumes a slot, and
     //   * admission control refuses work before the pool can fill: GenerationService's
@@ -369,18 +375,18 @@ void HttpServer::stop_stats_reporter() {
 }
 
 void HttpServer::register_post(const std::string& pattern, httplib::Server::Handler handler) {
-    server_.Post(pattern, [handler = std::move(handler)](const httplib::Request& request,
-                                                         httplib::Response& response,
-                                                         const httplib::ContentReader& reader) {
-        buffer_request_body(request, response, reader, handler);
+    server_.Post(pattern, [this, handler = std::move(handler)](
+                              const httplib::Request& request, httplib::Response& response,
+                              const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, &request_capture_, handler);
     });
 }
 
 void HttpServer::register_delete(const std::string& pattern, httplib::Server::Handler handler) {
-    server_.Delete(pattern, [handler = std::move(handler)](const httplib::Request& request,
-                                                           httplib::Response& response,
-                                                           const httplib::ContentReader& reader) {
-        buffer_request_body(request, response, reader, handler);
+    server_.Delete(pattern, [this, handler = std::move(handler)](
+                                const httplib::Request& request, httplib::Response& response,
+                                const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, &request_capture_, handler);
     });
 }
 

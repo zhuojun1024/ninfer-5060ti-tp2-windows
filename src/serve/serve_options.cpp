@@ -79,7 +79,7 @@ std::string serve_usage_text(const char* argv0) {
 "[--session-retention-floor N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--capture-requests DIR] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
@@ -100,6 +100,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --capture-requests writes one file per request (path, non-credential headers, raw\n"
+           "       body) so a live session can be replayed; off by default, diagnosis only\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -286,6 +288,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
+            }
+        } else if (arg == "--capture-requests") {
+            options.capture_requests_dir = require_value("--capture-requests");
+            if (options.capture_requests_dir.empty()) {
+                throw std::invalid_argument("--capture-requests must not be empty");
             }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),

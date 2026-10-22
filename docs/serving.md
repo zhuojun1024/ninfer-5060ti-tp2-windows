@@ -960,6 +960,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--capture-requests DIR` | diagnostic only: write one file per request (path, non-credential headers, raw body) so a live session can be replayed; off by default | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
@@ -1035,6 +1036,13 @@ Serve emits one warning with only the failure classification, never the generate
 in append mode and flushes every event, so successive model or MTP blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
+
+`--capture-requests DIR` is a separate diagnostic: it writes one file per request,
+`<seq>-<session>.json`, holding the request path, its headers (credentials removed) and the raw body
+text. The measurement log records outcomes and deliberately never carries prompt content, so a
+session can only be replayed from a capture. The directory is created if missing; a write failure
+disables capture with one `[capture]` line instead of failing the request. Capture stores whole
+conversation prompts, so enable it for one diagnostic run and delete the directory afterwards.
 
 Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within

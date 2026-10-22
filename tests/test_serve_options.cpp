@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -37,6 +38,8 @@ int main() {
                       "Vision item token ceiling default mismatch");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.capture_requests_dir.empty(),
+                      "request-body capture is enabled by default");
     failures += check(defaults.context_cost_presets.empty(),
                       "external context-cost presets are unexpectedly configured by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
@@ -252,6 +255,16 @@ int main() {
     failures += check(response_store.response_store_max_records == 42 &&
                           response_store.response_store_max_bytes == (8ULL << 20),
                       "Responses store limits did not reach serving options");
+
+    const ServeOptions capture =
+        parse({"ninfer-serve", "model.ninfer", "--capture-requests", "captures/run-1"});
+    failures += check(capture.capture_requests_dir == std::filesystem::path("captures/run-1"),
+                      "--capture-requests did not reach serving options");
+    bool empty_capture_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--capture-requests", ""});
+    } catch (const std::invalid_argument&) { empty_capture_rejected = true; }
+    failures += check(empty_capture_rejected, "--capture-requests accepted an empty directory");
 
     const ServeOptions sampling =
         parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
