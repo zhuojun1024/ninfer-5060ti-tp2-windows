@@ -683,6 +683,27 @@ planning      request_plan.cpp:683   plan->summary.prefix_reuse_path = plan->reu
 prefill.cpp:977 / tp2_generation_core.cpp:3830,5194 / generation_service.cpp:461 是结果侧的另一条支路
 ```
 
-**下一步的准确落点**是 `request_plan.cpp:683`：`reuse_reason` 可直接由 `plan->reuse == ReusePath::Root` 判定；
-`reuse_source` 需要把 `plan->selected_checkpoint` 归类为 Device / HostSlab（`PrivateEndpoint` 归 LiveState）——
-这需要先读该检查点的类型定义，确认它是否携带存储类别。**这是唯一未定的点**，其余四处都是机械接线。
+**下一步的准确落点**是 `request_plan.cpp:683`。已核实：`plan->selected_checkpoint` 的类型是
+`std::optional<runtime::CheckpointRef>`（`program_impl.h:218`），而
+
+```cpp
+struct CheckpointRef {              // src/runtime/.../resources.h:214
+    CheckpointKind kind = CheckpointKind::SessionEndpoint;   // ← 判别依据
+    std::uint32_t frontier = 0;
+    std::uint32_t ordinal  = 0;      // LongAnchor 用非零 slot
+};
+```
+
+`kind` 就是“这个检查点属于哪一类”的判别依据，**不需要新增字段**。剩下唯一未知是 `CheckpointKind` 的枚举全集
+（哪几个归 HostSlab、哪几个归 Device），一次 grep 即可确定。
+
+三行落点：
+
+```cpp
+plan->summary.prefix_reuse_path = plan->reuse;
+plan->summary.reuse_reason      = plan->reuse == ReusePath::Root ? ReuseReasonKind::NoAnchorAtOrBefore
+                                                                : ReuseReasonKind::Used;
+plan->summary.reuse_source      = /* 由 plan->selected_checkpoint->kind 映射，PrivateEndpoint 归 LiveState */;
+```
+
+其余四处（`RuntimeStats` 计数器、`record_prefix_selection()` 并行累加、两个 log writer、两个测试）都是机械接线。
