@@ -663,3 +663,26 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
   顺序不同，bit 级永远比不过；而 token id 全等正是用户能观察到的等价性。
 - **反例保护**：同一条 trace 走"从零 prefill"必须得到同一串 token id。若两条路径不等，先怀疑 `restore()` 的
   KV / 状态 / draft 三者不同步（§8.1 的失败面），而不是数值精度。
+
+---
+
+## 附：指标迁移（`PrefixReusePath` → `ReuseSourceKind`/`ReuseReasonKind`）的接线现状
+
+已落地（提交 `78790d9a`）：两个公开枚举、`GenerationResult` 与 `RequestPlanSummary` 的字段、`LaneReuse.reuse_reason`、
+walk 两处（`tp2_generation_core.cpp:3830` / `:5194`）的结果侧填充。构建通过，**但统计尚未读到**。
+
+数据流（已核实，三处写入、两个方向）：
+
+```
+planning      request_plan.cpp:683   plan->summary.prefix_reuse_path = plan->reuse
+                                     （同处已知 plan->reuse_base / plan->selected_checkpoint）
+   │
+   ├─► engine_core.h:1657  BeginSummary → engine_core.h:866 → result.prefix_reuse_path
+   └─► engine_core.h:561   record_prefix_selection(summary)  ← 六个计数器读这里
+
+prefill.cpp:977 / tp2_generation_core.cpp:3830,5194 / generation_service.cpp:461 是结果侧的另一条支路
+```
+
+**下一步的准确落点**是 `request_plan.cpp:683`：`reuse_reason` 可直接由 `plan->reuse == ReusePath::Root` 判定；
+`reuse_source` 需要把 `plan->selected_checkpoint` 归类为 Device / HostSlab（`PrivateEndpoint` 归 LiveState）——
+这需要先读该检查点的类型定义，确认它是否携带存储类别。**这是唯一未定的点**，其余四处都是机械接线。
