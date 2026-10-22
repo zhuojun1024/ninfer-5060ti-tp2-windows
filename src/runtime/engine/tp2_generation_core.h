@@ -230,6 +230,22 @@ private:
         // store on one lane must not advance where another lane writes next.
         std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_next{};
         std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_tail_next{};
+        // One state image covering every lane at the position its prompt stopped agreeing with that
+        // lane's history: the only anchor between the shared block boundary (where this conversation
+        // hits today) and the divergence, which is the 350 tokens every turn otherwise re-prefills.
+        // Allocated on first capture rather than at build time: an eager 147 MiB allocation was what
+        // destabilised startup, and the image is worth nothing until a second request asks for it.
+        std::unique_ptr<HostBuffer> reuse_boundary_state;
+        std::array<std::uint32_t, kTp2GenerationMaxConcurrency> reuse_boundary_position{};
+        // Session tag per lane, 0 meaning empty: a different conversation never loads the image.
+        std::array<std::uint64_t, kTp2GenerationMaxConcurrency> reuse_boundary_session{};
+        // FNV-1a of the eight tokens before the boundary. The image is the state of that prefix
+        // whatever conversation wrote it, so the tokens are the identity: a rewritten entry whose
+        // tokens changed must not load it. Zero means no image.
+        std::array<std::uint64_t, kTp2GenerationMaxConcurrency> reuse_boundary_tag{};
+        // The masked draft's context at the same position, allocated on first capture with the target
+        // half. A boundary without it cannot be loaded while DFlash2 runs.
+        std::unique_ptr<HostBuffer> reuse_boundary_dflash;
         std::unique_ptr<DeviceArena> workspace;
         Tensor prefill_hidden;
         // Workspace offset after the tensors that must survive every round scope (prefill_hidden and
@@ -807,12 +823,19 @@ private:
     // time the scan reads them.
     // Which frozen state a recall restores: the frontier the entry was evicted at, the end of the
     // prompt its last prefill walked, or the boundary another conversation diverged at.
-    enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared };
+    // Boundary: the lane-local image captured where the last prompt on this lane stopped agreeing
+    // with the lane's history. It is the only anchor between the shared block boundary and the
+    // divergence, and unlike the other three it belongs to the lane rather than to a session.
+    enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared, Boundary };
     [[nodiscard]] static LaneStateGeometry make_lane_state_geometry(const Shard& shard);
     // Copies the GDN state this lane's device slot holds right now into the ring slot the group
     // owns, tagged with the frontier it captures. A prefill writes these at its chunk boundaries and
     // the sweep that follows a completed prefill is what makes them usable; the prompt-end group is
     // written once by the publish of a completed (or cancelled) prefill instead.
+    // Freezes each lane's state at the position its prompt stopped agreeing with that lane's
+    // history, into the durable boundary image rather than the ring, which the request release
+    // discards. Lazy: the image is allocated on the first capture.
+    void capture_reuse_boundary(std::uint32_t lane);
     void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
                                   std::uint32_t lane);
     // Makes every checkpoint the lane's current prefill wrote usable. Only a completed prefill (or a
@@ -1042,6 +1065,11 @@ private:
         // evicted, so the next conversation that opens with the same block is recalled on the
         // boundary instead of prefilling the block again. Zero means the running lineage has none.
         std::uint32_t block_anchor_position   = 0;
+        // Where this request's prompt stopped agreeing with what the lane already held: the chunk
+        // that would step over it is clamped to end there, so the state captured sits exactly on the
+        // last token the next prompt may still share. Zero means nothing to capture.
+        std::uint32_t reuse_boundary_target = 0;
+        bool reuse_boundary_captured        = false;
         std::uint64_t block_anchor_prefill_id = 0;
         ReuseSource reuse_source              = ReuseSource::None;
         // The ring id the running prefill tags its new checkpoints with.
