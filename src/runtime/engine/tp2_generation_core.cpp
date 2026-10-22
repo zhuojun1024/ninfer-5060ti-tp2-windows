@@ -3828,12 +3828,10 @@ void TP2GenerationCore::execute_plain_batch(
 
         lane.result.reused_prompt_tokens = reuse;
         lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
-                lane.result.reuse_source         = lane_retention_[lane_id].reuse_source == ReuseSource::DeviceSnapshot ? ReuseSourceKind::Device
-                                                   : lane_retention_[lane_id].reuse_source == ReuseSource::HostCheckpoint ? ReuseSourceKind::HostSlab
-                                                   : lane_retention_[lane_id].reuse_source == ReuseSource::LiveState      ? ReuseSourceKind::LiveState
-                                                                                                                          : ReuseSourceKind::None;
-                lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used ? ReuseReasonKind::Used
-                                                                                                : ReuseReasonKind::NoAnchorAtOrBefore;
+        lane.result.reuse_source         = reuse_source_kind(lane_retention_[lane_id].reuse_source);
+        lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used
+                                               ? ReuseReasonKind::Used
+                                               : ReuseReasonKind::NoAnchorAtOrBefore;
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -4081,6 +4079,7 @@ void TP2GenerationCore::execute_plain_batch(
         // evict that entry and shift every later index.
         if (anchor_divergence) { capture_lane_anchor_frozen(lane_id, anchor_position); }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
+        record_reuse(lane.result);
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
         lane.prefilled = true;
         lane.finished = first_token_finish != FinishReason::None;
@@ -5190,14 +5189,12 @@ void TP2GenerationCore::execute_spec_batch(
         // The device state still stands on the boundary this lane inherited, so freeze it before the
         // first chunk overwrites it.
         capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
-        lane.result.reused_prompt_tokens           = reuse;
-        lane.result.prefix_reuse_path              = reuse_path(reuse, anchors.block_frontier, lane_id);
-                lane.result.reuse_source                   = lane_retention_[lane_id].reuse_source == ReuseSource::DeviceSnapshot ? ReuseSourceKind::Device
-                                                             : lane_retention_[lane_id].reuse_source == ReuseSource::HostCheckpoint ? ReuseSourceKind::HostSlab
-                                                             : lane_retention_[lane_id].reuse_source == ReuseSource::LiveState      ? ReuseSourceKind::LiveState
-                                                                                                                                    : ReuseSourceKind::None;
-                lane.result.reuse_reason                   = lane_reuse.reuse_reason == ReuseReason::Used ? ReuseReasonKind::Used
-                                                                                                         : ReuseReasonKind::NoAnchorAtOrBefore;
+        lane.result.reused_prompt_tokens = reuse;
+        lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
+        lane.result.reuse_source         = reuse_source_kind(lane_retention_[lane_id].reuse_source);
+        lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used
+                                               ? ReuseReasonKind::Used
+                                               : ReuseReasonKind::NoAnchorAtOrBefore;
         if (lane.pending->sink != nullptr) {
             lane.pending->sink->start(
                 GenerationStart{.prompt = request.summary, .reused_prompt_tokens = reuse});
@@ -5459,6 +5456,7 @@ void TP2GenerationCore::execute_spec_batch(
         // evict that entry and shift every later index.
         if (anchor_divergence) { capture_lane_anchor_frozen(lane_id, anchor_position); }
         computed_prefill_tokens_ += lane.prompt_tokens - reuse;
+        record_reuse(lane.result);
         publish_lane_prefill(lane_id, lane.prompt_tokens, tokens, prompt_media, data.context_cache);
         lane.prefilled = true;
         lane.finished   = first_token_finish != FinishReason::None;
@@ -7032,6 +7030,17 @@ PrefixReusePath TP2GenerationCore::reuse_path(std::uint32_t reuse,
     return PrefixReusePath::PrivateLongAnchor;
 }
 
+// The scan's internal source in the published vocabulary (§17 of docs/maintainer/prefix-reuse.md).
+ReuseSourceKind TP2GenerationCore::reuse_source_kind(ReuseSource source) noexcept {
+    switch (source) {
+    case ReuseSource::DeviceSnapshot: return ReuseSourceKind::Device;
+    case ReuseSource::HostCheckpoint: return ReuseSourceKind::HostSlab;
+    case ReuseSource::LiveState: return ReuseSourceKind::LiveState;
+    case ReuseSource::None: break;
+    }
+    return ReuseSourceKind::None;
+}
+
 // Copies the GDN state this lane's device slot holds right now into the ring slot the group owns,
 // tagged with the frontier it captures. It rides the shard stream, so it sees exactly the tokens the
 // enclosing loop has enqueued and none of the later ones, and the ring slot it lands in is only
@@ -7569,6 +7578,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     result.reused_prompt_tokens   = reuse;
     result.prefix_reuse_path =
         reuse_path(reuse, data.context_cache.leading_instruction_frontier.value_or(0), lane);
+    // The serial walk finds its own boundary instead of asking the ledger, so the one fact it
+    // establishes is whether it reused at all. Filling both axes here keeps them defined on this
+    // route too, which is what record_reuse() checks before counting either of them.
+    result.reuse_source = reuse_source_kind(lane_state.reuse_source);
+    result.reuse_reason = reuse != 0 ? ReuseReasonKind::Used : ReuseReasonKind::NoAnchorAtOrBefore;
 
     // Sampling config, device-resident, for ops::sample.
     ops::SamplingConfig sampling_config = make_sampling_config(request.sampling);
@@ -8029,6 +8043,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         walk_done = Clock::now();
     }
     computed_prefill_tokens_ += prompt_tokens - reuse;
+    record_reuse(result);
     if (vision_session) {
         // Every item the walk overlapped is encoded and its embeddings are in the KV now, so release
         // the host patch payloads and the handoff binding: the decode loop never revisits them.
@@ -8903,8 +8918,36 @@ std::vector<float> TP2GenerationCore::score(qwen::PreparedPrompt&& prompt,
     return output;
 }
 
+void TP2GenerationCore::record_reuse(const GenerationResult& result) {
+    // The two axes partition one population, so a record that names a storage without naming a use,
+    // or a use without a storage, is a broken producer rather than a request worth counting.
+    const bool served = result.reuse_source != ReuseSourceKind::None;
+    if ((result.reused_prompt_tokens > 0) != served ||
+        served != (result.reuse_reason == ReuseReasonKind::Used)) {
+        throw std::logic_error("reuse record contradicts itself: tokens=" +
+                               std::to_string(result.reused_prompt_tokens) + " source=" +
+                               std::to_string(static_cast<int>(result.reuse_source)) + " reason=" +
+                               std::to_string(static_cast<int>(result.reuse_reason)));
+    }
+    switch (result.reuse_source) {
+    case ReuseSourceKind::Device: ++reuse_stats_.reuse_source_device; break;
+    case ReuseSourceKind::HostSlab: ++reuse_stats_.reuse_source_host_slab; break;
+    case ReuseSourceKind::LiveState: ++reuse_stats_.reuse_source_live_state; break;
+    case ReuseSourceKind::None: ++reuse_stats_.reuse_source_none; break;
+    }
+    if (result.reuse_reason == ReuseReasonKind::Used) {
+        ++reuse_stats_.reuse_reason_used;
+    } else {
+        ++reuse_stats_.reuse_reason_no_anchor;
+    }
+    reuse_stats_.reused_prompt_tokens += result.reused_prompt_tokens;
+    reuse_stats_.last_reuse_tokens = result.reused_prompt_tokens;
+    reuse_stats_.last_reuse_source = result.reuse_source;
+    reuse_stats_.last_reuse_reason = result.reuse_reason;
+}
+
 RuntimeStats TP2GenerationCore::runtime_stats() const {
-    RuntimeStats stats;
+    RuntimeStats stats            = reuse_stats_;
     stats.computed_prefill_tokens = computed_prefill_tokens_;
     stats.committed_decode_tokens = committed_decode_tokens_;
     stats.decode_rounds           = decode_rounds_;

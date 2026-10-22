@@ -836,6 +836,10 @@ private:
     // history, into the durable boundary image rather than the ring, which the request release
     // discards. Lazy: the image is allocated on the first capture.
     void capture_reuse_boundary(std::uint32_t lane);
+    // One reuse record per lane whose prefill reached its first token, taken from the result the walk
+    // published rather than from the request plan: the plan's estimate is not what the request did.
+    // Called beside each `computed_prefill_tokens_ += ...`, so both counters cover one population.
+    void record_reuse(const GenerationResult& result);
     void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
                                   std::uint32_t lane);
     // Makes every checkpoint the lane's current prefill wrote usable. Only a completed prefill (or a
@@ -1026,6 +1030,11 @@ private:
     // a recall, or the tail of a conversation that just decoded - so nothing is copied at all.
     enum class ReuseSource : std::uint8_t { None, DeviceSnapshot, HostCheckpoint, LiveState };
 
+    // The scan's internal source in the published vocabulary. One mapping for every walk: a lane that
+    // served a prefix and reported a different storage than the one it restored from would make the
+    // counters describe a route nobody ran.
+    [[nodiscard]] static ReuseSourceKind reuse_source_kind(ReuseSource source) noexcept;
+
     // Per-lane retention state (tp2-plan-concurrency.md P2.3). The single-lane walk drives slot 0;
     // the batched executors drive one slot per active lane. Everything a lane needs in order to know
     // what prefix it may reuse lives here, because a lane's device state is its own slot in the
@@ -1186,6 +1195,9 @@ private:
     std::uint64_t computed_prefill_tokens_ = 0;
     std::uint64_t committed_decode_tokens_ = 0;
     std::uint64_t decode_rounds_           = 0;
+    // The reuse half of runtime_stats(), accumulated by record_reuse(). Kept as a RuntimeStats so the
+    // field list is written once; the counters above are read separately.
+    RuntimeStats reuse_stats_;
 };
 
 } // namespace ninfer::runtime

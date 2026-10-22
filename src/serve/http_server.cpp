@@ -102,6 +102,12 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.private_long_anchor_selections ||
            report.current.shared_stable_prefix_selections !=
                report.previous.shared_stable_prefix_selections ||
+           report.current.reuse_source_device != report.previous.reuse_source_device ||
+           report.current.reuse_source_host_slab != report.previous.reuse_source_host_slab ||
+           report.current.reuse_source_live_state != report.previous.reuse_source_live_state ||
+           report.current.reuse_source_none != report.previous.reuse_source_none ||
+           report.current.reuse_reason_used != report.previous.reuse_reason_used ||
+           report.current.reuse_reason_no_anchor != report.previous.reuse_reason_no_anchor ||
            report.current.state_moves != report.previous.state_moves ||
            report.current.state_forks != report.previous.state_forks ||
            report.current.state_restores != report.previous.state_restores ||

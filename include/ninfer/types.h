@@ -771,7 +771,9 @@ enum class PrefixReusePath : std::uint8_t {
 
 // Which kind of anchor served a request's prefix, and whether one was found at all. These replace
 // PrefixReusePath in the redesign: a request is described by where its state came from and by why the
-// decision went the way it did, not by naming one of five internal sub-rings.
+// decision went the way it did, not by naming one of five internal sub-rings. A request that reused
+// names a source and reason Used; one that did not names neither. Definitions:
+// docs/maintainer/prefix-reuse.md §17.
 enum class ReuseSourceKind : std::uint8_t {
     None,
     Device,
@@ -783,6 +785,26 @@ enum class ReuseReasonKind : std::uint8_t {
     Used,
     NoAnchorAtOrBefore,
 };
+
+[[nodiscard]] inline constexpr const char*
+reuse_source_kind_name(ReuseSourceKind source) noexcept {
+    switch (source) {
+    case ReuseSourceKind::None: return "none";
+    case ReuseSourceKind::Device: return "device";
+    case ReuseSourceKind::HostSlab: return "host_slab";
+    case ReuseSourceKind::LiveState: return "live_state";
+    }
+    return "none";
+}
+
+[[nodiscard]] inline constexpr const char*
+reuse_reason_kind_name(ReuseReasonKind reason) noexcept {
+    switch (reason) {
+    case ReuseReasonKind::Used: return "used";
+    case ReuseReasonKind::NoAnchorAtOrBefore: return "no_anchor_at_or_before";
+    }
+    return "no_anchor_at_or_before";
+}
 // Why bounded pressure planning stopped for the materialization decision committed to one request.
 enum class MaterializationStopReason : std::uint8_t {
     NoPressure,
@@ -1001,6 +1023,21 @@ struct RuntimeStats {
     std::uint64_t shared_stable_prefix_selections    = 0;
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
+
+    // Which storage served a reused prefix, and why the decision went as it did: one record per
+    // completed prefill, two axes. A request that reused names a non-None source and reason Used; one
+    // that did not names neither. Counted where the route's own prefill accounting is counted, so the
+    // tokens here and in `computed_prefill_tokens` cover the same population.
+    std::uint64_t reuse_source_device     = 0;
+    std::uint64_t reuse_source_host_slab  = 0;
+    std::uint64_t reuse_source_live_state = 0;
+    std::uint64_t reuse_source_none       = 0;
+    std::uint64_t reuse_reason_used       = 0;
+    std::uint64_t reuse_reason_no_anchor  = 0;
+    // The last decision observed, for a log line rather than an interval.
+    std::uint32_t last_reuse_tokens       = 0;
+    ReuseSourceKind last_reuse_source     = ReuseSourceKind::None;
+    ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

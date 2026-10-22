@@ -676,7 +676,8 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 统计单位是请求，不是 lane，不是锚点，不是字节。
 
 - TP-2 一个 round 批两个 lane ⇒ 两条记录。
-- 已 admit、随后被取消的请求**要计**：它省下的 prefill 是真实省下的。
+- prefill 走完第一个 chunk 的请求**要计**，prefill 中途被取消的**不计**。口径与 `computed_prefill_tokens`
+  完全一致（两者在同一个位置累加），所以"重算的 token"与"复用的 token"永远来自同一批请求，比值才有意义。
 - 排队期就被丢弃的请求**不计**：它从未看过锚点。
 - 一个请求只产生一条记录：扫描在第一个 chunk 之前做一次，此后的 chunk 不再重算。
 
@@ -687,14 +688,15 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 | `source` | `ReuseSourceKind` | `None` / `Device` / `HostSlab` / `LiveState` | 状态从哪种存储来 |
 | `reason` | `ReuseReasonKind` | `Used` / `NoAnchorAtOrBefore` | 决策为什么是它 |
 
-`source` 的准确含义（写死，不靠字面猜）：
+`source` 的准确含义（写死，不靠字面猜）。四个值都由 core 的扫描产生：批量路径是 `scan_lane_reuse()`，
+串行路径是 `execute_walk()` 里的内联扫描，两者经同一个 `reuse_source_kind()` 映射。
 
-| 值 | 含义 | 生产点 |
-|---|---|---|
-| `Device` | 状态从一张绑在本 lane 上的设备镜像恢复（`ReuseSource::DeviceSnapshot`）：KV 本来就在设备上，只有 GDN 状态做了一次 D2D | `scan_lane_reuse` |
-| `HostSlab` | 状态从 host 镜像恢复（`ReuseSource::HostCheckpoint`）：有 D2H → H2D 往返 | `scan_lane_reuse` |
-| `LiveState` | lane 的活状态本来就停在这个前沿，**没有从镜像槽恢复过状态** | `scan_lane_reuse` |
-| `None` | 共享前缀上没有锚点，从 token 0 全量 prefill | `scan_lane_reuse` |
+| 值 | 含义 |
+|---|---|
+| `Device` | 状态从一张绑在本 lane 上的设备镜像恢复（`ReuseSource::DeviceSnapshot`）：KV 本来就在设备上，只有 GDN 状态做了一次 D2D |
+| `HostSlab` | 状态从 host 镜像恢复（`ReuseSource::HostCheckpoint`）：有 D2H → H2D 往返 |
+| `LiveState` | lane 的活状态本来就停在这个前沿，**没有从镜像槽恢复过状态** |
+| `None` | 共享前缀上没有锚点，从 token 0 全量 prefill |
 
 `LiveState` 有一条必须写下来的边界：它**不承诺零拷贝**。会话目录把别的会话召回本 lane 时，`session_restore()`
 在扫描之前就把 KV 从 host slab 拷回了设备（`tp2_generation_core.cpp:6571`），随后扫描把这份活状态当作
@@ -720,7 +722,7 @@ source       != None       ⟺   reason == Used
 
 | | `source` | `reason` |
 |---|---|---|
-| 生产 | 执行器。TP-2：`scan_lane_reuse()` 把 `ReuseSource` 映射成公开枚举（`:3831`、`:5195`）。单卡：Program 侧 checkpoint 的驻留（**尚未接线**，见 §17.9） | `ReuseLedger::decide()` 的返回值（TP-2：`:2701`；单卡同样尚未接线） |
+| 生产 | 执行器。TP-2 两处扫描都经 `reuse_source_kind()` 映射：批量路径 `scan_lane_reuse()`、串行路径 `execute_walk()`。单卡：Program 侧 checkpoint 的驻留（**尚未接线**，见 §17.9） | 批量路径取 `ReuseLedger::decide()` 的返回值（`:2701`）；串行路径尚未接 ledger，由 `reuse != 0` 判定。单卡同样尚未接线 |
 | 定稿 | admit 之后、第一个 prefill chunk 之前；此后只读 | 同左 |
 | 载体 | `GenerationResult.reuse_source` | `GenerationResult.reuse_reason` |
 | 消费 | 每请求日志；累计计数器 | 同左 |
@@ -814,6 +816,8 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 2. `last` 是 gauge；其余六个与 `reused_prompt_tokens` 是单调计数器，消费方照现有约定做区间相减。
 3. `report_has_activity()`（`http_server.cpp:84`）里六个旧计数器兼作"这条区间有没有发生事"的触发器之一。
    删它们时必须换成新的六个，否则纯复用区间不再触发报告。
+4. `context_cache.selections` 整块保留到单卡接线（§17.9 第 3 步）为止。过渡期内它只有单卡有值、`reuse`
+   只有双卡有值，两者不会同时有意义——这是允许的并存，不是两个口径。
 
 ### 17.8 明确不做的
 
@@ -839,3 +843,12 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
   定下来之前单卡的两个 partition 保持 0。
 - **catalog 召回之后算不算 `HostSlab`**：按 §17.2 的定义不算，扫描报 `LiveState`。如果运维想知道"这次请求是不是走了
   catalog 召回"，那是 `[tp2-session] recall` 这条 trace 的事，不是这个字段的事。
+
+**已执行（2026-10-22，TP-2 侧）**：第 1、2、4 步的 TP-2 一半完成——`RuntimeStats` 的字段、两处扫描的
+`ReuseSourceKind`/`ReuseReasonKind` 填充、`record_reuse()` 在三个 `computed_prefill_tokens_` 旁累加、
+`request_log.cpp` 的 `context_cache.reuse` 块、`report_has_activity()` 的六个新触发器。第 3 步与单卡侧按上面
+两个未定项推迟，`context_cache.selections` 因此暂时保留。
+
+构建通过；`test_request_log` 新增的 `reuse` 断言通过，`test_resource_manager`、`test_engine_options` 通过。
+**双卡端到端未验证**：复现脚本在这台机器上启动即崩（`--devices 0,1` 时 `nvidia-smi` 报 index 1 是计算能力 7.5 的
+Tesla T10，而路线按 `sm_120a` 编译），同一次会话里 HEAD 的二进制也以同样方式崩过 4/6，故不作为回归判据。

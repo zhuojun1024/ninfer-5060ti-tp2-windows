@@ -590,6 +590,17 @@ int main() {
     throughput.current.device_state_occupied_images      = 3;
     throughput.current.host_state_occupied_images        = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
+    throughput.previous.reused_prompt_tokens            = 400;
+    throughput.previous.reuse_source_none               = 1;
+    throughput.current.reused_prompt_tokens             = 1000;
+    throughput.current.reuse_source_device              = 2;
+    throughput.current.reuse_source_live_state          = 1;
+    throughput.current.reuse_source_none                = 1;
+    throughput.current.reuse_reason_used                = 3;
+    throughput.current.reuse_reason_no_anchor           = 1;
+    throughput.current.last_reuse_tokens                = 640;
+    throughput.current.last_reuse_source                = ninfer::ReuseSourceKind::HostSlab;
+    throughput.current.last_reuse_reason                = ninfer::ReuseReasonKind::Used;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
     throughput.current.pressure_checkpoints_dropped     = 1;
@@ -690,6 +701,21 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
+    failures += check(
+        throughput_json.at("context_cache").at("reuse").at("by_source").at("device") == 2 &&
+            throughput_json.at("context_cache").at("reuse").at("by_source").at("host_slab") == 0 &&
+            throughput_json.at("context_cache").at("reuse").at("by_source").at("live_state") == 1 &&
+            throughput_json.at("context_cache").at("reuse").at("by_source").at("none") == 0 &&
+            throughput_json.at("context_cache").at("reuse").at("by_reason").at("used") == 3 &&
+            throughput_json.at("context_cache")
+                    .at("reuse")
+                    .at("by_reason")
+                    .at("no_anchor_at_or_before") == 1 &&
+            throughput_json.at("context_cache").at("reuse").at("reused_prompt_tokens") == 600 &&
+            throughput_json.at("context_cache").at("reuse").at("last").at("tokens") == 640 &&
+            throughput_json.at("context_cache").at("reuse").at("last").at("source") == "host_slab" &&
+            throughput_json.at("context_cache").at("reuse").at("last").at("reason") == "used",
+        "reuse records per source and reason are missing or not interval-scoped");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
