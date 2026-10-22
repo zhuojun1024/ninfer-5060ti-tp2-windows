@@ -475,12 +475,25 @@ FP8 AllReduce（`NINFER_TP2_AR_CODEC=bf16` 后所有复用数字一位不差，�
 不要走 ring：`release_lane_kv` 每请求清环（见上），任何 lane 内镜像都活不过一个请求。
 
 **历史（已作废，结论保留）**：本方案先按"每会话一块 slab"设计过，因内存账不可接受（28% 预算、会话数 39→30）改为按 lane。
-实施期间观察到的 "starting engine 之后 0xC0000005" 经同一二进制两次复跑确认是**启动阶段的偶发失败**
-（GPU 初始化争用或上一进程未完全释放设备），与新增分配无关，期间所有二分结论作废。
+实施期间观察到的 "starting engine 之后 0xC0000005" 一度被判为"启动阶段的偶发失败 / 连续重启的设备释放窗口重叠"，
+夹具靠启动前等 15 秒规避。
 
-后续定位（同日）：崩溃点固定在 allreduce codec 那一行之后、任何分配打印之前，属于**设备初始化**阶段。夹具在每次启动前加
-15 秒让驱动释放设备的等待后，连续两次运行均正常且输出逐位一致，而此前不加等待时多次复现。因此判断为**连续重启时与上一个进程的设备释放窗口重叠**。
-未在产品侧修复（一次快速重启仍可能崩），夹具用等待规避。
+**2026-10-22 复核：那个解释不成立。** 空机冷启、等待 90 秒、隐藏第三张卡（`CUDA_VISIBLE_DEVICES=0,1`）、关掉内核内 allreduce
+（`NINFER_TP2_AR_FORCE_HOST_STAGING=1`）、换 codec（`NINFER_TP2_AR_CODEC=bf16`）、关看门狗，全部照样复现；与命令行参数
+无关，最小命令 `--devices 0,1 --max-context 16384` 同样崩。`--devices` 的序号也确认无误：CUDA 默认 best-first 枚举为
+`0/1 = 两张 5060 Ti、2 = Tesla T10`，`nvidia-smi -L` 的 PCI 顺序不同，不能拿来判序号。
+
+已确认的事实（`ninfer-serve` 4/4 失败，崩溃时刻 0.4 s / 0.8 s / 29 s 三种）：
+
+- 崩溃指令在 `nvcuda64.dll` / `nvcudart_hybrid64.dll` 内部，异常恒为 `0xC0000005`：一次 `info0=8 data=0`（跳到地址 0），
+  其余是读一个畸形指针（低 32 位固定 `0xa4fa`、高 32 位每次不同），形态像是驱动侧分配器的链表被打断；
+- 调用链固定为 `TP2GenerationCore` → `materialize_model_tp2` → `tp::materialize_tp2` → `tp_init` →
+  `DeviceArena::DeviceArena` → `cudaMalloc`；另一种落在 `build_shard` 里；
+- **分开都正常，按产品顺序串起来就崩**：`test_tp2_load`（直接 `materialize_model_tp2`，不建 `DevicePair`）4/4 通过；
+  `test_tp_device_pair`（建 `DevicePair` 并跑集合通信，不 materialize）通过；`ninfer-serve`（先 `DevicePair` 再 materialize）0/4 通过。
+
+因此根因在 **`DevicePair` 构造后留下的状态：它使随后的第一次 `cudaMalloc` 在驱动内部崩溃**。未修复。下一步应在一个不经过 HTTP 的
+最小程序里把这两步串起来复现，再对 `DevicePair` 里的 peer access / 映射分配 / 通道单元格逐个二分。
 方案 B 随后改为**惰性分配**（首次捕获时才申请），实测正常：捕获到 `pos=21641 / 21667 / 21825`，正是每轮的一致点，
 比共享块边界 21,504 深 137–321 token。**但 recall 尚未把它当候选**，所以复用数字仍是 21,504。
 
@@ -850,5 +863,5 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 两个未定项推迟，`context_cache.selections` 因此暂时保留。
 
 构建通过；`test_request_log` 新增的 `reuse` 断言通过，`test_resource_manager`、`test_engine_options` 通过。
-**双卡端到端未验证**：复现脚本在这台机器上启动即崩（`--devices 0,1` 时 `nvidia-smi` 报 index 1 是计算能力 7.5 的
-Tesla T10，而路线按 `sm_120a` 编译），同一次会话里 HEAD 的二进制也以同样方式崩过 4/6，故不作为回归判据。
+**双卡端到端未验证**：复现脚本在这台机器上启动即崩（见 §12 历史那条的 2026-10-22 复核：与本次改动无关，
+但也没有修好），所以这次改动在双卡上没有跑过一次真实请求。
