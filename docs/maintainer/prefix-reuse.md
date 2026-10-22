@@ -694,8 +694,13 @@ struct CheckpointRef {              // src/runtime/.../resources.h:214
 };
 ```
 
-`kind` 就是“这个检查点属于哪一类”的判别依据，**不需要新增字段**。剩下唯一未知是 `CheckpointKind` 的枚举全集
-（哪几个归 HostSlab、哪几个归 Device），一次 grep 即可确定。
+**更正**：`CheckpointKind` 是 `SessionEndpoint / TurnClosure / ResponseReplay / SharedStablePrefix / LongAnchor`，
+它描述的是**锚点的角色**，不是状态存放的位置。因此 plan 阶段**并不知道**状态来自 device 还是 host slab——
+那是运行期事实，只有 core 的 `lane_retention_[lane].reuse_source` 知道。
+
+这条改变了接线方案：`reuse_source` **不能**在 `request_plan.cpp:683` 填，它必须从结果侧（`GenerationResult`，
+已在 walk 两处填好）在"结果与统计同时可见"的位置回填，或让新计数器直接在完成时按结果累加，而不是走
+`record_prefix_selection(summary)`。`reuse_reason` 仍可在 plan 侧由 `plan->reuse == ReusePath::Root` 判定。
 
 三行落点：
 
