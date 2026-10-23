@@ -760,7 +760,11 @@ struct ThinkingBudgetStats {
     bool applied                  = false;
 };
 
-enum class PrefixReusePath : std::uint8_t {
+// How a request's prefill stood on state it did not generate. This is the single-GPU program's own
+// routing vocabulary - what `is_rewrite_checkpoint_restore()` and the planning code switch on - not
+// a storage label, which is why it is named for the restore it describes rather than for the cache
+// it reads (docs/maintainer/prefix-reuse.md 17.6).
+enum class RestorePath : std::uint8_t {
     Root,
     PrivateEndpoint,
     PrivateTurnClosure,
@@ -769,11 +773,10 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
-// Which kind of anchor served a request's prefix, and whether one was found at all. These replace
-// PrefixReusePath in the redesign: a request is described by where its state came from and by why the
-// decision went the way it did, not by naming one of five internal sub-rings. A request that reused
-// names a source and reason Used; one that did not names neither. Definitions:
-// docs/maintainer/prefix-reuse.md §17.
+// Which kind of anchor served a request's prefix, and whether one was found at all. This is the
+// redesign's decision report - where the state came from and why the decision went the way it did -
+// rather than a role inside a prefill program. A request that reused names a source and reason
+// Used; one that did not names neither. Definitions: docs/maintainer/prefix-reuse.md 17.
 enum class ReuseSourceKind : std::uint8_t {
     None,
     Device,
@@ -905,8 +908,11 @@ struct GenerationResult {
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
-    // The decision in the redesign's own terms, filled beside the legacy path.
+    // How the prefill stood on state it did not generate. The single-GPU route fills it from its
+    // own restore decisions; the TP-2 route reports the same fact through reuse_source/reuse_reason
+    // and leaves this at Root.
+    RestorePath restore_path = RestorePath::Root;
+    // The decision in the redesign's own terms, filled beside the path above.
     ReuseSourceKind reuse_source       = ReuseSourceKind::None;
     ReuseReasonKind reuse_reason       = ReuseReasonKind::NoAnchorAtOrBefore;
     MaterializationDiagnostics materialization;

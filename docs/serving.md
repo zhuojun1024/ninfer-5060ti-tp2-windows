@@ -1194,7 +1194,7 @@ Compatible prefixes are reused for both text and multimodal histories unless the
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
 skips Vision execution, while new suffix media is encoded normally. The pretty completion record
 shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
-`prefix_cache_hit_tokens` and `prefix_reuse_path` fields. Machine paths are `root`,
+`prefix_cache_hit_tokens` and `restore_path` fields. Machine paths are `root`,
 `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, and
 `shared_stable_prefix`. Reuse validation covers KV, recurrent state, hidden state, selected-backend
 state, and the exact prompt frontier. With stable `preserve_thinking=true`, the auxiliary checkpoint
@@ -1209,7 +1209,7 @@ reasoning without discarding the preceding conversation.
 checkpoints remain reusable across a mode change. If the desired boundary is behind the selected
 reuse frontier and has no snapshot, the Engine keeps the valid hit and defers the new checkpoint. A
 later request that diverges before every retained checkpoint starts from root. The JSONL completion
-record exposes the restored checkpoint as `prefix_reuse_path`. Reasoning-effort changes participate
+record exposes the restored checkpoint as `restore_path`. Reasoning-effort changes participate
 in rendered-token identity and exact-prefix selection.
 
 An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior

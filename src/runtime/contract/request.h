@@ -59,7 +59,7 @@ struct RequestPlanSummary {
     // be read at once until the old one goes.
     ReuseSourceKind reuse_source = ReuseSourceKind::None;
     ReuseReasonKind reuse_reason = ReuseReasonKind::NoAnchorAtOrBefore;
-    PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
+    RestorePath restore_path              = RestorePath::Root;
     std::uint64_t service_work_quanta     = 0;
     bool publish_continuation             = true;
 };

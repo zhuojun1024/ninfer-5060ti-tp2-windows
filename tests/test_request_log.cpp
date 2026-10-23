@@ -376,7 +376,7 @@ int main() {
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.metrics.restore_path            = ninfer::RestorePath::PrivateTurnClosure;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
                   .engine_boundary_exposed_seconds      = 0.001,
@@ -436,7 +436,7 @@ int main() {
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "computed prefill tokens missing");
-    failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
+    failures += check(done.at("result").at("restore_path") == "private_turn_closure",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
@@ -452,12 +452,11 @@ int main() {
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
-    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::PrivateResponseReplay;
+    outcome.metrics.restore_path = ninfer::RestorePath::PrivateResponseReplay;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
-    failures +=
-        check(response_restore.at("result").at("prefix_reuse_path") == "private_response_replay",
-              "response checkpoint reuse path missing");
+    failures += check(response_restore.at("result").at("restore_path") == "private_response_replay",
+                      "response checkpoint reuse path missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");

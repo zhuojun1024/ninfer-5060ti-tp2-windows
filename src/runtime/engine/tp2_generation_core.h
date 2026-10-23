@@ -526,9 +526,8 @@ private:
     // Names the boundary the prefix scan accepted in the checkpoint vocabulary the Engine already
     // publishes, so a serve log can tell an exact endpoint apart from a fall-back behind the answer
     // this lineage generated.
-    [[nodiscard]] PrefixReusePath reuse_path(std::uint32_t reuse,
-                                             std::uint32_t block_frontier,
-                                             std::uint32_t lane) const noexcept;
+    [[nodiscard]] RestorePath reuse_path(std::uint32_t reuse, std::uint32_t block_frontier,
+                                         std::uint32_t lane) const noexcept;
 
     void build_shard(Shard& shard, int shard_index);
 

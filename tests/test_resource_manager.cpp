@@ -17,7 +17,7 @@
 
 namespace {
 
-using ninfer::PrefixReusePath;
+using ninfer::RestorePath;
 using ninfer::RuntimeStats;
 using ninfer::runtime::CancellationFlagView;
 using ninfer::runtime::CheckpointKind;
@@ -676,24 +676,24 @@ public:
             plan.value.reusable_prompt_tokens = checkpoint->frontier;
             switch (checkpoint->kind) {
             case CheckpointKind::SessionEndpoint:
-                plan.value.prefix_reuse_path = PrefixReusePath::PrivateEndpoint;
+                plan.value.restore_path = RestorePath::PrivateEndpoint;
                 break;
             case CheckpointKind::TurnClosure:
-                plan.value.prefix_reuse_path = PrefixReusePath::PrivateTurnClosure;
+                plan.value.restore_path = RestorePath::PrivateTurnClosure;
                 break;
             case CheckpointKind::ResponseReplay:
-                plan.value.prefix_reuse_path = PrefixReusePath::PrivateResponseReplay;
+                plan.value.restore_path = RestorePath::PrivateResponseReplay;
                 break;
             case CheckpointKind::LongAnchor:
-                plan.value.prefix_reuse_path = PrefixReusePath::PrivateLongAnchor;
+                plan.value.restore_path = RestorePath::PrivateLongAnchor;
                 break;
             case CheckpointKind::SharedStablePrefix:
-                plan.value.prefix_reuse_path = PrefixReusePath::SharedStablePrefix;
+                plan.value.restore_path = RestorePath::SharedStablePrefix;
                 break;
             }
         } else {
             plan.value.reusable_prompt_tokens = 0;
-            plan.value.prefix_reuse_path      = PrefixReusePath::Root;
+            plan.value.restore_path           = RestorePath::Root;
         }
         plan.remaining.tokens = plan.value.prompt_tokens > plan.value.reusable_prompt_tokens
                                     ? plan.value.prompt_tokens - plan.value.reusable_prompt_tokens
@@ -3241,7 +3241,7 @@ void test_cancelled_request_republishes_its_checkpoint() {
     require(reuse.readiness == Readiness::Ready && reuse.choice,
             "republished checkpoint was not reusable");
     require(reuse.choice->summary().reusable_prompt_tokens == 9 &&
-                reuse.choice->summary().prefix_reuse_path == PrefixReusePath::PrivateTurnClosure,
+                reuse.choice->summary().restore_path == RestorePath::PrivateTurnClosure,
             "republished checkpoint reused the wrong frontier or reuse path");
 }
 

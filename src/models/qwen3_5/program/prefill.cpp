@@ -974,7 +974,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse,
+                                        .restore_path         = staged.reuse,
                                         .reuse_source         = staged.reuse_source,
                                         .reuse_reason         = staged.reuse_reason};
     std::uint32_t processed_prompt_tokens = 0;

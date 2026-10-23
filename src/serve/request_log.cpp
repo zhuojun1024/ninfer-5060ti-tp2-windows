@@ -134,19 +134,19 @@ const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
 }
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+const char* restore_path_name(ninfer::RestorePath path) {
     switch (path) {
-    case ninfer::PrefixReusePath::Root:
+    case ninfer::RestorePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
+    case ninfer::RestorePath::PrivateEndpoint:
         return "private_endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
+    case ninfer::RestorePath::PrivateTurnClosure:
         return "private_turn_closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
+    case ninfer::RestorePath::PrivateResponseReplay:
         return "private_response_replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
+    case ninfer::RestorePath::PrivateLongAnchor:
         return "private_long_anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
+    case ninfer::RestorePath::SharedStablePrefix:
         return "shared_stable_prefix";
     }
     return "unknown";
@@ -571,7 +571,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
               std::max(0, outcome.prompt_tokens -
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
-             {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"restore_path", restore_path_name(outcome.metrics.restore_path)},
              {"thinking_budget", outcome.thinking.configured_budget
                                      ? Json(*outcome.thinking.configured_budget)
                                      : Json(nullptr)},

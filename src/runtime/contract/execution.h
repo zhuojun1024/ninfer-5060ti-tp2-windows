@@ -44,7 +44,7 @@ struct CommitDecision {
 struct BeginSummary {
     std::uint32_t prompt_tokens        = 0;
     std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
+    RestorePath restore_path           = RestorePath::Root;
     // The decision in the redesign's own terms, filled beside the legacy path.
     ReuseSourceKind reuse_source       = ReuseSourceKind::None;
     ReuseReasonKind reuse_reason       = ReuseReasonKind::NoAnchorAtOrBefore;

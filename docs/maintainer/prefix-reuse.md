@@ -571,7 +571,7 @@ extent 裁剪、`forget()` 回收槽。
 
 **阶段 2：单一提交规则**，删除三分支与清零逻辑，落地 §9.1 的两份 extent。
 
-**阶段 3：删除旧机制**：五个子环、`valid[lane]`、`reuse_path` 枚举（换成 §16.1 的 `reuse_source`）、重复 trace；
+**阶段 3：删除旧机制**：五个子环、`valid[lane]`、`restore_path` 枚举在指标上的用途（换成 §16.1 的 `reuse_source`/`reuse_reason`）、重复 trace；
 catalog 的注册职责交回 `ConversationLog` 的所有者，同时删掉 `SessionEntry`。
 
 **阶段 4：标定张数与上限**：`stride=8192` 已经是契约，不再重标；标定每会话上限、`--host-state-images`
@@ -601,13 +601,18 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
 - `session_publish` 的三条分支与字段清零。**2026-10-23 核对后不适用**：三条分支是 catalog 的**发布策略**
   （驻留条目原地更新 / 延续的条目原地重写 / 新建条目 + 容量淘汰），编码的是"这条请求延续哪个条目"，
   属于会话注册职责，不是锚点记账；删掉它们等于删掉 catalog 的发布语义；
-- `reuse_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
+- `restore_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
   收窄作用域**：该枚举在单卡路线里是程序内部的**恢复路径**（`is_rewrite_checkpoint_restore()` 与
   `PrivateEndpoint`/`SharedStablePrefix`/`PrivateLongAnchor` 在 `program/prefill.cpp`、`context.cpp`、`pressure.cpp` 里做路由判定），
   不是存储标签——§17.6 已经写明"旧枚举是角色，不是存储"。删它就得重新编码那套路由，是净增复杂度。
   已完成的删除：`record_prefix_selection()`、六个 `*_selections`、`last_selected_frontier_tokens`、`context_cache.selections`
-  与 `last_selection`。**保留**：枚举本身，作为单卡程序的路由词汇（要更诚实可改名 `RestorePath`，与 §17.6 一致，属可选整理）；
-- `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）——不需要 ledger，可独立做；
+  与 `last_selection`。**保留**：枚举本身，作为单卡程序的路由词汇；2026-10-23 已按 §17.6 改名为 `RestorePath`、
+  字段改为 `restore_path`（JSON 键同名），语义未动——原名把"复用了多少"和"走了哪条恢复路径"混在一起，
+  是这套指标长期被误读的根源；
+- `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）——**2026-10-23 核对后不合并**：
+  这不是重复存储，而是"每次请求与自身谱系一致的那段比较流"与"持久身份"两件事，ledger 的
+  `ConversationLog.tokens` 也只承担前者；删掉 `cached_prompt_tokens` 会让没有 catalog 条目的 lane（匿名请求、
+  catalog 满、`--host-kv-mib 0`）连自己那条谱系都不能复用；
 - device/host 双份代码路径。
 
 ### 13.1 改名：让单位诚实
@@ -657,7 +662,7 @@ context cache 的通用容量（TP-2 上它实际只管 prefix-reuse 的镜像�
 | 内存参数怎么命名 | `--host-state-images` / `--device-state-images`，按"张"计；`--host-kv-mib` 保持 MiB（§13.1） | 状态镜像是定长的（146.8 MiB/张），张数才是用户能对上内存的单位；`slots` 是内部索引，不该出现在 CLI |
 | `--host-state-images` 的默认值 | **20**（≈2.9 GiB，覆盖 64K 提示 + 64K 生成） | 按 §7.1 反推；旧的 8（实占 12 张 ≈1.7 GiB）只够 40K 双段覆盖 |
 | 规整失败时是否允许强制续写 | **不允许**（第 5 节）。失败就用客户端流并把代价暴露出来 | 静默改写历史的正确性风险远大于一次全量 prefill；要重开需要独立开关，不作为默认路径 |
-| 单卡路线是否也迁到 ledger | **不迁**。单卡保留自己的 context cache / `StateImageStore`；`PrefixReusePath` 收窄为程序内部的路由词汇（§13 第 5 条） | 单卡那套是参考路线的在线特性（device/host 双副本、跨会话 shared prefix、long anchor、rewrite checkpoint、压力驱逐、MTP 桥接），是 ledger 今天能力的**真超集**；且它与准入控制（`ResourceManager`/`PressurePlanner`/`MaterializationPlanner`/`AdmissionCandidate`）耦合，迁移必须连 admission 一起重写。收益只是"少一套代码"，代价是数值参考路线与一到两周工期 |
+| 单卡路线是否也迁到 ledger | **不迁**。单卡保留自己的 context cache / `StateImageStore`；`RestorePath`（原名 `PrefixReusePath`）收窄为程序内部的路由词汇（§13 第 5 条） | 单卡那套是参考路线的在线特性（device/host 双副本、跨会话 shared prefix、long anchor、rewrite checkpoint、压力驱逐、MTP 桥接），是 ledger 今天能力的**真超集**；且它与准入控制（`ResourceManager`/`PressurePlanner`/`MaterializationPlanner`/`AdmissionCandidate`）耦合，迁移必须连 admission 一起重写。收益只是"少一套代码"，代价是数值参考路线与一到两周工期 |
 
 ### 14.2 仍开放
 
@@ -812,13 +817,14 @@ catalog 的 slab 只在条目被逐出时消失。
 ### 16.1 逐条分类
 
 先给数字：`tests/models/qwen3_5/test_engine_prefix_real.cpp` 里 `reused_prompt_tokens` 出现 **78** 次、
-`prefix_reuse_path` 出现 **54** 次。后者是**公开 API**（`include/ninfer/types.h:763` 的枚举、`:872` 的字段），
-而 §13 要删它——所以阶段 1 做完，这套测试必然红一片。必须先分清"红得对"和"红得不对"：
+`restore_path`（原名 `prefix_reuse_path`）出现 **54** 次。后者是**公开 API**（`include/ninfer/types.h` 的枚举
+`RestorePath` 与字段 `restore_path`），而 §13 曾计划删它——所以阶段 1 做完，这套测试必然红一片。必须先分清"红得对"
+和"红得不对"：
 
 | 测试 | 现在断言什么 | 处置 |
 |---|---|---|
 | `test_engine_prefix_real.cpp` 的 `reused_prompt_tokens`（78 处） | 追加式复用、零后缀复用、跨会话恢复、媒体前缀各自的命中 token 数 | **保留结构，逐个更新期望值**。数值会变（栅格从"按预算反推的 32,768"变成 8192），但"命中多少"仍是行为契约；每条期望值旁注明它落在哪个锚点上 |
-| 同文件的 `prefix_reuse_path`（54 处） | 复用来源枚举（`SharedStablePrefix`、`Root` 等） | **改写**。`GenerationResult` 保留 `reuse_source`（存储轴 `None/Device/HostSlab/LiveState`）与 `reuse_reason`，定义见 §17；旧枚举的五个非 `Root` 值描述的是**锚点角色**，不提升为公开字段（§17.6），替代判据是"命中多少 token、命中哪种存储" |
+| 同文件的 `restore_path`（54 处） | 单卡程序走到哪条恢复路径（`SharedStablePrefix`、`Root` 等） | **保留**。该枚举是单卡程序的**路由词汇**，不是存储标签（§17.6）；2026-10-23 只把它从 `PrefixReusePath` 改名为 `RestorePath`、字段改名为 `restore_path`，语义未动。双卡路线用 `reuse_source`（存储轴 `None/Device/HostSlab/LiveState`）与 `reuse_reason` 报告同一件事，定义见 §17 |
 | `test_turn_replay.cpp` | `same_rendered_turn` / `adoption_candidates` 的逐字节判等与候选筛选 | **阶段 1 不动**；§5 落地时一起改写（它是 §5 的被替换对象） |
 | `test_tp2_sessions.cpp` | catalog 行为、跨会话回落、adoption 读 catalog | **保留**（阶段 1 保留 catalog）；只删依赖 ring 槽位布局的断言 |
 | `test_resource_manager.cpp` 的 `host_state_occupied_*` | 设备侧 context cache 占用 | **随分配器改写**；设备侧语义不变的部分保留 |
@@ -928,7 +934,7 @@ source       != None       ⟺   reason == Used
 
 ### 17.6 旧枚举是"角色"，不是"存储"
 
-`PrefixReusePath` 的五个非 `Root` 值区分的是**锚点的角色**（端点、轮次收尾、响应重放、长锚、共享稳定前缀），
+`RestorePath` 的五个非 `Root` 值区分的是**锚点的角色**（端点、轮次收尾、响应重放、长锚、共享稳定前缀），
 对应设计里的 `AnchorProvenance`（`PromptEnd/Divergence/Block/Grid/Generated`），而不是 `AnchorStorage`
 （`Device/Host`）。把它映射成 `Device/HostSlab/LiveState` 会丢信息，这是有意的：
 

@@ -240,7 +240,7 @@ int exercise_boundary_restore(ninfer::Engine& engine) {
     if (restored.reused_prompt_tokens == 0 || restored.generated_token_ids.size() != 4) {
         std::cerr << "DFlash assistant-boundary restore did not reuse its cache snapshot: reused="
                   << restored.reused_prompt_tokens
-                  << " path=" << static_cast<int>(restored.prefix_reuse_path)
+                  << " path=" << static_cast<int>(restored.restore_path)
                   << " source_prompt=" << first.prompt.prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size() << '\n';
         return 1;

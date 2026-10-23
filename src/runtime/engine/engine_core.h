@@ -877,7 +877,7 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.restore_path         = request->begin->restore_path;
             result.reuse_source         = request->begin->reuse_source;
             result.reuse_reason         = request->begin->reuse_reason;
         }
@@ -1389,7 +1389,7 @@ private:
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
             const auto describe = [](const BeginSummary& summary) {
                 return "tokens=" + std::to_string(summary.reused_prompt_tokens) +
-                       " path=" + std::to_string(static_cast<int>(summary.prefix_reuse_path)) +
+                       " path=" + std::to_string(static_cast<int>(summary.restore_path)) +
                        " source=" + std::string(reuse_source_kind_name(summary.reuse_source)) +
                        " reason=" + std::string(reuse_reason_kind_name(summary.reuse_reason));
             };
@@ -1679,7 +1679,7 @@ private:
         publish_generation_start(
             request, BeginSummary{.prompt_tokens        = summary.prompt_tokens,
                                   .reused_prompt_tokens = summary.reusable_prompt_tokens,
-                                  .prefix_reuse_path    = summary.prefix_reuse_path,
+                                  .restore_path         = summary.restore_path,
                                   .reuse_source         = summary.reuse_source,
                                   .reuse_reason         = summary.reuse_reason});
 

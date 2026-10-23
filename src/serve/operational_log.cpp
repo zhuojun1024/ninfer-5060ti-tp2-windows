@@ -86,19 +86,19 @@ const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
     return "unknown";
 }
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
+const char* restore_path_name(ninfer::RestorePath path) noexcept {
     switch (path) {
-    case ninfer::PrefixReusePath::Root:
+    case ninfer::RestorePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
+    case ninfer::RestorePath::PrivateEndpoint:
         return "private endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
+    case ninfer::RestorePath::PrivateTurnClosure:
         return "turn closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
+    case ninfer::RestorePath::PrivateResponseReplay:
         return "response replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
+    case ninfer::RestorePath::PrivateLongAnchor:
         return "long anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
+    case ninfer::RestorePath::SharedStablePrefix:
         return "shared prefix";
     }
     return "unknown";
@@ -254,8 +254,8 @@ OperationalRecord render_request_done(const RequestLogContext& context,
                                    : 0.0;
     out << " | cache " << product::format_pretty_count(metrics.prefix_cache_hit_tokens) << " ("
         << product::format_pretty_percent(cache_ratio);
-    if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
-        out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
+    if (metrics.restore_path != ninfer::RestorePath::Root) {
+        out << ", " << restore_path_name(metrics.restore_path);
     }
     out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
         << product::format_pretty_duration(metrics.total_seconds);

@@ -526,13 +526,13 @@ int exercise_host_restore(const char* artifact) {
         engine.generate(engine.prepare(std::move(continuation)), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.runtime_stats();
     if (restored.generated_token_ids.size() != 2 ||
-        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
+        restored.restore_path != ninfer::RestorePath::PrivateTurnClosure ||
         restored.reused_prompt_tokens == 0 ||
         after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
         after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
         after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
         std::cerr << "Complete MTP checkpoint was not materialized from Host: path="
-                  << static_cast<int>(restored.prefix_reuse_path)
+                  << static_cast<int>(restored.restore_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
                   << " state=" << after_restore.state_h2d_count
@@ -615,10 +615,10 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
     if (observed_filler.generated_token_ids.size() != 1 ||
         observed_reuse.generated_token_ids.size() != 1 ||
-        observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        observed_reuse.restore_path != ninfer::RestorePath::SharedStablePrefix ||
         observed_reuse.reused_prompt_tokens == 0) {
         std::cerr << "promoted shared prefix was not reusable after private eviction: path="
-                  << static_cast<int>(observed_reuse.prefix_reuse_path)
+                  << static_cast<int>(observed_reuse.restore_path)
                   << " reused=" << observed_reuse.reused_prompt_tokens << '\n';
         return 1;
     }
@@ -658,10 +658,10 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::cerr << "shared replacement fixture did not complete all requests\n";
         return 1;
     }
-    if (reused.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+    if (reused.restore_path != ninfer::RestorePath::SharedStablePrefix ||
         reused.reused_prompt_tokens == 0 || reused.reused_prompt_tokens % 64U == 0) {
         std::cerr << "single-slot shared replacement was not reusable at a non-aligned frontier: "
-                  << "path=" << static_cast<int>(reused.prefix_reuse_path)
+                  << "path=" << static_cast<int>(reused.restore_path)
                   << " reused=" << reused.reused_prompt_tokens
                   << " captures=" << after_replacement.active_captures_completed << '/'
                   << after_filler.active_captures_completed << '/'
@@ -769,11 +769,11 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     const std::uint64_t followup_prefill =
         after_followup.computed_prefill_tokens - before_followup.computed_prefill_tokens;
     if (followup.generated_token_ids.size() != 1 ||
-        followup.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        followup.restore_path != ninfer::RestorePath::PrivateEndpoint ||
         followup.reused_prompt_tokens == 0 ||
         followup_prefill != followup.prompt.prompt_tokens - followup.reused_prompt_tokens) {
         std::cerr << "model-output reasoning frontier did not resume from PrivateEndpoint: path="
-                  << static_cast<int>(followup.prefix_reuse_path)
+                  << static_cast<int>(followup.restore_path)
                   << " reused=" << followup.reused_prompt_tokens
                   << " prompt=" << followup.prompt.prompt_tokens << " computed=" << followup_prefill
                   << '\n';
@@ -852,19 +852,19 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     const std::uint64_t branch_prefill =
         after_branch.computed_prefill_tokens - before_branch.computed_prefill_tokens;
 
-    if (late.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
-        branch.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+    if (late.restore_path != ninfer::RestorePath::SharedStablePrefix ||
+        branch.restore_path != ninfer::RestorePath::SharedStablePrefix ||
         late.generated_token_ids.size() != 1 || branch.generated_token_ids.size() != 1 ||
         late.reused_prompt_tokens <= branch.reused_prompt_tokens ||
         branch.reused_prompt_tokens == 0 || second_filler.generated_token_ids.size() != 1 ||
         late_prefill != late.prompt.prompt_tokens - late.reused_prompt_tokens ||
         branch_prefill != branch.prompt.prompt_tokens - branch.reused_prompt_tokens) {
         std::cerr << "default shared catalog did not retain nested compact frontiers: late_path="
-                  << static_cast<int>(late.prefix_reuse_path)
+                  << static_cast<int>(late.restore_path)
                   << " late_reused=" << late.reused_prompt_tokens
                   << " late_prompt=" << late.prompt.prompt_tokens
                   << " late_computed=" << late_prefill
-                  << " branch_path=" << static_cast<int>(branch.prefix_reuse_path)
+                  << " branch_path=" << static_cast<int>(branch.restore_path)
                   << " branch_reused=" << branch.reused_prompt_tokens
                   << " branch_prompt=" << branch.prompt.prompt_tokens
                   << " branch_computed=" << branch_prefill << '\n';
@@ -994,16 +994,15 @@ int exercise_shared_rewrite_materialization(const char* artifact) {
         engine.generate(engine.prepare(input(true)), request_options());
     const ninfer::RuntimeStats after_third = engine.runtime_stats();
 
-    if (first.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
-        second.reused_prompt_tokens == 0 ||
-        third.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+    if (first.restore_path != ninfer::RestorePath::Root || second.reused_prompt_tokens == 0 ||
+        third.restore_path != ninfer::RestorePath::PrivateResponseReplay ||
         third.reused_prompt_tokens == 0 || third.generated_token_ids.empty() ||
         after_third.historical_fork_hits <= before_third.historical_fork_hits) {
         std::cerr << "shared/private rewrite alias did not materialize through its active Fork: "
-                  << "first_path=" << static_cast<int>(first.prefix_reuse_path)
-                  << " second_path=" << static_cast<int>(second.prefix_reuse_path)
+                  << "first_path=" << static_cast<int>(first.restore_path)
+                  << " second_path=" << static_cast<int>(second.restore_path)
                   << " second_reused=" << second.reused_prompt_tokens
-                  << " third_path=" << static_cast<int>(third.prefix_reuse_path)
+                  << " third_path=" << static_cast<int>(third.restore_path)
                   << " third_reused=" << third.reused_prompt_tokens
                   << " third_outputs=" << third.generated_token_ids.size()
                   << " forks=" << before_third.historical_fork_hits << '/'
@@ -1047,7 +1046,7 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
     const ninfer::GenerationResult source = engine.generate(
         engine.prepare(input({std::string(stable), "Follow the original branch."}, 1)), request);
     if (source.generated_token_ids.size() != 1 ||
-        source.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        source.restore_path != ninfer::RestorePath::Root) {
         std::cerr << "first private long-anchor capture did not complete from Root\n";
         return 1;
     }
@@ -1063,11 +1062,11 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
     const ninfer::GenerationResult replacement =
         engine.generate(engine.prepare(std::move(replacement_input)), request);
     if (replacement.generated_token_ids.size() != 1 ||
-        replacement.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        replacement.restore_path != ninfer::RestorePath::PrivateLongAnchor ||
         replacement.reused_prompt_tokens == 0 ||
         replacement.reused_prompt_tokens >= replacement.prompt.prompt_tokens) {
         std::cerr << "private long anchor was not selected before full-capacity replacement: path="
-                  << static_cast<int>(replacement.prefix_reuse_path)
+                  << static_cast<int>(replacement.restore_path)
                   << " reused=" << replacement.reused_prompt_tokens
                   << " prompt=" << replacement.prompt.prompt_tokens << '\n';
         return 1;
@@ -1082,12 +1081,12 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
     const ninfer::GenerationResult replaced =
         engine.generate(engine.prepare(std::move(replaced_input)), request);
     if (replaced.generated_token_ids.size() != 1 ||
-        replaced.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        replaced.restore_path != ninfer::RestorePath::PrivateLongAnchor ||
         replaced.reused_prompt_tokens <= replacement.reused_prompt_tokens ||
         replaced.reused_prompt_tokens >= replaced.prompt.prompt_tokens) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "replacement private long anchor was not reusable: path="
-                  << static_cast<int>(replaced.prefix_reuse_path)
+                  << static_cast<int>(replaced.restore_path)
                   << " first_reused=" << replacement.reused_prompt_tokens
                   << " replaced_reused=" << replaced.reused_prompt_tokens
                   << " prompt=" << replaced.prompt.prompt_tokens
@@ -1134,10 +1133,10 @@ int exercise_last_private_alias_eviction(const char* artifact) {
         one_token);
     if (source.generated_token_ids.size() != 1 || branch.generated_token_ids.size() != 1 ||
         branch.reused_prompt_tokens == 0 ||
-        (branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
-         branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint)) {
+        (branch.restore_path != ninfer::RestorePath::PrivateResponseReplay &&
+         branch.restore_path != ninfer::RestorePath::PrivateEndpoint)) {
         std::cerr << "last-alias fixture did not establish two private prefix aliases: path="
-                  << static_cast<int>(branch.prefix_reuse_path)
+                  << static_cast<int>(branch.restore_path)
                   << " reused=" << branch.reused_prompt_tokens << '\n';
         return 1;
     }
@@ -1152,13 +1151,13 @@ int exercise_last_private_alias_eviction(const char* artifact) {
         full_capacity);
     const ninfer::RuntimeStats after = engine.runtime_stats();
     if (consumed.generated_token_ids.size() != 1 || consumed.reused_prompt_tokens == 0 ||
-        (consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
-         consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) ||
+        (consumed.restore_path != ninfer::RestorePath::PrivateResponseReplay &&
+         consumed.restore_path != ninfer::RestorePath::PrivateEndpoint) ||
         after.pressure_private_owners_evicted <= before.pressure_private_owners_evicted ||
         after.device_main_kv_occupied_pages == 0 || after.device_main_kv_occupied_pages > 8 ||
         after.device_backend_kv_occupied_pages == 0 || after.device_backend_kv_occupied_pages > 8) {
         std::cerr << "last private prefix alias did not transfer into the active entitlement: path="
-                  << static_cast<int>(consumed.prefix_reuse_path)
+                  << static_cast<int>(consumed.restore_path)
                   << " reused=" << consumed.reused_prompt_tokens
                   << " evictions=" << before.pressure_private_owners_evicted << '/'
                   << after.pressure_private_owners_evicted
@@ -1228,8 +1227,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
 
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare(input_with_history(0, true)), options(true));
-    if (first.generated_token_ids.size() != 4 ||
-        first.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+    if (first.generated_token_ids.size() != 4 || first.restore_path != ninfer::RestorePath::Root) {
         std::cerr << "response-checkpoint source request did not complete from a cold lane\n";
         return 1;
     }
@@ -1237,11 +1235,11 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult exact_replay =
         engine.generate(engine.prepare(input_with_history(0, false)), options(true));
     if (exact_replay.generated_token_ids.size() != 4 ||
-        exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+        exact_replay.restore_path != ninfer::RestorePath::PrivateResponseReplay ||
         exact_replay.reused_prompt_tokens == 0) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "pre-generation response checkpoint was not restored on an exact replay: "
-                  << "path=" << static_cast<int>(exact_replay.prefix_reuse_path)
+                  << "path=" << static_cast<int>(exact_replay.restore_path)
                   << " reused=" << exact_replay.reused_prompt_tokens
                   << " captures=" << stats.active_captures_completed
                   << " capture_aborts=" << stats.active_captures_aborted << '\n';
@@ -1252,10 +1250,10 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     // Replay can rebuild the MTP bridge at T=1; capture can also split the source prefill.
     // Each route must finish within its own budget and publish a valid reuse frontier.
     if (exact_baseline.generated_token_ids.size() != 4 ||
-        exact_baseline.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+        exact_baseline.restore_path != ninfer::RestorePath::Root ||
         exact_baseline.reused_prompt_tokens != 0) {
         std::cerr << "uncached response-checkpoint baseline did not complete from Root: path="
-                  << static_cast<int>(exact_baseline.prefix_reuse_path)
+                  << static_cast<int>(exact_baseline.restore_path)
                   << " reused=" << exact_baseline.reused_prompt_tokens
                   << " outputs=" << exact_baseline.generated_token_ids.size() << '\n';
         return 1;
@@ -1265,15 +1263,15 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
     const ninfer::RuntimeStats after_first_replay = engine.runtime_stats();
-    const ninfer::PrefixReusePath expected_first_replay =
-        shared_alias ? ninfer::PrefixReusePath::SharedStablePrefix
-                     : ninfer::PrefixReusePath::PrivateResponseReplay;
+    const ninfer::RestorePath expected_first_replay =
+        shared_alias ? ninfer::RestorePath::SharedStablePrefix
+                     : ninfer::RestorePath::PrivateResponseReplay;
     if (first_replay.generated_token_ids.size() != 4 ||
-        first_replay.prefix_reuse_path != expected_first_replay ||
+        first_replay.restore_path != expected_first_replay ||
         first_replay.reused_prompt_tokens == 0 ||
         (shared_alias && first_replay.reused_prompt_tokens <= exact_replay.reused_prompt_tokens)) {
         std::cerr << "normalized first response selected the wrong cache frontier: path="
-                  << static_cast<int>(first_replay.prefix_reuse_path)
+                  << static_cast<int>(first_replay.restore_path)
                   << " expected=" << static_cast<int>(expected_first_replay)
                   << " reused=" << first_replay.reused_prompt_tokens << '\n';
         return 1;
@@ -1292,7 +1290,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult second_replay =
         engine.generate(engine.prepare(input_with_history(2, true)), options(true));
     if (second_replay.generated_token_ids.size() != 4 ||
-        second_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+        second_replay.restore_path != ninfer::RestorePath::PrivateResponseReplay ||
         second_replay.reused_prompt_tokens <= first_replay.reused_prompt_tokens) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "rolling response checkpoint did not advance across the tool loop: first="
@@ -1306,10 +1304,10 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult mode_change =
         engine.generate(engine.prepare(input_with_history(2, false)), options(true));
     if (mode_change.generated_token_ids.size() != 4 ||
-        mode_change.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+        mode_change.restore_path != ninfer::RestorePath::PrivateResponseReplay ||
         mode_change.reused_prompt_tokens == 0) {
         std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
-                  << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
+                  << "path=" << static_cast<int>(mode_change.restore_path)
                   << " reused=" << mode_change.reused_prompt_tokens << '\n';
         return 1;
     }
@@ -1419,7 +1417,7 @@ int exercise_cancelled_turn_rollback(const char* artifact) {
     const ninfer::GenerationResult history =
         engine.generate(engine.prepare(input_with_history(0, true)), request_options(4));
     if (history.generated_token_ids.size() != 4 ||
-        history.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        history.restore_path != ninfer::RestorePath::Root) {
         std::cerr << "cancelled-turn fixture did not establish a cold history\n";
         return 1;
     }
@@ -1450,10 +1448,10 @@ int exercise_cancelled_turn_rollback(const char* artifact) {
     const ninfer::GenerationResult resumed =
         engine.generate(engine.prepare(input_with_history(1, true)), request_options(4));
     if (resumed.generated_token_ids.size() != 4 ||
-        resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
+        resumed.restore_path != ninfer::RestorePath::PrivateResponseReplay ||
         resumed.reused_prompt_tokens == 0 || resumed.reused_prompt_tokens > sink.prompt_tokens) {
         std::cerr << "rollback checkpoint did not restore the cancelled prompt frontier: path="
-                  << static_cast<int>(resumed.prefix_reuse_path)
+                  << static_cast<int>(resumed.restore_path)
                   << " reused=" << resumed.reused_prompt_tokens
                   << " cancelled_prompt=" << sink.prompt_tokens << '\n';
         return 1;
@@ -1499,7 +1497,7 @@ int exercise_rewrite_branch(const char* artifact) {
     const ninfer::GenerationResult source =
         engine.generate(engine.prepare(input(false)), options(true));
     if (source.generated_token_ids.size() != 4 ||
-        source.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        source.restore_path != ninfer::RestorePath::Root) {
         std::cerr << "rewrite branch source did not establish a response checkpoint\n";
         return 1;
     }
@@ -1509,12 +1507,12 @@ int exercise_rewrite_branch(const char* artifact) {
         engine.generate(engine.prepare(input(true)), options(false));
     if (branch.generated_token_ids.size() != 4 || branch.reused_prompt_tokens == 0 ||
         branch.reused_prompt_tokens >= branch.prompt.prompt_tokens ||
-        (branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
-         branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure) ||
+        (branch.restore_path != ninfer::RestorePath::PrivateResponseReplay &&
+         branch.restore_path != ninfer::RestorePath::PrivateTurnClosure) ||
         branch_baseline.generated_token_ids.size() != 4 ||
         branch_baseline.reused_prompt_tokens != 0) {
         std::cerr << "replacement user suffix did not reuse the stable conversation prefix: path="
-                  << static_cast<int>(branch.prefix_reuse_path)
+                  << static_cast<int>(branch.restore_path)
                   << " reused=" << branch.reused_prompt_tokens
                   << " prompt=" << branch.prompt.prompt_tokens
                   << " target_count=" << branch.materialization.targets_evaluated
@@ -1872,10 +1870,10 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
         after_resume.main_kv_h2d_pages - before_resume.main_kv_h2d_pages;
     const std::uint32_t reused_pages = (resumed.reused_prompt_tokens + 63U) / 64U;
     if (resumed.generated_token_ids.size() != 1 ||
-        resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
-        reused_pages != 120 || restored_pages != 4) {
+        resumed.restore_path != ninfer::RestorePath::PrivateTurnClosure || reused_pages != 120 ||
+        restored_pages != 4) {
         std::cerr << "pressure-resume did not restore the retained turn closure: path="
-                  << static_cast<int>(resumed.prefix_reuse_path)
+                  << static_cast<int>(resumed.restore_path)
                   << " reused=" << resumed.reused_prompt_tokens << " reused_pages=" << reused_pages
                   << " restored=" << restored_pages << '\n';
         return 1;
@@ -1942,15 +1940,15 @@ int exercise_materialization_source_pressure_protection(const char* artifact) {
     const std::uint64_t degraded = after_branch.pressure_private_owners_degraded -
                                    before_branch.pressure_private_owners_degraded;
     const bool private_partial_source =
-        branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateResponseReplay ||
-        branched.prefix_reuse_path == ninfer::PrefixReusePath::PrivateTurnClosure;
+        branched.restore_path == ninfer::RestorePath::PrivateResponseReplay ||
+        branched.restore_path == ninfer::RestorePath::PrivateTurnClosure;
     if (branched.generated_token_ids.size() != 1 || !private_partial_source ||
         branched.reused_prompt_tokens == 0 ||
         branched.reused_prompt_tokens >= branched.prompt.prompt_tokens || demoted_pages == 0 ||
         degraded == 0 || branched.materialization.selected_maximal_fallback) {
         std::cerr << "source-pressure branch did not preserve its source under guided Host KV "
                      "pressure: path="
-                  << static_cast<int>(branched.prefix_reuse_path)
+                  << static_cast<int>(branched.restore_path)
                   << " reused=" << branched.reused_prompt_tokens
                   << " prompt=" << branched.prompt.prompt_tokens << " demoted=" << demoted_pages
                   << " degraded=" << degraded
@@ -2038,10 +2036,10 @@ int exercise_private_checkpoint_pressure_retention(const char* artifact) {
     const ninfer::GenerationResult resumed =
         engine.generate(engine.prepare(std::move(resume)), fixed_output(1));
     if (resumed.generated_token_ids.size() != 1 ||
-        resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
+        resumed.restore_path != ninfer::RestorePath::PrivateTurnClosure ||
         resumed.reused_prompt_tokens == 0) {
         std::cerr << "private checkpoint pressure discarded the reusable turn closure: path="
-                  << static_cast<int>(resumed.prefix_reuse_path)
+                  << static_cast<int>(resumed.restore_path)
                   << " reused=" << resumed.reused_prompt_tokens
                   << " future_ns=" << resumed.materialization.predicted_future_loss_ns << '\n';
         return 1;
@@ -2099,9 +2097,9 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
         engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
         fixed_output(2));
     if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
-        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        replay.restore_path == ninfer::RestorePath::Root) {
         std::cerr << "late older finish exposed the newer session binding to pressure: path="
-                  << static_cast<int>(replay.prefix_reuse_path)
+                  << static_cast<int>(replay.restore_path)
                   << " reused=" << replay.reused_prompt_tokens << '\n';
         return 1;
     }

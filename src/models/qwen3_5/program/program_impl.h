@@ -39,7 +39,7 @@ using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 
-using ReusePath = ninfer::PrefixReusePath;
+using ReusePath = ninfer::RestorePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
     return path == ReusePath::PrivateTurnClosure || path == ReusePath::PrivateResponseReplay;

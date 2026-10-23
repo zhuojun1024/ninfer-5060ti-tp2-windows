@@ -715,7 +715,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         }
     }
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
-    plan->summary.prefix_reuse_path      = plan->reuse;
+    plan->summary.restore_path           = plan->reuse;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::Root) {
             plan->prepare_mtp = true;

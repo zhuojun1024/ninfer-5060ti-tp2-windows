@@ -3872,7 +3872,7 @@ void TP2GenerationCore::execute_plain_batch(
         capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
 
         lane.result.reused_prompt_tokens = reuse;
-        lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
+        lane.result.restore_path         = reuse_path(reuse, anchors.block_frontier, lane_id);
         lane.result.reuse_source         = reuse_source_kind(lane_retention_[lane_id].reuse_source);
         lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used
                                                ? ReuseReasonKind::Used
@@ -5234,7 +5234,7 @@ void TP2GenerationCore::execute_spec_batch(
         // first chunk overwrites it.
         capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
         lane.result.reused_prompt_tokens = reuse;
-        lane.result.prefix_reuse_path    = reuse_path(reuse, anchors.block_frontier, lane_id);
+        lane.result.restore_path         = reuse_path(reuse, anchors.block_frontier, lane_id);
         lane.result.reuse_source         = reuse_source_kind(lane_retention_[lane_id].reuse_source);
         lane.result.reuse_reason         = lane_reuse.reuse_reason == ReuseReason::Used
                                                ? ReuseReasonKind::Used
@@ -7065,24 +7065,21 @@ TP2GenerationCore::adopt_generated_turn(models::qwen3_5::PreparedPromptData& dat
     return adoption;
 }
 
-PrefixReusePath TP2GenerationCore::reuse_path(std::uint32_t reuse,
-                                              std::uint32_t block_frontier,
-                                              std::uint32_t lane) const noexcept {
+RestorePath TP2GenerationCore::reuse_path(std::uint32_t reuse, std::uint32_t block_frontier,
+                                          std::uint32_t lane) const noexcept {
     const RetentionState& lane_state = retention(lane);
-    if (reuse == 0) { return PrefixReusePath::Root; }
-    if (block_frontier != 0 && reuse == block_frontier) {
-        return PrefixReusePath::SharedStablePrefix;
-    }
+    if (reuse == 0) { return RestorePath::Root; }
+    if (block_frontier != 0 && reuse == block_frontier) { return RestorePath::SharedStablePrefix; }
     if (lane_state.active_session != kNoSession) {
         const SessionEntry& entry = sessions_[lane_state.active_session];
-        if (reuse == entry.frontier) { return PrefixReusePath::PrivateEndpoint; }
+        if (reuse == entry.frontier) { return RestorePath::PrivateEndpoint; }
         // The boundary in front of the answer this lineage generated. A client that re-rendered that
         // answer cannot extend it and re-prefills from the generation opener instead.
-        if (reuse == entry.prompt_end) { return PrefixReusePath::PrivateResponseReplay; }
+        if (reuse == entry.prompt_end) { return RestorePath::PrivateResponseReplay; }
     }
     // Everything else is a retention boundary: a grid or tail anchor this core wrote, or a state
     // another conversation was seen to diverge at.
-    return PrefixReusePath::PrivateLongAnchor;
+    return RestorePath::PrivateLongAnchor;
 }
 
 // The scan's internal source in the published vocabulary (§17 of docs/maintainer/prefix-reuse.md).
@@ -7631,7 +7628,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
     }
     result.reused_prompt_tokens   = reuse;
-    result.prefix_reuse_path =
+    result.restore_path =
         reuse_path(reuse, data.context_cache.leading_instruction_frontier.value_or(0), lane);
     // The serial walk finds its own boundary instead of asking the ledger, so the one fact it
     // establishes is whether it reused at all. Filling both axes here keeps them defined on this
