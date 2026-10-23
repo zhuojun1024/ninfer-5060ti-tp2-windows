@@ -1155,6 +1155,7 @@ token。两条收窄同时落地：
   单一持有者的锚点，于是一次镜像都冻不下来（`host=0/11`）。这条**不是**本轮引入的：在 `09116db5`（池化之前）
   同一场景复用 512 成功，但那时的失败在别处——输出与 oracle 在第 3 个 token 分岔（`16` vs `15`）。两半都要修：
   池化那一半是 eviction 策略（池满时应淘汰已完成会话的 prompt-end 锚点），再往下才是那个 token 分岔。
+  **两半的进展见 §18.7**：池那半与设备深度那半都已修，`reused 512` 回来了；那个 token 分岔确认与边界选择无关。
 - **镜像可以共享读**：`copy_lane_state` 的 H2D 分支只读宿主缓冲、只写本 lane 的 device 区；`load_dflash_image`
   同理；每个 shard 一条 CUDA stream，且执行被 `execution_mutex_` 串行化，所以两条 lane 读同一张镜像没有竞争。
 
@@ -1163,5 +1164,59 @@ token。两条收窄同时落地：
 - **媒体身份**：`identity_ok` 已经单独检查 `media` 前缀（§15.3），token 哈希看不见图片，两者互补。
 - **`prefill_id`**：它标记"这批镜像属于同一次 prefill"，是写入侧的一致性问题，不是身份的替代品；
   跨 lane 之后它仍然只在同一次 prefill 内部比较。
+
+### 18.7 chunk 网格与设备前缀深度（2026-10-23）
+
+§18.4 记的两半，前半已修，后半确认为独立问题并留下了判据。
+
+**一、池那半：镜像和 prompt-end 抢槽 → 各自有槽。** `d3d37f74` 让 prompt-end 镜像占用
+`capacity + lane` 这一组角色槽（`reserve_prompt_end_slot`），不再和轮转镜像抢 11 个位置的池。
+`[tp2-cp] skip … pool exhausted` 消失，`switch` 场景的镜像重新冻得下来。
+
+**二、`device_kv_limit` 必须在每条移动设备前缀深度的路径上维护。** 这个字段回答"设备 KV 里有多少
+个前缀位置是本 prompt 的"，扫描用它拒绝"底下已经没有 KV"的镜像。但此前只有召回和批量 publish 写它，
+两条路漏了：
+
+| 路径 | 该写什么 | 之前 |
+|---|---|---|
+| walk 的 publish（写完 `[0, prompt)`） | `kNoDeviceKvLimit` | 从不写，带着上个请求的值（实测漏到 71 / 0） |
+| session 切换（resident 已存盘、池子还没被覆盖） | `active_shared` | 从不写，同样带旧值 |
+
+`60583617` 补齐之后：`dropped transport` 回到 256（它走 `continue` 分支，靠 walk 的复位），
+`switch` 的**复用计数**从 0 回到 512。walk 的复用 trace 现在同时打印 `kv_limit=`，这类问题一眼可见。
+
+**三、复用点必须落在 walk 自己的 chunk 网格上**（`83fcf8ae`）。一个 chunk 的行带着它自身宽度的归约
+形状，而**最后一个 chunk 的宽度等于剩余 token 数**，随 prompt 总长变化。所以只有从 0 起切的完整 chunk
+（`position % chunk_width == 0`）下面的行，才是任何一次 walk 都会算出同样结果的行；网格之外的边界是
+另一次 prefill 算出来的。两份扫描都加了这道门，套件里的期望随之改成"各自边界的网格下取整"。
+
+**精确性定律（本轮确立）**：`kPrefillChunkMaximum = 1024`，一次 prefill 的 chunk 是
+`min(剩余, chunk)`。因此
+
+- prompt ≤ 1024 时整条提示词是**单个 tile**，它的归约形状由总长度决定，**任何**跨长度的复用都不
+  逐位一致；
+- prompt > 1024 时只有最后一个（不完整）tile 受影响，落在完整 tile 端点上的边界是逐位一致的。
+
+要让**任意**边界都可复用，只能把最后一个 tile 补齐到固定宽度——即"fixed-shape tiles"。这条路要求
+`TextContext::prefill_chunk` 接受 `nominal_length > 实际 token 数`，并在 `prefill_impl` 里同时做到：
+attention 对 padding 行 mask、**GDN 递推不推进 padding 行**、**KV 不写 padding 位置**、logits 只取
+最后一个真实行。后两条要穿过 `run_layers → single_layer` 进入 GDN/attention 的 op，属于模型层改动，
+本轮没有动。
+
+**四、`switch` 的输出分岔不是边界选择问题。** 计数修好后该场景暴露
+
+```
+got      [1703 220 16 15 15 …]
+expected [1703 220 15 15 15 15 …]
+```
+
+第 3 个采样翻了一个 token，前两个相同。用 `NINFER_TP2_REUSE_CAP` 把复用深度压到 256，**输出分岔逐字
+相同**——所以它与"哪个边界"无关，**任何**对这段共享块的复用都会翻这个近 tie。同一个分岔在
+`09116db5`（池化之前）就出现过，说明它不是池化、不是跨 lane、也不是网格规则引入的，而是
+"复用走查"与"冷走查"在状态/KV 镜像路径上的 ulp 级差异。
+
+这意味着 §15 那条"缓存不改变答案"的强契约目前**不成立**（至少在近似平局的输出上）：它需要上面那条
+fixed-shape tiles 才可能成立。在补齐之前，本场景的验收要么放宽到"边界 + 首 token 一致"，要么保持红色
+作为该工作的验收目标。这个取舍留给项目决定，本文只记录判据。
 
 ---
