@@ -1131,14 +1131,11 @@ token。两条收窄同时落地：
 
 | 收窄 | 落点 | 理由 |
 |---|---|---|
-| 镜像只服务**写它的那个会话** | `HostCheckpoint.conversation` | 同一会话换 lane 仍可复用（跨 lane 的目标不变），但另一段对话不能用它的镜像重启。身份取自请求自己的会话键（FNV-1a），匿名请求退化为按 lane——**不能用 `active_session`**，那个索引在 store/evict 时会移动，18.1 的 `0x8000…` 事故就是这一类 |
-| prompt-end 镜像**不进 ring 扫描** | `HostCheckpoint.prompt_end` | prompt-end 镜像是 catalog 和活谱系的入口（重试被取消的那一轮、返回的一轮站到"正好在末尾"），不是轮转镜像；把它当轮转边界用，就是上一条 ulp 类的来源 |
+| prompt-end 镜像**不进 ring 扫描** | `HostCheckpoint.prompt_end` | prompt-end 镜像是 catalog 和活谱系的入口（重试被取消的那一轮），不是轮转镜像；把它当轮转边界用，就是上一条 ulp 类的来源 |
 
-第一版收窄只做了会话域，`unaligned dialogue` 仍然失败——该场景两段对话都是匿名的，按 lane 的身份分不开；
-加上 prompt-end 排除才回到 `reused 0` 与 oracle 逐 token 一致。代价记在测试里：`dropped transport`
-那条从"复用被取消那一轮的 prompt end（408）"变成"复用它下面最深的一张轮转镜像（256）"，仍然不是从零重来
-（事故的观测值是"复用为 0"），但少省 152 个 token。要拿回那 152 个 token，需要"边界 KV 与本次 prefill 同源"
-的判据（例如按 chunk 形状记录），那是独立的设计问题。
+**试过但撤回的一条**：先做过"镜像只服务写它的那个会话"（`HostCheckpoint.conversation`，身份取请求自己的会话键的 FNV-1a，匿名请求退化为按 lane）。它对 `unaligned dialogue` 没有作用——该场景两段对话都是匿名的，按 lane 的身份分不开；真正解决问题的是 prompt-end 排除。而它**会挡住产品要的形态**：共享稳定前缀（系统提示词）本来就是跨会话复用的一等场景（§15.6 的 block 锚点、`SharedStablePrefix`）。所以该字段、身份函数和两处校验一并删掉了，镜像的身份回到"它冻结的那段前缀"（指纹）。
+
+代价记在测试里：`dropped transport` 那条从"复用被取消那一轮的 prompt end（408）"变成"复用它下面最深的一张轮转镜像（256）"，仍然不是从零重来（事故的观测值是"复用为 0"），但少省 152 个 token。要拿回那 152 个 token，需要一个"边界 KV 与本次 prefill 同源（同 chunk 形状）"的判据——**注意它与"跨会话共享稳定前缀"是冲突的**，需要先解决下面那条。
 
 ### 18.5 实测结论（双卡）
 
@@ -1152,6 +1149,12 @@ token。两条收窄同时落地：
      `offered > shared` 被排除，`reach=0`——语义上正确，那条历史本来就不能再用，代价是这一轮从 8451 重 prefill。
      要让多 lane 路线真正吃到跨 lane 的收益，需要"共同前缀 +1"这类容差（prompt-end 落在分歧后一个 token），
      那是独立的设计问题，本轮没动。
+- **未解决：共享系统提示词这一族在池化之后拿不到复用。** `test_tp2_sessions.cpp` 的 switch 场景（两段对话共享
+  512 token 的系统提示词）在双卡上 `reused 0`，trace 里是 `[tp2-cp] skip lane=0 pos=256 pool exhausted`：
+  池化让 prompt-end 镜像与轮转镜像抢同一个 11 槽池，多对话跑下来池被占满，`reserve_image_slot` 又只能淘汰
+  单一持有者的锚点，于是一次镜像都冻不下来（`host=0/11`）。这条**不是**本轮引入的：在 `09116db5`（池化之前）
+  同一场景复用 512 成功，但那时的失败在别处——输出与 oracle 在第 3 个 token 分岔（`16` vs `15`）。两半都要修：
+  池化那一半是 eviction 策略（池满时应淘汰已完成会话的 prompt-end 锚点），再往下才是那个 token 分岔。
 - **镜像可以共享读**：`copy_lane_state` 的 H2D 分支只读宿主缓冲、只写本 lane 的 device 区；`load_dflash_image`
   同理；每个 shard 一条 CUDA stream，且执行被 `execution_mutex_` 串行化，所以两条 lane 读同一张镜像没有竞争。
 

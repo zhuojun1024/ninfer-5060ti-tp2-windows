@@ -199,7 +199,6 @@ private:
         // it is, so the host budget is the lanes=1 budget whatever the lane count; the prompt-end
         // slots are appended after every lane's slice, one per lane. The per-frontier fields are
         // indexed by lane to keep a stale claim from a re-partitioned ring readable.
-        static constexpr std::uint64_t kNoConversation = static_cast<std::uint64_t>(-1);
         struct HostCheckpoint {
             std::unique_ptr<HostBuffer> buffer;
             // The masked draft's context at the same frontier, on the shard that owns the draft
@@ -223,13 +222,6 @@ private:
             // stronger than the eight-token tag the boundary image uses, which only ever has to
             // notice a rewritten tail because only its own lane loads it. Zero means not stamped.
             std::uint64_t history_hash = 0;
-            // The conversation whose prefill froze this image, as the ledger names it. A prefix can
-            // be the same tokens for two conversations and still be a boundary only one of them may
-            // restart on: the KV under it was written by a different prefill with a different chunk
-            // shape, which is ulp-level apart from what a from-scratch walk would produce. So an
-            // image serves its own conversation - on any lane, since a conversation that moved
-            // lanes still wants it - and no other. kNoConversation means not stamped.
-            std::uint64_t conversation = kNoConversation;
             // The image of a prefill's own end rather than a rotation image; see the declaration of
             // snapshot_host_checkpoint.
             bool prompt_end = false;
@@ -864,7 +856,7 @@ private:
     // into a boundary the next request can restore - and the stamp is what makes it identifiable
     // without knowing which lane wrote it.
     void publish_lane_checkpoints(std::uint32_t lane, std::span<const TokenId> history,
-                                  std::span<const TokenId> tail, std::uint64_t conversation);
+                                  std::span<const TokenId> tail = {});
     // Copies one lane's image between a whole-pool device buffer and its compact pinned image, or
     // between two whole-pool device buffers. `other` is the compact pinned image for a host copy
     // and the source pool for a device-to-device one.
@@ -975,7 +967,7 @@ private:
     [[nodiscard]] LaneReuse scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> token_ids,
                                             std::span<const MediaSpan> media,
                                             std::uint32_t prompt_tokens, std::size_t replay_split,
-                                            bool adopted, bool trace, std::uint64_t conversation);
+                                            bool adopted, bool trace);
     // The two boundaries a prefill freezes beyond its grid and tail checkpoints: the position a
     // later conversation of this family is already known to want (the observed divergence, one
     // margin token behind it) and the end of this prompt's own leading instruction block. Both sit
