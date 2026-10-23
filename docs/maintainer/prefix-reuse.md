@@ -1035,3 +1035,84 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
   权重 15.2 GiB，只有 `--embedding-host` + `--max-context 512` 才装得进 16 GiB 卡，所以单卡验证只能是短上下文。
 - 观测欠账：`--log-stats-interval-ms` 没吐出带 `context_cache` 的周期报告（试了两次），所以计数器的**区间相减**
   没有人眼验证过，只有 JSON 形状的单元断言与逐轮 `cached_tokens` 佐证。
+
+---
+
+## 18. 跨 lane 复用：让镜像自带历史指纹
+
+这是第 4 批的第一件事，也是"两张 16 GiB 卡上跑 4 条 lane"时最实际的一处损失：会话换到另一条 lane 就失去自己在
+ring 里的全部检查点。
+
+### 18.1 现状与两个实测阻塞
+
+`Shard::HostCheckpoint` 的归属是 `writer == lane`（§15.5）。扫描只登记本 lane 写的镜像，理由是两条：
+
+1. **校验不足**：`shared_prefix` 是拿本 lane 的 `cached_prompt_tokens` 比的；别的 lane 的镜像属于别的历史，
+   没被校验过。用它恢复等于相信"这个位置碰巧对得上"。
+2. **所有权绑定失败过一次**：把归属改成按会话号键控时，写入侧看到的 key 是 `0x8000…`（无会话的匿名键），
+   发布侧看到的却是真实会话号——`active_session` 在 `session_publish` 里才绑定，扫描早于它。结果 `t2 cached=0`。
+   回退到 `writer == lane` 后恢复 8192。
+
+### 18.2 指纹：镜像记下它冻结的整个前缀
+
+位置本身不是身份，**位置之前的 token 序列**才是。所以给每张宿主镜像加一个字段：
+
+```
+HostCheckpoint.history_hash = FNV-1a(tokens[0, position))
+```
+
+- **写入侧**（`snapshot_host_checkpoint`）：写者手里有本次 prefill 的 token 流，按 frontier 增量算一遍即可，
+  与拷贝本身同量级，不引入新的大 O。
+- **扫描侧**：候选位置是稀疏的（每个有效槽一个），把候选位置排序后对 `cached_prompt_tokens[0, shared_prefix)`
+  走一遍，在候选位置处取快照。O(提示词长度 + 槽数 log 槽数)，每请求一次，可忽略。
+- **比较**：`checkpoint.history_hash == 本提示词在 position 处的前缀哈希` 才允许登记。等号意味着"这个镜像冻结的
+  token 序列与本提示词到该位置为止完全一致"，与写它的 lane、会话号、`prefill_id` 都无关。
+
+这与 `reuse_boundary_tag` 的先例一致（`tp2_generation_core.h:237`："The image is the state of that prefix whatever
+conversation wrote it, so the tokens are the identity"），但**强度不同**：boundary 的 tag 只哈希边界前 8 个
+token，因为它只会被同一个 lane 加载，8 个 token 足以发现"尾部被改写"；跨 lane 需要的是**整段前缀**的证据，
+否则两段共享同一段样板文字、前面完全不同的历史会互相当成对方。
+
+### 18.3 所有权：owner/borrower 不够，要引用计数
+
+指纹解决了"能不能用"，还剩"谁让它活着"。今天的规则是 owner/borrower（§15.6）：拥有者释放时
+`release_borrowers()` 把借用者一起删掉。跨 lane 之后这条会错——写它的会话已经走了，读它的会话才是唯一的用户，
+却会跟着拥有者一起被删。
+
+改为**每个槽一个持有者集合**：
+
+| 事件 | 结果 |
+|---|---|
+| 登记（指纹匹配） | 把会话加进该槽的持有者集合 |
+| 会话 `forget()` / 条目被逐出 | 只把自己从集合里移除 |
+| 集合变空 | 槽才回池（`release_slot`） |
+| 淘汰 | 只考虑持有者集合等于 {自己} 的锚点；别人也持有的槽删了腾不出空间 |
+| 一个会话登记同位置的新镜像 | 先把自己从旧槽摘掉，再挂到新槽 |
+
+`Anchor.borrowed` 这个布尔量随之消失，换成"我是不是唯一持有者"的判断（`sole_holder(slot, session)`）。
+
+### 18.4 分步
+
+1. **指纹字段与写入侧**：`HostCheckpoint.history_hash`、`snapshot_host_checkpoint` 增加一个 token span 参数；
+   此时没有任何读取方，行为不变（可先用一次 `NINFER_TP2_CHECKPOINT_TRACE` 打印校验）。
+2. **扫描侧校验**：登记时比较指纹；仍限 `writer == lane`，即"同 lane 也不接受对不上的镜像"——这是纯加固，
+   单独可验证（改写一条 prompt 的中间一段，确认它不再命中旧检查点）。
+3. **引用计数替换 owner/borrower**：`holders` 集合、`sole_holder()`、`release_slot` 的触发条件。
+4. **打开跨 lane**：去掉 `writer == lane` 闸门，改用指纹 + 持有者集合。验证：同一会话在两条 lane 间往返，
+   `cached_tokens` 不应掉回 0。
+
+第 3、4 步必须一起落地（先开跨 lane 而没有引用计数会让借用者的镜像被提前回收）。
+
+### 18.5 验证判据
+
+- 正向：4 条 lane、同一会话按 lane 轮转发三轮，第二轮起每轮 `cached_tokens >= 8192`（今天换 lane 就掉到 0）。
+- 反向：把第二轮 prompt 的中间一段换掉、尾部保留，指纹必须拒绝恢复（今天的 `writer == lane` 之后没有第二道闸）。
+- 不变量：任何时刻 `Σ 持有者数 == 有效锚点数`；`free_slots()` 在无淘汰压力时不应因跨 lane 读取而下降。
+
+### 18.6 不参与指纹的两件事
+
+- **媒体身份**：`identity_ok` 已经单独检查 `media` 前缀（§15.3），token 哈希看不见图片，两者互补。
+- **`prefill_id`**：它标记"这批镜像属于同一次 prefill"，是写入侧的一致性问题，不是身份的替代品；
+  跨 lane 之后它仍然只在同一次 prefill 内部比较。
+
+---
