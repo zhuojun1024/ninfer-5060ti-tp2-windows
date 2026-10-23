@@ -494,6 +494,26 @@ FP8 AllReduce（`NINFER_TP2_AR_CODEC=bf16` 后所有复用数字一位不差，�
 
 因此根因在 **`DevicePair` 构造后留下的状态：它使随后的第一次 `cudaMalloc` 在驱动内部崩溃**。未修复。下一步应在一个不经过 HTTP 的
 最小程序里把这两步串起来复现，再对 `DevicePair` 里的 peer access / 映射分配 / 通道单元格逐个二分。
+
+**2026-10-23 用最小复现把上一条推翻**（源码在 `_temp/20261023-0800_tp2_pair_repro.cpp`，落盘时临时加过
+`ninfer_add_test` 目标，验完已从受版本管理的树里移除）：
+
+| 复现程序 | 做的事 | 结果 |
+|---|---|---|
+| `--mode none` | 只 materialize | 通过 |
+| `--mode pair` | `DevicePair`，然后 materialize | 4/4 通过 |
+| `--mode mapped` | 映射分配 + 通道单元格 + materialize | 通过 |
+| `--mode core` | 复刻 `TP2GenerationCore` 构造体：`DevicePair`、`DeviceContext` 移动赋值、`Reader`、`plan_load`、`materialize_model_tp2`、两个 `Parameters` | 3/3 通过 |
+| `--mode engine` | `ninfer::Engine`，选项与失败的命令行一致 | **7/7 失败**（0.4 s 与 28 s 两档） |
+
+所以"`DevicePair` 留下坏状态"**也不成立**：`DevicePair` + materialize 是干净的。要复现必须是一个更大的进程
+（`Engine` 或 `ninfer-serve`）。同时排掉：`--no-prefix-reuse`（关掉 host checkpoint ring）照样崩、`--max-context 2048`
+与 `16384` 都崩、`--spec`/`--vision`/`--embedding-host` 都无关，所以 ring 和上下文大小都不是原因。
+
+剩下的差异只有 `Engine` 在 materialize 之前多做的 `normalize_engine_options` 和 `Engine::Impl` 的成员布局，两者都是纯 C++；
+而崩溃里有 `0xC0000374`（堆校验失败），说明**已经有一次主机侧越界写**，驱动只是碰到坏结构的第一个受害者。
+下一个该用的手段是守卫页堆：在复现程序里重写全局 `operator new`/`delete`，把每个块尾贴到 `PAGE_NOACCESS` 页前面，
+配一个 vectored handler 打模块+偏移，就能在真正越界写的那条指令上停下，而不是等驱动去碰它。
 方案 B 随后改为**惰性分配**（首次捕获时才申请），实测正常：捕获到 `pos=21641 / 21667 / 21825`，正是每轮的一致点，
 比共享块边界 21,504 深 137–321 token。**但 recall 尚未把它当候选**，所以复用数字仍是 21,504。
 
