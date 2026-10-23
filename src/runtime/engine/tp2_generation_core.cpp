@@ -2706,6 +2706,10 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         }
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             const auto& checkpoint = shard_a_.host_checkpoints[slot];
+            // Only this lane's own images are offered: an image is the state after *its* token
+            // history, so it only means something to the conversation that produced it. The pool
+            // may hand the slot to another lane, which is why a write clears every lane's
+            // description of it above.
             if (checkpoint.valid[lane]) {
                 offer(checkpoint.position[lane], slot, ReuseSource::HostCheckpoint,
                       AnchorStorage::Host);
@@ -2968,8 +2972,11 @@ void TP2GenerationCore::restore_lane_dflash(std::uint32_t lane, const LaneReuse&
     }
     case ReuseSource::HostCheckpoint: {
         const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse.slot];
-        if (checkpoint.dflash_buffer == nullptr ||
-            checkpoint.dflash_frontier[lane] != checkpoint.position[lane]) {
+        // The metadata belongs to the lane that wrote the image, which need not be this one: the
+        // draft half is only trustworthy when that lane froze it at the frontier it reports.
+        const std::int32_t writer = checkpoint.writer;
+        if (checkpoint.dflash_buffer == nullptr || writer < 0 ||
+            checkpoint.dflash_frontier[writer] != checkpoint.position[writer]) {
             throw std::logic_error(
                 "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
         }
@@ -7176,10 +7183,15 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     shard.device.bind_to_current_thread();
     Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[slot];
     // Overwriting the slot already destroys the checkpoint it held, so retire it before the copy is
-    // enqueued: a prefill that throws between here and the publish sweep must not leave a torn buffer
-    // behind a flag that still says the last completed prefill wrote it. Only the sweep below, which
-    // runs after the prefill finished, makes a checkpoint usable again.
-    checkpoint.valid[lane] = false;
+    // enqueued: a prefill that throws between here and the publish sweep must not leave a torn
+    // buffer behind a flag that still says the last completed prefill wrote it. Only the sweep
+    // below, which runs after the prefill finished, makes a checkpoint usable again. The slot holds
+    // exactly one image, and this lane is about to replace whatever sat there: every lane's
+    // description of it goes with the overwrite, not just the writing lane's. Without that a later
+    // request could be offered a position whose image is already this one.
+    for (bool& valid : checkpoint.valid) { valid = false; }
+    checkpoint.writer           = static_cast<std::int32_t>(lane);
+    checkpoint.valid[lane]      = false;
     checkpoint.position[lane]   = frontier;
     checkpoint.prefill_id[lane] = retention(lane).host_checkpoint_live_id;
     // The slot belongs to this lane, so its buffer *is* the lane's compact state image: the lane
@@ -7457,6 +7469,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             const auto& checkpoint = shard_a_.host_checkpoints[index];
+            // This lane's own images only; see the serial path for why an image belongs to the
+            // conversation whose token history produced it.
             if (checkpoint.valid[lane]) {
                 take(checkpoint.position[lane], index, ReuseSource::HostCheckpoint);
             }
@@ -7572,8 +7586,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         case ReuseSource::HostCheckpoint: {
             const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse_slot];
-            if (checkpoint.dflash_buffer == nullptr ||
-                checkpoint.dflash_frontier[lane] != checkpoint.position[lane]) {
+            const std::int32_t writer               = checkpoint.writer;
+            if (checkpoint.dflash_buffer == nullptr || writer < 0 ||
+                checkpoint.dflash_frontier[writer] != checkpoint.position[writer]) {
                 throw std::logic_error(
                     "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
             }

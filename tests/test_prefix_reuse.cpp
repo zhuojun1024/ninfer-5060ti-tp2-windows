@@ -260,6 +260,34 @@ int main() {
             check(ledger.free_slots() == 0, "eviction returned a slot the fixed image still uses");
     }
 
+    // An image can serve more than one conversation, but only one of them keeps it alive: a
+    // borrower goes when the owner's slot is reclaimed, so a restore can never read a buffer that
+    // moved on.
+    {
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 1});
+        ConversationLog& owner  = ledger.conversation(1);
+        ConversationLog& reader = ledger.conversation(2);
+
+        const ReuseLedger::RecordResult owned = ledger.record(owner, grid(8192));
+        failures += check(owned.recorded, "the owning anchor was refused");
+
+        ReuseLedger::AnchorRequest borrowed = grid(8192);
+        borrowed.slot                       = owned.slot;
+        failures +=
+            check(ledger.record(reader, borrowed).recorded, "the borrowing anchor was refused");
+        failures +=
+            check(reader.anchors.floor(8192) != nullptr, "the borrowing anchor was not recorded");
+
+        // The pool is full; only the owner can make room, because the borrower holds no slot. The
+        // borrower must disappear with the image it names.
+        failures += check(ledger.record(ledger.conversation(3), grid(16384)).recorded,
+                          "the pool refused an anchor that the owner's eviction made room for");
+        failures +=
+            check(owner.anchors.floor(8192) == nullptr, "the evicted owner kept its anchor");
+        failures += check(reader.anchors.floor(8192) == nullptr,
+                          "a borrowed anchor survived the eviction of its image");
+    }
+
     std::cout << (failures == 0 ? "ok" : "failures") << '\n';
     return failures == 0 ? 0 : 1;
 }

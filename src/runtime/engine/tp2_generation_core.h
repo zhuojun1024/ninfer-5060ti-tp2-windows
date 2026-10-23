@@ -219,6 +219,10 @@ private:
             // stops covering this frontier: the state is only the state of *this* prompt's prefix
             // while the whole lineage agrees on the tokens before it.
             std::array<bool, kTp2GenerationMaxConcurrency> valid{};
+            // The lane whose metadata describes this slot's image: the pool hands a slot to
+            // whichever lane reserves it next, and every other lane's view of it goes with the
+            // overwrite.
+            std::int32_t writer = -1;
         };
         // Within a lane's slice the ring is split in two: [0, grid_slots) holds the position grid,
         // which keeps the whole context covered and is never evicted by the tail anchors;

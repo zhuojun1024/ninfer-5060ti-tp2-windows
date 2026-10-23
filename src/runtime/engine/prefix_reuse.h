@@ -54,6 +54,10 @@ struct Anchor {
     AnchorKvSource kv_source    = AnchorKvSource::Device;
     std::int32_t lane           = kAnyLane;
     std::int32_t slot           = kNoSlot;  // host image slot; kNoSlot for a device anchor
+    // A borrower names an image another conversation owns. The state after [0, position) does not
+    // depend on the lane that produced it, so more than one conversation may point at one image -
+    // but only the owner keeps it alive: when the owner's anchor goes, every borrower goes with it.
+    bool borrowed = false;
 };
 
 // Every decision names why it did or did not reuse. A free-text log line cannot be asserted on, so
@@ -187,8 +191,15 @@ public:
                         std::uint32_t device_extent, std::uint32_t host_extent);
 
 private:
+    // One conversation's claim on an image it does not own.
+    struct Borrower {
+        std::uint64_t session  = 0;
+        std::uint32_t position = 0;
+    };
     [[nodiscard]] std::int32_t allocate_slot();
     void release_slot(std::int32_t slot);
+    // Drops every borrowed anchor that names `slot`: the image below it is about to be overwritten.
+    void release_borrowers(std::int32_t slot);
     // Evicts the farthest Lru anchor of any conversation; false when none is evictable.
     bool evict_one();
     [[nodiscard]] std::uint32_t extent_for(const ConversationLog& conversation,
@@ -198,6 +209,10 @@ private:
     std::vector<bool> used_slots_;
     // Slots this ledger allocated, as opposed to ones a caller owns. Only these come back.
     std::vector<bool> owned_slots_;
+    // Per slot, the conversation that owns the image (0 when no conversation claimed it).
+    std::vector<std::uint64_t> owner_sessions_;
+    // Per slot, the conversations that point at the image without owning it.
+    std::vector<std::vector<Borrower>> borrowers_;
     std::unordered_map<std::uint64_t, ConversationLog> conversations_;
 };
 
