@@ -7164,7 +7164,8 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     // anchor, and reserving before the copy is what makes that safe - the slot handed back is free
     // the moment it is returned, so the evicted anchor was the one whose image this copy
     // overwrites.
-    const std::int32_t reserved = reuse_ledger_->reserve_image_slot();
+    const std::int32_t reserved = prompt_end ? reuse_ledger_->reserve_prompt_end_slot(lane)
+                                             : reuse_ledger_->reserve_image_slot();
     // Every image in the pool is held by an anchor that refused eviction: the capture is skipped,
     // and the caller already tolerates a boundary without a checkpoint.
     if (reserved == kNoSlot) {

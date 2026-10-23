@@ -41,13 +41,26 @@ std::optional<Anchor> AnchorTable::erase_at(std::uint32_t position) {
 }
 
 ReuseLedger::ReuseLedger(ReuseBudget budget) : budget_(budget) {
-    used_slots_.assign(budget_.capacity, false);
+    used_slots_.assign(budget_.capacity + budget_.prompt_end_capacity, false);
     owned_slots_.assign(budget_.capacity, false);
     holders_.resize(budget_.capacity);
 }
 
 std::uint32_t ReuseLedger::free_slots() const noexcept {
-    return static_cast<std::uint32_t>(std::count(used_slots_.begin(), used_slots_.end(), false));
+    // The rotation pool only, which is what a caller can take for a new boundary; the trailing
+    // slots are roles and are never available to it.
+    return static_cast<std::uint32_t>(
+        std::count(used_slots_.begin(), used_slots_.begin() + budget_.capacity, false));
+}
+
+std::int32_t ReuseLedger::reserve_prompt_end_slot(std::uint32_t lane) {
+    if (lane >= budget_.prompt_end_capacity) { return kNoSlot; }
+    const std::size_t slot = static_cast<std::size_t>(budget_.capacity) + lane;
+    if (slot >= used_slots_.size()) { return kNoSlot; }
+    // Claimed but never owned: releasing the anchor leaves the slot to the same role's next image
+    // instead of returning it to the rotation pool.
+    used_slots_[slot] = true;
+    return static_cast<std::int32_t>(slot);
 }
 
 bool ReuseLedger::holds_slot(std::int32_t slot) const noexcept {
@@ -92,8 +105,8 @@ void ReuseLedger::drop_hold(std::size_t slot, std::uint64_t session) {
 std::int32_t ReuseLedger::reserve_image_slot() {
     std::int32_t slot = allocate_slot();
     if (slot != kNoSlot) { return slot; }
-    // Every image is held by a Pinned anchor: refusing is the honest outcome, because clearing a
-    // pinned image to make room would break the guarantee it exists for.
+    // The rotation pool is full of images a Pinned anchor needs: refusing is the honest outcome,
+    // because clearing a pinned image to make room would break the guarantee it exists for.
     if (!evict_one()) { return kNoSlot; }
     return allocate_slot();
 }

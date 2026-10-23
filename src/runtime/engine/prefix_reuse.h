@@ -99,8 +99,15 @@ struct ReuseBudget {
     // The coverage contract. One stride is the worst-case re-prefill - 8,192 tokens is about 4.9 s at
     // the measured 1,687 tok/s - and it does not follow the image budget.
     std::uint32_t stride = 8192;
-    // Host state images this route may hold. 0 disables reuse.
+    // Host state images this route may hold. 0 disables reuse. Rotation images only: a prompt end
+    // is not a rotation image and does not compete for these slots.
     std::uint32_t capacity = 20;
+    // One slot per lane for the image of a prefill's own end. It is written once per completed
+    // prefill and never rotates, so it gets its own slot instead of taking one a rotation boundary
+    // would need: a workload of several conversations pins several of these at once, and letting
+    // them drain the rotation pool is what made a family of conversations sharing a system prompt
+    // freeze nothing at all.
+    std::uint32_t prompt_end_capacity = 0;
 };
 
 // A conversation's canonical token stream plus the images it owns.
@@ -175,7 +182,13 @@ public:
     // that anchor returns the slot to the budget. Reserve before the copy is enqueued, because a
     // full pool evicts here — the evicted anchor's image is the one the copy is about to overwrite.
     // kNoSlot means the pool holds nothing evictable; the caller then skips the capture.
+    // `requester` is the conversation asking for the slot: the one conversation whose only image an
+    // eviction must not take.
     [[nodiscard]] std::int32_t reserve_image_slot();
+    // Reserves the slot of one lane's prompt-end image, which is a role rather than a place in the
+    // rotation pool. Claimed but never owned: releasing the anchor leaves the slot for the same
+    // role's next image instead of returning it to the pool.
+    [[nodiscard]] std::int32_t reserve_prompt_end_slot(std::uint32_t lane);
 
 private:
     [[nodiscard]] std::int32_t allocate_slot();
@@ -190,7 +203,10 @@ private:
     void release_slot(std::int32_t slot);
     // Frees unconditionally; only called once the holder set is empty.
     void free_slot(std::size_t slot);
-    // Evicts the farthest Lru anchor this ledger may take; false when none is evictable.
+    // Evicts the farthest anchor this ledger may take: an Lru image first, and only when the pool
+    // has none left, one of the shallow images of a conversation that froze several. False when
+    // nothing is evictable, which is the pool being genuinely full of images every conversation
+    // needs.
     bool evict_one();
 
     ReuseBudget budget_;
