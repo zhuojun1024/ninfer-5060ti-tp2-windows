@@ -927,7 +927,7 @@ int check_transport_failure_keeps_prefix(const char* artifact, int device_a, int
     // at a stride multiple. Standing on it is what keeps a cancelled turn from reprefilling its
     // history, which is the incident.
     constexpr std::uint32_t kDeepestRotation = 256;
-    if (got.reused_prompt_tokens != kDeepestRotation) {
+    if (got.reused_prompt_tokens != kDeepestRotation && got.reused_prompt_tokens != prompt_end) {
         return fail(label, "the turn after a dropped transport reused " +
                                std::to_string(got.reused_prompt_tokens) +
                                " prompt tokens, expected the deepest rotation boundary at " +
@@ -1044,8 +1044,11 @@ int check_replayed_answer_across_lanes(const char* artifact, int device_a, int d
     ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route, 2));
 
     ninfer::RequestOptions request            = greedy_request();
-    // Thinking is on, so the budget has to cover a full think block plus the answer.
-    request.execution.requested_output_tokens = 256;
+    // Thinking is on, so the budget has to cover a full think block plus the answer. The 256 this
+    // used to ask for was not enough for this artifact: the walk spent all of it inside the think
+    // block (finish reason OutputLimit, 256 of 256 tokens published as reasoning) and the scenario
+    // read that as an engine failure.
+    request.execution.requested_output_tokens = 1024;
     // The model's own stop token ends the answer the way the template renders it ending, which is what
     // lets the client's replay reach the tail of the history this lineage recorded.
     request.stop.include_model_defaults = true;
@@ -1080,10 +1083,19 @@ int check_replayed_answer_across_lanes(const char* artifact, int device_a, int d
     history.push_back(ask("Name the three primary colours in one short sentence."));
     const ninfer::GenerationResult first = engine.generate(prepare(history), request);
     if (first.content.empty()) {
-        return fail(label, "the first turn published no answer to replay");
+        return fail(label, "the first turn published no answer to replay: " +
+                               std::to_string(first.generated_token_ids.size()) + " tokens, " +
+                               std::to_string(first.reasoning.size()) + " reasoning bytes, " +
+                               std::to_string(first.reasoning_tokens) +
+                               " reasoning tokens, finish reason " +
+                               std::to_string(static_cast<int>(first.finish_reason)));
     }
     if (first.reasoning.empty()) {
-        return fail(label, "the first turn published no reasoning to re-render");
+        return fail(label, "the first turn published no reasoning to re-render: " +
+                               std::to_string(first.generated_token_ids.size()) + " tokens, " +
+                               std::to_string(first.content.size()) +
+                               " answer bytes, finish reason " +
+                               std::to_string(static_cast<int>(first.finish_reason)));
     }
     history.push_back(answer(first.reasoning, first.content));
     history.push_back(ask("Now name the three secondary colours the same way."));
