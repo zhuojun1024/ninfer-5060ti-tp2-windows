@@ -91,17 +91,6 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.active_captures_aborted != report.previous.active_captures_aborted ||
            report.current.cancelled_continuations_retained !=
                report.previous.cancelled_continuations_retained ||
-           report.current.root_selections != report.previous.root_selections ||
-           report.current.private_endpoint_selections !=
-               report.previous.private_endpoint_selections ||
-           report.current.private_turn_closure_selections !=
-               report.previous.private_turn_closure_selections ||
-           report.current.private_response_replay_selections !=
-               report.previous.private_response_replay_selections ||
-           report.current.private_long_anchor_selections !=
-               report.previous.private_long_anchor_selections ||
-           report.current.shared_stable_prefix_selections !=
-               report.previous.shared_stable_prefix_selections ||
            report.current.reuse_source_device != report.previous.reuse_source_device ||
            report.current.reuse_source_host_slab != report.previous.reuse_source_host_slab ||
            report.current.reuse_source_live_state != report.previous.reuse_source_live_state ||

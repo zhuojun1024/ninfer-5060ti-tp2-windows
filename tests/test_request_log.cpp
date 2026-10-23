@@ -574,7 +574,6 @@ int main() {
     throughput.committed_decode_tokens                  = 40;
     throughput.decode_rounds                            = 10;
     throughput.decode_row_rounds                        = 18;
-    throughput.previous.root_selections                 = 2;
     throughput.previous.state_h2d_bytes                 = 100;
     throughput.current.running_requests                 = 2;
     throughput.current.prefilling_requests              = 1;
@@ -583,13 +582,11 @@ int main() {
     throughput.current.materializing_requests           = 1;
     throughput.current.capture_pending_requests         = 1;
     throughput.current.terminal_pending_requests        = 1;
-    throughput.current.root_selections                  = 3;
     throughput.current.state_h2d_count                  = 1;
     throughput.current.state_h2d_bytes                  = 132;
     throughput.current.state_h2d_seconds                = 0.25;
     throughput.current.device_state_occupied_images      = 3;
     throughput.current.host_state_occupied_images        = 1;
-    throughput.current.last_selected_frontier_tokens    = 64;
     throughput.previous.reused_prompt_tokens            = 400;
     throughput.previous.reuse_source_none               = 1;
     throughput.current.reused_prompt_tokens             = 1000;
@@ -694,8 +691,7 @@ int main() {
                 .is_null(),
         "zero Host-work denominators must serialize as null");
     failures += check(
-        throughput_json.at("context_cache").at("selections").at("root") == 1 &&
-            throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
+        throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_images") == 3 &&
             throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&

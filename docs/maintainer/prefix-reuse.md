@@ -525,10 +525,14 @@ FP8 AllReduce（`NINFER_TP2_AR_CODEC=bf16` 后所有复用数字一位不差，�
 `tp2_generation_core.h` 全量重建，`ninfer-serve --devices 0,1` 从 0/10 变成 **4/4 存活 50 秒**，真实请求也通了
 （59 prompt / 8 completion token）。此前所有"设备释放窗口""`DevicePair` 留坏状态""第三张卡""FP8 codec"的结论全部作废。
 
-教训：改了被广泛包含的头文件后必须确认所有依赖它的 TU 都重编过。这类不一致不会报错，只会让另一侧的堆块被写穿，
-症状是驱动内部随机 AV，而栈看上去总在无辜的地方（`cudaMalloc`、`cudaGetDeviceProperties`、空闲线程跳 0）。
-`tests/models/qwen3_5/test_tp2_startup_order.cpp` 现在覆盖"`Engine` 在两张卡上完成加载"这条产品启动路径，
-`NINFER_GUARD_HEAP=1` 可以在下次出现同类症状时直接定位到越界写的那条指令。
+**为什么会有陈旧目标文件**：中文 MSVC 把 `/showIncludes` 的输出写成"注意: 包含文件:"，CMake 只认英文前缀，
+于是**一条头文件依赖都没记下来**；改头文件后增量构建什么都不做，二进制里混着两套结构体布局。同一天再修一次时
+（改 `engine_core.h` 后 ninja 报 "no work to do"）确认了这一点。修法：`tools/win_port/vcvars.ps1` 设 `VSLANG=1033`，
+顶层 `CMakeLists.txt` 在 `CMAKE_CL_SHOWINCLUDES_PREFIX` 为空时直接 `FATAL_ERROR`；旧对象没有依赖记录，
+必须 `--clean-first` 重建一次。细节见 `docs/windows.md`。
+
+教训：一次"重建就好"的崩溃，先怀疑构建，再怀疑引擎。`tests/models/qwen3_5/test_tp2_startup_order.cpp` 现在覆盖
+"`Engine` 在两张卡上完成加载"这条产品启动路径，`NINFER_GUARD_HEAP=1` 可以在下次出现同类症状时直接定位到越界写的那条指令。
 
 方案 B 随后改为**惰性分配**（首次捕获时才申请），实测正常：捕获到 `pos=21641 / 21667 / 21825`，正是每轮的一致点，
 比共享块边界 21,504 深 137–321 token。**但 recall 尚未把它当候选**，所以复用数字仍是 21,504。
@@ -904,3 +908,21 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 **双卡端到端已跑通（2026-10-23）**：启动崩溃的根因是陈旧目标文件（§12 历史那条），重建后 `ninfer-serve --devices 0,1`
 连续 4 次启动存活、并完成一次真实请求（59 prompt / 8 completion token）。这次请求是全新对话，没有可复用前缀，
 所以 `context_cache.reuse` 的计数正确停在 0——**计数本身的非零路径仍未在真实双卡请求上验证**，只有单元断言覆盖。
+
+**已执行（2026-10-23，单卡侧接线，第 3 步收口）**：
+
+- 生产在 `request_plan.cpp` 的 `inspect_lane()`，四处复用点各设一次 `summary.reuse_source`：
+  `SharedStablePrefix` 与 `PrivateLongAnchor` 取**服务该前缀的状态镜像的驻留**；`PrivateEndpoint` 是活前沿、
+  不恢复任何镜像，报 `LiveState`；rewrite 检查点没有状态镜像时页从 host store 回来，报 `HostSlab`。
+- **`Both` 归 `Device`**（原未定项 1）：`checkpoint_recovery.cpp:371` 只在设备副本缺失时才追加 host→device
+  需求，所以两份都在时读的是设备副本。规则固定在 `reuse_storage_kind()` 一处，不再靠猜。
+- 载体：`RequestPlanSummary` → `RequestControl::Prefill` → `BeginSummary` → `GenerationResult`；
+  `complete_success()` 末尾 `record_reuse(result)` 累加，并断言 §17.3 的不变量（违反即抛，报出三个字段）。
+- 删除：`record_prefix_selection()`、六个 `*_selections`、`last_selected_frontier_tokens`、
+  `context_cache.selections` 与 `last_selection`；`report_has_activity()` 的六个旧触发器换成新的六个。
+  `reused_prompt_tokens` 保留——它现在是 `context_cache.reuse` 块里的单调计数器，仍在完成时按实际值累加。
+- 验证：`test_request_log` 通过（删掉旧指标后它从长期失败转为通过）。单卡真实请求同一会话连跑三轮，
+  `prompt_tokens_details.cached_tokens` 依次 **0 → 127 → 144**，不变量未被触发。这台机器的单卡路线要先过内存关：
+  权重 15.2 GiB，只有 `--embedding-host` + `--max-context 512` 才装得进 16 GiB 卡，所以单卡验证只能是短上下文。
+- 观测欠账：`--log-stats-interval-ms` 没吐出带 `context_cache` 的周期报告（试了两次），所以计数器的**区间相减**
+  没有人眼验证过，只有 JSON 形状的单元断言与逐轮 `cached_tokens` 佐证。

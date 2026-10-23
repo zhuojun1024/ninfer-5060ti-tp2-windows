@@ -337,6 +337,8 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
+            .reuse_source       = request_plan.summary.reuse_source,
+            .reuse_reason       = request_plan.summary.reuse_reason,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));

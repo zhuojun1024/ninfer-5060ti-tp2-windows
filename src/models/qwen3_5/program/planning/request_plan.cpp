@@ -437,6 +437,25 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+namespace {
+
+// Which storage serves a reused prefix (docs/maintainer/prefix-reuse.md §17.2). The recovery
+// planner only appends a host-to-device requirement when the device replica is missing
+// (`checkpoint_recovery.cpp:371`), so a state that exists in both places is read from the device:
+// `Both` is `Device`, not `HostSlab`.
+ReuseSourceKind reuse_storage_kind(StateReplicaResidency residency) {
+    switch (residency) {
+    case StateReplicaResidency::DeviceOnly:
+    case StateReplicaResidency::Both:
+        return ReuseSourceKind::Device;
+    case StateReplicaResidency::HostOnly:
+        break;
+    }
+    return ReuseSourceKind::HostSlab;
+}
+
+} // namespace
+
 std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
@@ -480,6 +499,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse       = ReusePath::SharedStablePrefix;
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
+        plan->summary.reuse_source =
+            reuse_storage_kind(state_store->residency(shared_source->state));
+        plan->summary.reuse_reason = ReuseReasonKind::Used;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
@@ -500,6 +522,10 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
             plan->reuse      = ReusePath::PrivateEndpoint;
             plan->reuse_base = selected.frontier;
+            // The endpoint is this session's own live frontier: nothing is restored, the state is
+            // already where the suffix continues.
+            plan->summary.reuse_source = ReuseSourceKind::LiveState;
+            plan->summary.reuse_reason = ReuseReasonKind::Used;
         } else if (selected.kind == runtime::CheckpointKind::LongAnchor) {
             const auto anchor =
                 std::find_if(source->long_anchors.begin(), source->long_anchors.end(),
@@ -517,6 +543,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             plan->reuse       = ReusePath::PrivateLongAnchor;
             plan->reuse_base  = selected.frontier;
             plan->source_mode = runtime::PrivateSourceMode::Retain;
+            plan->summary.reuse_source = reuse_storage_kind(state_store->residency(anchor->state));
+            plan->summary.reuse_reason = ReuseReasonKind::Used;
         } else {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private rewrite checkpoint ordinal is invalid");
@@ -533,6 +561,13 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             }
             plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
             plan->reuse_base = selected.frontier;
+            // A rewrite checkpoint's state image is optional; without one the pages come back from
+            // the host store, which is the same round trip `HostSlab` names.
+            plan->summary.reuse_source =
+                source->rewrite_state
+                    ? reuse_storage_kind(state_store->residency(*source->rewrite_state))
+                    : ReuseSourceKind::HostSlab;
+            plan->summary.reuse_reason = ReuseReasonKind::Used;
         }
     }
 

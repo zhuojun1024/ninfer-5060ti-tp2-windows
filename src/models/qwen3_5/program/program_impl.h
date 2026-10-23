@@ -424,6 +424,10 @@ struct RequestControl {
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
+        // Which storage serves the reused prefix, in the redesign's own terms (prefix-reuse.md
+        // §17).
+        ReuseSourceKind reuse_source        = ReuseSourceKind::None;
+        ReuseReasonKind reuse_reason        = ReuseReasonKind::NoAnchorAtOrBefore;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
     };
 

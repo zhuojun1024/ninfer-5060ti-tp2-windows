@@ -16,6 +16,20 @@ endif()
 # and tools/win_port/package.ps1 refuses to package a tree whose tag does not match.
 project(ninfer VERSION 0.1.2 LANGUAGES C CXX CUDA)
 
+# Every object file's header dependencies come from cl.exe's localized `/showIncludes` note, which
+# CMake decodes with the ANSI code page. When that disagrees with the bytes the compiler writes, the
+# recorded prefix matches no line, ninja stores zero dependencies, and an incremental build then
+# keeps stale objects whose struct layouts disagree — which surfaces as a heap overrun far away. The
+# prefix cannot be trusted here, so only the crude case is refused; tools/win_port/build.ps1 repairs
+# the recorded prefix by asking the compiler what it prints, and it must be the entry point used for
+# configure (docs/windows.md).
+if(MSVC AND NOT CMAKE_CL_SHOWINCLUDES_PREFIX)
+  message(FATAL_ERROR
+    "CMake did not detect the MSVC /showIncludes prefix, so no header dependencies would be "
+    "recorded and incremental builds would keep stale objects. Run tools/win_port/build.ps1 "
+    "-Configure, which repairs the recorded prefix.")
+endif()
+
 # WSL2's virtualized driver (591.x) segfaults inside the driver JIT compiler
 # during CUDA initialization with the dynamically linked CUDA 13.1 runtime;
 # the static runtime avoids that path. Off by default: native builds keep the

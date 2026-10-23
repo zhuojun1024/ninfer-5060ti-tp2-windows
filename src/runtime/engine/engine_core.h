@@ -557,29 +557,43 @@ private:
         published_stats_ = snapshot;
     }
 
-    void record_prefix_selection(const RequestPlanSummary& summary) noexcept {
-        switch (summary.prefix_reuse_path) {
-        case PrefixReusePath::Root:
-            ++cumulative_stats_.root_selections;
+    // One record per completed prefill (docs/maintainer/prefix-reuse.md §17): the storage that
+    // served the reused prefix, why the decision went as it did, and how many tokens it saved.
+    // Taken from the route's own result rather than from the plan's estimate, at the same place the
+    // route's `computed_prefill_tokens` is taken, so the two cover the same population. The four
+    // legal pairs are asserted here because this is where both fields are final.
+    void record_reuse(const GenerationResult& result) {
+        const bool served = result.reuse_source != ReuseSourceKind::None;
+        if ((result.reused_prompt_tokens > 0) != served ||
+            served != (result.reuse_reason == ReuseReasonKind::Used)) {
+            throw std::logic_error("reuse decision is inconsistent: tokens=" +
+                                   std::to_string(result.reused_prompt_tokens) +
+                                   " source=" + reuse_source_kind_name(result.reuse_source) +
+                                   " reason=" + reuse_reason_kind_name(result.reuse_reason));
+        }
+        switch (result.reuse_source) {
+        case ReuseSourceKind::Device:
+            ++cumulative_stats_.reuse_source_device;
             break;
-        case PrefixReusePath::PrivateEndpoint:
-            ++cumulative_stats_.private_endpoint_selections;
+        case ReuseSourceKind::HostSlab:
+            ++cumulative_stats_.reuse_source_host_slab;
             break;
-        case PrefixReusePath::PrivateTurnClosure:
-            ++cumulative_stats_.private_turn_closure_selections;
+        case ReuseSourceKind::LiveState:
+            ++cumulative_stats_.reuse_source_live_state;
             break;
-        case PrefixReusePath::PrivateResponseReplay:
-            ++cumulative_stats_.private_response_replay_selections;
-            break;
-        case PrefixReusePath::PrivateLongAnchor:
-            ++cumulative_stats_.private_long_anchor_selections;
-            break;
-        case PrefixReusePath::SharedStablePrefix:
-            ++cumulative_stats_.shared_stable_prefix_selections;
+        case ReuseSourceKind::None:
+            ++cumulative_stats_.reuse_source_none;
             break;
         }
-        cumulative_stats_.reused_prompt_tokens += summary.reusable_prompt_tokens;
-        cumulative_stats_.last_selected_frontier_tokens = summary.reusable_prompt_tokens;
+        if (served) {
+            ++cumulative_stats_.reuse_reason_used;
+        } else {
+            ++cumulative_stats_.reuse_reason_no_anchor;
+        }
+        cumulative_stats_.reused_prompt_tokens += result.reused_prompt_tokens;
+        cumulative_stats_.last_reuse_tokens = result.reused_prompt_tokens;
+        cumulative_stats_.last_reuse_source = result.reuse_source;
+        cumulative_stats_.last_reuse_reason = result.reuse_reason;
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
@@ -864,6 +878,8 @@ private:
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.reuse_source         = request->begin->reuse_source;
+            result.reuse_reason         = request->begin->reuse_reason;
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -892,6 +908,7 @@ private:
             request->result        = std::move(result);
             request->response_done = true;
         }
+        record_reuse(request->result);
         if (mark_completed(request)) { release_reserved_capacity(); }
         request->cv.notify_one();
     }
@@ -1370,7 +1387,16 @@ private:
             throw std::logic_error("completed prefill has no lane or pending token");
         }
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
-            throw std::logic_error("runtime Begin summary differs from committed admission");
+            const auto describe = [](const BeginSummary& summary) {
+                return "tokens=" + std::to_string(summary.reused_prompt_tokens) +
+                       " path=" + std::to_string(static_cast<int>(summary.prefix_reuse_path)) +
+                       " source=" + std::string(reuse_source_kind_name(summary.reuse_source)) +
+                       " reason=" + std::string(reuse_reason_kind_name(summary.reuse_reason));
+            };
+            throw std::logic_error(
+                "runtime Begin summary differs from committed admission: runtime " +
+                describe(progress.summary) + " vs admitted " +
+                (request->admitted_begin ? describe(*request->admitted_begin) : "none"));
         }
         const std::uint32_t lane = request->lane->value;
         if (scheduler_.prefill_lane() == lane) {
@@ -1546,7 +1572,6 @@ private:
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;
                     slots_[lane]                 = request;
-                    record_prefix_selection(control.summary);
                     materializing_.reset();
                     scheduler_.set_prefill_lane(lane);
                     request_admission_check();
@@ -1654,7 +1679,9 @@ private:
         publish_generation_start(
             request, BeginSummary{.prompt_tokens        = summary.prompt_tokens,
                                   .reused_prompt_tokens = summary.reusable_prompt_tokens,
-                                  .prefix_reuse_path    = summary.prefix_reuse_path});
+                                  .prefix_reuse_path    = summary.prefix_reuse_path,
+                                  .reuse_source         = summary.reuse_source,
+                                  .reuse_reason         = summary.reuse_reason});
 
         publish_runtime_stats();
         return progress_context_transaction(false);

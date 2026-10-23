@@ -1015,14 +1015,7 @@ struct RuntimeStats {
     // discarding the whole active continuation.
     std::uint64_t cancelled_continuations_retained = 0;
 
-    std::uint64_t root_selections                    = 0;
-    std::uint64_t private_endpoint_selections        = 0;
-    std::uint64_t private_turn_closure_selections    = 0;
-    std::uint64_t private_response_replay_selections = 0;
-    std::uint64_t private_long_anchor_selections     = 0;
-    std::uint64_t shared_stable_prefix_selections    = 0;
-    std::uint64_t reused_prompt_tokens               = 0;
-    std::uint32_t last_selected_frontier_tokens      = 0;
+    std::uint64_t reused_prompt_tokens = 0;
 
     // Which storage served a reused prefix, and why the decision went as it did: one record per
     // completed prefill, two axes. A request that reused names a non-None source and reason Used; one
