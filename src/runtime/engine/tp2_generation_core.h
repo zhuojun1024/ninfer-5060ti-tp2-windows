@@ -847,8 +847,14 @@ private:
     // the one a live lineage continues from, not a rotation image: a later prompt that happens to
     // share this prefix would be restarting on KV another prefill wrote, which is ulp-apart from
     // its own walk (see prefix-reuse.md 18.5), so the ring scan does not offer these.
-    void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, std::uint32_t lane,
-                                  bool prompt_end = false);
+    // One boundary is one slot: this reserves it once and writes both shards' halves at the same
+    // index, because a restore addresses the pair with that single number. Reserving per shard let
+    // the ledger hand the halves different indices, and the peer then restored whatever its own
+    // ring happened to hold there - a state belonging to another prompt, at the same position,
+    // which no fingerprint taken on the writer's shard can catch.
+    void snapshot_host_pair(std::uint32_t frontier, std::uint32_t lane, bool prompt_end = false);
+    void snapshot_host_checkpoint(Shard& shard, std::size_t slot, std::uint32_t frontier,
+                                  std::uint32_t lane, bool prompt_end);
     // Makes every checkpoint the lane's current prefill wrote usable, and stamps each of them with
     // the prefix it froze: `history` is the token stream the walk really stood on (the prompt, plus
     // `tail` when the answer decode extended it). Only a completed prefill (or a cancelled walk

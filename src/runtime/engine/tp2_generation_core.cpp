@@ -3043,8 +3043,8 @@ void TP2GenerationCore::publish_lane_prefill(
     // The prefill end is a boundary like any other, so it is published into the ring's prompt-end
     // slot: that is where a store reads the prompt-end image and where a returning turn stands
     // without a device plane. It is written before the sweep below, which is what makes it usable.
-    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane, /*prompt_end=*/true);
-    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane, /*prompt_end=*/true);
+    snapshot_host_pair(prompt_tokens, lane, /*prompt_end=*/true);
+
     // Only now are this prefill's checkpoints usable: their state is one the prefill reached and
     // their KV prefix is one it wrote.
     publish_lane_checkpoints(lane, tokens, {});
@@ -3096,8 +3096,8 @@ void TP2GenerationCore::publish_partial_prefill(std::uint32_t lane, std::uint32_
     // The truncated prompt end is a boundary like a completed one, so it goes into the ring's
     // prompt-end slot and the sweep makes it usable: that is what lets the retry of the same prompt
     // stand on it.
-    snapshot_host_checkpoint(shard_a_, frontier, lane, /*prompt_end=*/true);
-    snapshot_host_checkpoint(shard_b_, frontier, lane, /*prompt_end=*/true);
+    snapshot_host_pair(frontier, lane, /*prompt_end=*/true);
+
     publish_lane_checkpoints(lane, tokens, {});
     session_publish(
         std::vector<TokenId>(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(frontier)),
@@ -3984,22 +3984,20 @@ void TP2GenerationCore::execute_plain_batch(
                     capture_reuse_boundary(lane_id);
                 }
                 if (frontier >= next_host_checkpoint) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
+
                     next_host_checkpoint =
                         (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
                 } else if (frontier != lane.prompt_tokens &&
                            static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
                 }
                 if (anchor_divergence && frontier == anchor_position) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
                 }
                 if (block_anchor && frontier == block_position) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
+
                     // The id names the prefill that wrote it, so an eviction can tell this
                     // conversation's own block state from a later conversation's rewrite of the slot.
                     retention(lane_id).block_anchor_position   = block_position;
@@ -5074,8 +5072,8 @@ void TP2GenerationCore::execute_spec_batch(
                                                     &flush_end, 1);
                         retention(lane.slot).dflash_context_frontier = frontier;
                     }
-                    snapshot_host_checkpoint(shard_a_, frontier, lane.slot);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane.slot);
+                    snapshot_host_pair(frontier, lane.slot);
+
                     next = frontier + kReuseGeneratedTailStride;
                 }
             }
@@ -5352,22 +5350,20 @@ void TP2GenerationCore::execute_spec_batch(
                     capture_reuse_boundary(lane_id);
                 }
                 if (frontier >= next_host_checkpoint) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
+
                     next_host_checkpoint =
                         (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
                 } else if (frontier != lane.prompt_tokens &&
                            static_cast<std::uint64_t>(frontier) + tail_span > lane.prompt_tokens) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
                 }
                 if (anchor_divergence && frontier == anchor_position) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
                 }
                 if (block_anchor && frontier == block_position) {
-                    snapshot_host_checkpoint(shard_a_, frontier, lane_id);
-                    snapshot_host_checkpoint(shard_b_, frontier, lane_id);
+                    snapshot_host_pair(frontier, lane_id);
+
                     // The id names the prefill that wrote it, so an eviction can tell this
                     // conversation's own block state from a later conversation's rewrite of the slot.
                     retention(lane_id).block_anchor_position   = block_position;
@@ -7164,26 +7160,11 @@ void TP2GenerationCore::capture_reuse_boundary(std::uint32_t lane) {
     }
 }
 
-void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier,
-                                                 std::uint32_t lane, bool prompt_end) {
+void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::size_t slot,
+                                                 std::uint32_t frontier, std::uint32_t lane,
+                                                 bool prompt_end) {
     if (shard.host_checkpoints.empty() || reuse_ledger_ == nullptr) { return; }
     ++prefill_host_writes_;
-    // Every host image comes out of the ledger's pool, which owns every slot of the ring. One
-    // allocator over one pool: the slot an image lands in follows the same eviction rule as its
-    // anchor, and reserving before the copy is what makes that safe - the slot handed back is free
-    // the moment it is returned, so the evicted anchor was the one whose image this copy
-    // overwrites.
-    const std::int32_t reserved = prompt_end ? reuse_ledger_->reserve_prompt_end_slot(lane)
-                                             : reuse_ledger_->reserve_image_slot();
-    // Every image in the pool is held by an anchor that refused eviction: the capture is skipped,
-    // and the caller already tolerates a boundary without a checkpoint.
-    if (reserved == kNoSlot) {
-        if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
-            std::fprintf(stderr, "[tp2-cp] skip lane=%u pos=%u pool exhausted\n", lane, frontier);
-        }
-        return;
-    }
-    const std::size_t slot = static_cast<std::size_t>(reserved);
     if (slot >= shard.host_checkpoints.size()) {
         throw std::logic_error("TP-2 ledger reserved a slot outside the host ring");
     }
@@ -7233,6 +7214,30 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     }
     // The rotating images are the ledger's to place now, so the per-lane next-index counters that
     // used to rotate them are gone; the pool decides which slot an image lands in.
+}
+
+void TP2GenerationCore::snapshot_host_pair(std::uint32_t frontier, std::uint32_t lane,
+                                           bool prompt_end) {
+    if (shard_a_.host_checkpoints.empty() || shard_b_.host_checkpoints.empty() ||
+        reuse_ledger_ == nullptr) {
+        return;
+    }
+    // One boundary, one slot: both shards' images have to live at the same index, because a restore
+    // addresses the pair with a single slot number. Reserving per shard let the ledger hand the two
+    // halves different indices, and the peer then restored whatever its ring happened to hold
+    // there. Every image in the pool is held by an anchor that refused eviction: the capture is
+    // skipped, and the caller already tolerates a boundary without a checkpoint.
+    const std::int32_t reserved = prompt_end ? reuse_ledger_->reserve_prompt_end_slot(lane)
+                                             : reuse_ledger_->reserve_image_slot();
+    if (reserved == kNoSlot) {
+        if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
+            std::fprintf(stderr, "[tp2-cp] skip lane=%u pos=%u pool exhausted\n", lane, frontier);
+        }
+        return;
+    }
+    const std::size_t slot = static_cast<std::size_t>(reserved);
+    snapshot_host_checkpoint(shard_a_, slot, frontier, lane, prompt_end);
+    snapshot_host_checkpoint(shard_b_, slot, frontier, lane, prompt_end);
 }
 
 void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
@@ -7920,8 +7925,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // ring's prompt-end slot and the sweep makes it usable: that is what lets the retry of
                 // the same prompt stand on it. It is written after the flush so the checkpoint's draft
                 // frontier names the same position.
-                snapshot_host_checkpoint(shard_a_, t0, lane, /*prompt_end=*/true);
-                snapshot_host_checkpoint(shard_b_, t0, lane, /*prompt_end=*/true);
+                snapshot_host_pair(t0, lane, /*prompt_end=*/true);
+
                 publish_lane_checkpoints(lane, token_ids, request.generated);
 
                 session_publish(
@@ -8041,21 +8046,19 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             const bool in_tail           = frontier != prompt_tokens &&
                                  static_cast<std::uint64_t>(frontier) + tail_span > prompt_tokens;
             if (on_grid) {
-                snapshot_host_checkpoint(shard_a_, frontier, lane);
-                snapshot_host_checkpoint(shard_b_, frontier, lane);
+                snapshot_host_pair(frontier, lane);
+
                 next_host_checkpoint =
                     (frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
             } else if (in_tail) {
-                snapshot_host_checkpoint(shard_a_, frontier, lane);
-                snapshot_host_checkpoint(shard_b_, frontier, lane);
+                snapshot_host_pair(frontier, lane);
             }
             if (anchor_divergence && frontier == anchor_position) {
-                snapshot_host_checkpoint(shard_a_, frontier, lane);
-                snapshot_host_checkpoint(shard_b_, frontier, lane);
+                snapshot_host_pair(frontier, lane);
             }
             if (block_anchor && frontier == block_position) {
-                snapshot_host_checkpoint(shard_a_, frontier, lane);
-                snapshot_host_checkpoint(shard_b_, frontier, lane);
+                snapshot_host_pair(frontier, lane);
+
                 // The id names the walk that wrote it, so the eviction can tell this conversation's
                 // own block state from a later conversation's rewrite of the same slot.
                 lane_state.block_anchor_position   = block_position;
@@ -8170,8 +8173,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // The prompt end is a boundary like any other: it goes into the ring's prompt-end slot, which is
     // where a store reads the prompt-end image and where a returning turn stands when the
     // configuration keeps no device plane.
-    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane, /*prompt_end=*/true);
-    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane, /*prompt_end=*/true);
+    snapshot_host_pair(prompt_tokens, lane, /*prompt_end=*/true);
+
     // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
     // resident catalog entry describes what the walk just wrote. A conversation that had no entry
     // yet gets one here, before decode extends its history.
@@ -8785,8 +8788,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;
             if (committed_frontier >= next_host_checkpoint) {
                 flush_dflash_context(committed_frontier);
-                snapshot_host_checkpoint(shard_a_, committed_frontier, lane);
-                snapshot_host_checkpoint(shard_b_, committed_frontier, lane);
+                snapshot_host_pair(committed_frontier, lane);
+
                 next_host_checkpoint =
                     (committed_frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
             }

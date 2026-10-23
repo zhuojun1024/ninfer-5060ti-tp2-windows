@@ -360,8 +360,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // The stable-block family of the last scenario, built here because the oracle needs it too: X
     // carries the block and is evicted by a probe that agrees with it for 16 tokens, the two side
     // requests share nothing with the family or with each other, and w1/w2 open with the same block
-    // behind different tails.
-    const std::vector<TokenId> family_block = make_prompt(70000, 500);
+    // behind different tails. The block ends a margin inside a grid point (528 - 16 = 512), because
+    // the anchor a recalled walk freezes at the divergence is a rotation image and the ring only
+    // offers boundaries on the walk's chunk grid.
+    const std::vector<TokenId> family_block     = make_prompt(70000, 528);
     constexpr std::uint32_t family_probe_prefix = 16;
     std::vector<TokenId> family_x = family_block;
     append(family_x, make_prompt(71000, 128));
@@ -672,8 +674,14 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     if (burst.generated_token_ids.empty()) {
         return fail(label, "the scenario's long turn generated nothing to reuse");
     }
-    const std::uint32_t burst_frontier = grid_floor(
-        burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()) - 1U);
+    // The long turn's prefill writes rotation images only inside its tail window, and its own end
+    // goes into the role slot the ring scan does not offer, so the deepest boundary this
+    // conversation can stand on is the grid point inside that window - not the grid point behind
+    // the frontier the answer reached. The number this used to expect was a slot the scan had never
+    // been able to trust: it carried the right position and the right prefix hash, but its bytes
+    // came from another prefill (see prefix-reuse.md 18.7), so it passed while the peer restored a
+    // state that was never the prompt's.
+    const std::uint32_t burst_frontier = grid_floor(burst_prompt_end);
     const ninfer::GenerationResult burst_continued =
         run_budget(engine, burst_history, kContinueBudget);
     if (burst_continued.reused_prompt_tokens != burst_frontier) {
@@ -1255,16 +1263,13 @@ int main() {
                 status != 0) {
                 return status;
             }
-            // Not part of the gate: it is red today at two of three boundary depths, and its
-            // subject is the image path rather than the reuse decisions the rest of this file pins.
-            // Run it by hand with NINFER_IMAGE_EQUALITY=1 (and NINFER_IMAGE_BLOCK=<chunks> for a
-            // given depth).
-            if (std::getenv("NINFER_IMAGE_EQUALITY") != nullptr) {
-                if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
-                                                                        devices.second, route);
-                    status != 0) {
-                    return status;
-                }
+            // The image path's own regression: a walk standing on an image has to reproduce the
+            // cold walk of the same prompt, at every depth the ring can hand out.
+            // `NINFER_IMAGE_BLOCK` sweeps the depth by hand; the gate runs the default one.
+            if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
+                                                                    devices.second, route);
+                status != 0) {
+                return status;
             }
             if (const int status = run_scenario(artifact, devices.first, devices.second, route);
                 status != 0) {
