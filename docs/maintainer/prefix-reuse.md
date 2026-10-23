@@ -1120,6 +1120,26 @@ token，因为它只会被同一个 lane 加载，8 个 token 足以发现"尾�
 设成恢复到的边界，自己 prefill 到底的路径设成无限；扫描侧只登记 `position <= device_kv_limit` 的宿主镜像。
 没有这一条，去掉写者闸门就是**不健全**的。
 
+**回归与收窄**（`cff2ddde`、本轮的会话域 + prompt-end 排除）：打开跨 lane 的那个提交之后，
+`ninfer_qwen3_5_tp2_sessions_test` 的 `unaligned dialogue (plain)` 从通过变成失败。二分把责任落到池化
+（`c6341b5b`）而不是跨 lane：同一份失败在 `5a823986`（跨 lane 之前）与 HEAD 上逐 token 相同，而在 `09116db5`
+（池化之前）该场景 `reused 0` 且通过。机制是池化把 prompt-end 镜像从"钉住的固定槽"变成"池里的一张普通镜像"，
+于是它会作为普通边界被扫描提供出去：`continued` 回退 8 个 token 到另一段对话写下的 64 位置镜像，其首采样与冷
+oracle 不一致（`2752 …` vs `1605 …`）。根因不是复用了错的前缀——指纹、会话、KV 全都对——而是**边界下面的 KV 行
+由另一次 prefill 写下**（88 token 一次写 vs 72 token 先写再续），归约形状不同，ulp 级差异在近似平局上翻了一个
+token。两条收窄同时落地：
+
+| 收窄 | 落点 | 理由 |
+|---|---|---|
+| 镜像只服务**写它的那个会话** | `HostCheckpoint.conversation` | 同一会话换 lane 仍可复用（跨 lane 的目标不变），但另一段对话不能用它的镜像重启。身份取自请求自己的会话键（FNV-1a），匿名请求退化为按 lane——**不能用 `active_session`**，那个索引在 store/evict 时会移动，18.1 的 `0x8000…` 事故就是这一类 |
+| prompt-end 镜像**不进 ring 扫描** | `HostCheckpoint.prompt_end` | prompt-end 镜像是 catalog 和活谱系的入口（重试被取消的那一轮、返回的一轮站到"正好在末尾"），不是轮转镜像；把它当轮转边界用，就是上一条 ulp 类的来源 |
+
+第一版收窄只做了会话域，`unaligned dialogue` 仍然失败——该场景两段对话都是匿名的，按 lane 的身份分不开；
+加上 prompt-end 排除才回到 `reused 0` 与 oracle 逐 token 一致。代价记在测试里：`dropped transport`
+那条从"复用被取消那一轮的 prompt end（408）"变成"复用它下面最深的一张轮转镜像（256）"，仍然不是从零重来
+（事故的观测值是"复用为 0"），但少省 152 个 token。要拿回那 152 个 token，需要"边界 KV 与本次 prefill 同源"
+的判据（例如按 chunk 形状记录），那是独立的设计问题。
+
 ### 18.5 实测结论（双卡）
 
 - **走查路线（并发 1，默认）**：`0 → 8192` 不变，`refused_hash=0`。这条路线用的是本 lane 的活谱系 + ring 镜像，

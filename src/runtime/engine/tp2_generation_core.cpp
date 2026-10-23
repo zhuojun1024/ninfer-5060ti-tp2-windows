@@ -61,6 +61,23 @@ constexpr std::uint64_t kFnvPrime       = 1099511628211ULL;
     return hash;
 }
 
+// The stable identity of the conversation a request belongs to: a hash of the client's session key,
+// or the lane when the request named none. Deliberately not the catalog index - that moves when an
+// entry is stored, evicted or rebound, and an image has to be recognised across requests of one
+// conversation even while the catalog is rearranging itself.
+[[nodiscard]] std::uint64_t conversation_identity(const qwen::PreparedContextCache& hints,
+                                                  std::uint32_t lane) {
+    if (!hints.session_key.has_value()) {
+        return 0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane);
+    }
+    std::uint64_t hash = kFnvOffsetBasis;
+    for (const char byte : hints.session_key->view()) {
+        hash = (hash ^ static_cast<std::uint64_t>(static_cast<unsigned char>(byte))) * kFnvPrime;
+    }
+    // The high bit marks the anonymous form, and zero marks "not stamped".
+    return (hash & 0x7FFF'FFFF'FFFF'FFFFULL) | 1ULL;
+}
+
 // Phase timing for the TP-2 prefill/decode walk, enabled with NINFER_TP2_TIMING=1. It exists to
 // attribute a decode round to its phases while the round is being optimised (see the worklog, Round 11);
 // with the flag off every call is one branch on a cached bool. The marks are recorded on shard A's
@@ -2619,12 +2636,11 @@ std::size_t TP2GenerationCore::media_prefix_cap(std::span<const MediaSpan> cache
     return shared_prefix;
 }
 
-TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t lane,
-                                                               std::span<const TokenId> token_ids,
-                                                               std::span<const MediaSpan> media,
-                                                               std::uint32_t prompt_tokens,
-                                                               std::size_t replay_split,
-                                                               bool adopted, bool trace) {
+TP2GenerationCore::LaneReuse
+TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> token_ids,
+                                   std::span<const MediaSpan> media, std::uint32_t prompt_tokens,
+                                   std::size_t replay_split, bool adopted, bool trace,
+                                   std::uint64_t conversation_id) {
     RetentionState& lane_state = retention(lane);
     LaneReuse result;
     ReuseReason reuse_reason  = ReuseReason::NoAnchorAtOrBefore;
@@ -2722,7 +2738,7 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                                                lane_state.cached_prompt_tokens.size());
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             auto& checkpoint = const_cast<Shard::HostCheckpoint&>(shard_a_.host_checkpoints[slot]);
-            if (!checkpoint.valid) { continue; }
+            if (!checkpoint.valid || checkpoint.prompt_end) { continue; }
             // The ledger owns the pool, the ring only owns the bytes. A slot the ledger released
             // has been or is about to be handed to another image, so this description names a
             // buffer that no longer holds it - the slot's retirement never reaches the ring, which
@@ -2731,12 +2747,13 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                 checkpoint.valid = false;
                 continue;
             }
-            // Any lane's image, whichever conversation wrote it: the stamp is the evidence that it
-            // is the state of *this* prefix. A slot can hold another conversation's image at the
-            // same position, and an image that was never stamped cannot prove anything; refusing is
-            // cheap - the next boundary down is offered anyway - while restoring the wrong prefix
-            // would poison the whole turn.
-            if (checkpoint.history_hash == 0 ||
+            // Any lane's image, whichever lane wrote it, but only this conversation's: the KV under
+            // a boundary was written by the prefill that froze it, and a from-scratch walk of the
+            // same tokens chunks differently, so restarting another conversation on it is a
+            // boundary crossing the suite's contract does not cover. On top of that the stamp has
+            // to describe *this* prefix: a slot can hold another conversation's image at the same
+            // position, and an image that was never stamped cannot prove anything.
+            if (checkpoint.conversation != conversation_id || checkpoint.history_hash == 0 ||
                 checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
                 ++refused_fingerprint;
                 continue;
@@ -2774,12 +2791,13 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         std::fprintf(stderr,
                      "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
                      "adopted=%d prefill_end=%u host=%zu/%zu lane_slots=%zu refused_hash=%zu "
-                     "stride=%u -> reuse=%u slot=%u src=%s reason=%s\n",
+                     "conv=%llu stride=%u -> reuse=%u slot=%u src=%s reason=%s\n",
                      lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
                      valid_checkpoints, shard_a_.host_checkpoints.size(), lane_checkpoints,
-                     refused_fingerprint, host_checkpoint_stride_, result.tokens, result.slot,
-                     source, reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
+                     refused_fingerprint, static_cast<unsigned long long>(conversation_key(lane)),
+                     host_checkpoint_stride_, result.tokens, result.slot, source,
+                     reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
     }
     // Tag the checkpoints this prefill leaves behind and start the ring at the first stride multiple
     // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
@@ -3039,11 +3057,11 @@ void TP2GenerationCore::publish_lane_prefill(
     // The prefill end is a boundary like any other, so it is published into the ring's prompt-end
     // slot: that is where a store reads the prompt-end image and where a returning turn stands
     // without a device plane. It is written before the sweep below, which is what makes it usable.
-    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane);
-    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane);
+    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane, /*prompt_end=*/true);
+    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane, /*prompt_end=*/true);
     // Only now are this prefill's checkpoints usable: their state is one the prefill reached and
     // their KV prefix is one it wrote.
-    publish_lane_checkpoints(lane, tokens);
+    publish_lane_checkpoints(lane, tokens, {}, conversation_identity(cache_hints, lane));
     // A configuration without the ring keeps the device plane that carries the same image; with the
     // ring it is not carved and the checkpoint above is the only copy. execute_walk writes the whole
     // plane at its own prefill end; a batched lane writes only its own slice, which is all a
@@ -3092,9 +3110,9 @@ void TP2GenerationCore::publish_partial_prefill(std::uint32_t lane, std::uint32_
     // The truncated prompt end is a boundary like a completed one, so it goes into the ring's
     // prompt-end slot and the sweep makes it usable: that is what lets the retry of the same prompt
     // stand on it.
-    snapshot_host_checkpoint(shard_a_, frontier, lane);
-    snapshot_host_checkpoint(shard_b_, frontier, lane);
-    publish_lane_checkpoints(lane, tokens);
+    snapshot_host_checkpoint(shard_a_, frontier, lane, /*prompt_end=*/true);
+    snapshot_host_checkpoint(shard_b_, frontier, lane, /*prompt_end=*/true);
+    publish_lane_checkpoints(lane, tokens, {}, conversation_identity(data.context_cache, lane));
     session_publish(
         std::vector<TokenId>(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(frontier)),
         frontier, data.context_cache, collect_media_spans(data, frontier), lane);
@@ -3557,7 +3575,8 @@ void TP2GenerationCore::execute_plain_batch(
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
             // The anchors this answer wrote sit past a state the walk committed, so they become
             // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
-            publish_lane_checkpoints(lane.slot, history);
+            publish_lane_checkpoints(lane.slot, history, {},
+                                     conversation_identity(data.context_cache, lane.slot));
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -3853,9 +3872,9 @@ void TP2GenerationCore::execute_plain_batch(
         // lineage: the host checkpoint ring, plane 0's slice of this lane (written at this lane's
         // own prefill end, below), and the catalog entry. Two lanes in one batch never read each
         // other's state, so the batch route reuses prefixes exactly as the serial walk does.
-        const LaneReuse lane_reuse =
-            scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
-                            adoption.adopted, reuse_trace);
+        const LaneReuse lane_reuse = scan_lane_reuse(
+            lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
+            adoption.adopted, reuse_trace, conversation_identity(data.context_cache, lane_id));
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -4411,7 +4430,8 @@ void TP2GenerationCore::execute_spec_batch(
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
             // The anchors this answer wrote sit past a state the walk committed, so they become
             // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
-            publish_lane_checkpoints(lane.slot, history);
+            publish_lane_checkpoints(lane.slot, history, {},
+                                     conversation_identity(data.context_cache, lane.slot));
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -5217,9 +5237,9 @@ void TP2GenerationCore::execute_spec_batch(
         // plain batch runs them (P2.3 Stage 2). Every lane owns its own GDN slot, draft-ring slot and
         // slice of the host ring, so two lanes never share a boundary.
         session_recall(lane_id, token_ids, prompt_media);
-        const LaneReuse lane_reuse =
-            scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
-                            adoption.adopted, reuse_trace);
+        const LaneReuse lane_reuse = scan_lane_reuse(
+            lane_id, token_ids, prompt_media, lane.prompt_tokens, adoption.divergence,
+            adoption.adopted, reuse_trace, conversation_identity(data.context_cache, lane_id));
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -7156,7 +7176,7 @@ void TP2GenerationCore::capture_reuse_boundary(std::uint32_t lane) {
 }
 
 void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier,
-                                                 std::uint32_t lane) {
+                                                 std::uint32_t lane, bool prompt_end) {
     if (shard.host_checkpoints.empty() || reuse_ledger_ == nullptr) { return; }
     ++prefill_host_writes_;
     // Every host image comes out of the ledger's pool, which owns every slot of the ring. One
@@ -7187,6 +7207,7 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     // it goes with the overwrite, and so does the conversation it belonged to.
     checkpoint.valid      = false;
     checkpoint.writer     = static_cast<std::int32_t>(lane);
+    checkpoint.prompt_end = prompt_end;
     checkpoint.position   = frontier;
     checkpoint.prefill_id = retention(lane).host_checkpoint_live_id;
     if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
@@ -7226,7 +7247,8 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
 
 void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
                                                  std::span<const TokenId> history,
-                                                 std::span<const TokenId> tail) {
+                                                 std::span<const TokenId> tail,
+                                                 std::uint64_t conversation) {
     const std::uint64_t live_id = retention(lane).host_checkpoint_live_id;
 
     // Stamp before publishing: an image whose prefix is unknown must never become a boundary
@@ -7266,8 +7288,12 @@ void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
         }
         // A position past the stream is not this history's image at all: leave it unstamped rather
         // than record a hash of a prefix the walk never stood on.
-        pending[index].shard->host_checkpoints[pending[index].slot].history_hash =
-            position <= total ? hash : 0;
+        Shard::HostCheckpoint& checkpoint =
+            pending[index].shard->host_checkpoints[pending[index].slot];
+        checkpoint.history_hash = position <= total ? hash : 0;
+        // The conversation this prefill publishes for. The caller derives it from the request's own
+        // session key, so it cannot move while the catalog rearranges itself.
+        checkpoint.conversation = position <= total ? conversation : Shard::kNoConversation;
     }
     std::size_t published = 0;
     for (Shard* shard : {&shard_a_, &shard_b_}) {
@@ -7281,8 +7307,10 @@ void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
         }
     }
     if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
-        std::fprintf(stderr, "[tp2-cp] publish lane=%u id=%llu published=%zu stream=%zu\n", lane,
-                     static_cast<unsigned long long>(live_id), published, total);
+        std::fprintf(stderr,
+                     "[tp2-cp] publish lane=%u id=%llu published=%zu stream=%zu conv=%llu\n", lane,
+                     static_cast<unsigned long long>(live_id), published, total,
+                     static_cast<unsigned long long>(conversation_key(lane)));
         for (Shard* shard : {&shard_a_, &shard_b_}) {
             for (std::size_t slot = 0; slot < shard->host_checkpoints.size(); ++slot) {
                 const Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
@@ -7469,6 +7497,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // count is reported so a fingerprint that starts refusing everything is visible in the trace.
     std::size_t refused_fingerprint     = 0;
     std::size_t shared_prefix = 0;
+    // The conversation this prompt belongs to, as the publish below stamps its images: the client's
+    // session key, or the lane when it named none.
+    const std::uint64_t conversation_id = conversation_identity(data.context_cache, lane);
     lane_state.reuse_source             = ReuseSource::None;
     if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
         const std::size_t common = std::min(lane_state.cached_prompt_tokens.size(), token_ids.size());
@@ -7543,18 +7574,19 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                                lane_state.cached_prompt_tokens.size());
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             auto& checkpoint = const_cast<Shard::HostCheckpoint&>(shard_a_.host_checkpoints[index]);
-            if (!checkpoint.valid) { continue; }
+            if (!checkpoint.valid || checkpoint.prompt_end) { continue; }
             // The ledger owns the pool, the ring only owns the bytes: a slot it released names a
             // buffer that no longer holds this image.
             if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(index))) {
                 checkpoint.valid = false;
                 continue;
             }
-            // Any lane's image: the writer's stamp is the only evidence that this image is the
-            // state of *this* prefix. A slot can hold another conversation's image at the same
-            // position, and an image that was never stamped proves nothing. Refusing costs the next
-            // boundary down; restoring the wrong prefix would poison the turn.
-            if (checkpoint.history_hash == 0 ||
+            // Any lane's image, but only this conversation's: the KV under a boundary was written
+            // by the prefill that froze it, and a from-scratch walk of the same tokens chunks
+            // differently. The stamp then has to describe *this* prefix as well - a slot can hold
+            // another conversation's image at the same position, and an image that was never
+            // stamped proves nothing.
+            if (checkpoint.conversation != conversation_id || checkpoint.history_hash == 0 ||
                 checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
                 ++refused_fingerprint;
                 continue;
@@ -7897,9 +7929,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // ring's prompt-end slot and the sweep makes it usable: that is what lets the retry of
                 // the same prompt stand on it. It is written after the flush so the checkpoint's draft
                 // frontier names the same position.
-                snapshot_host_checkpoint(shard_a_, t0, lane);
-                snapshot_host_checkpoint(shard_b_, t0, lane);
-                publish_lane_checkpoints(lane, token_ids, request.generated);
+                snapshot_host_checkpoint(shard_a_, t0, lane, /*prompt_end=*/true);
+                snapshot_host_checkpoint(shard_b_, t0, lane, /*prompt_end=*/true);
+                publish_lane_checkpoints(lane, token_ids, request.generated,
+                                         conversation_identity(data.context_cache, lane));
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
@@ -8141,8 +8174,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // The prompt end is a boundary like any other: it goes into the ring's prompt-end slot, which is
     // where a store reads the prompt-end image and where a returning turn stands when the
     // configuration keeps no device plane.
-    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane);
-    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane);
+    snapshot_host_checkpoint(shard_a_, prompt_tokens, lane, /*prompt_end=*/true);
+    snapshot_host_checkpoint(shard_b_, prompt_tokens, lane, /*prompt_end=*/true);
     // The pools now hold exactly this prompt and the live GDN state sits at its end, so the
     // resident catalog entry describes what the walk just wrote. A conversation that had no entry
     // yet gets one here, before decode extends its history.
@@ -8152,7 +8185,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (lane_state.active_session != kNoSession) { sessions_[lane_state.active_session].prompt_end = prompt_tokens; }
     // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
     // KV prefix is one the walk wrote.
-    publish_lane_checkpoints(lane, token_ids, request.generated);
+    publish_lane_checkpoints(lane, token_ids, request.generated,
+                             conversation_identity(data.context_cache, lane));
 
     if (prefill_trace) {
         const auto millis = [](Clock::time_point from, Clock::time_point to) {

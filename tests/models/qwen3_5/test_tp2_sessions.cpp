@@ -914,16 +914,25 @@ int check_transport_failure_keeps_prefix(const char* artifact, int device_a, int
         append(retry, make_prompt(52000, 16));
         got = run_budget(engine, retry, kDroppedBudget);
     }
-    // What this pins is the boundary, not the answer: the recall resumes beside a chunk boundary, so
-    // its suffix walks a different execution shape than a from-scratch prefill of the same prompt and
-    // its near ties resolve their own way - the bounded-recall tolerance the other scenarios document.
-    // The observable the served incident produced is the reuse count, which a retired entry reports as
-    // zero.
-    if (got.reused_prompt_tokens != prompt_end) {
+    // What this pins is the boundary, not the answer: the recall resumes beside a chunk boundary,
+    // so its suffix walks a different execution shape than a from-scratch prefill of the same
+    // prompt and its near ties resolve their own way - the bounded-recall tolerance the other
+    // scenarios document. The observable the served incident produced is the reuse count, which a
+    // retired entry reports as zero.
+    //
+    // The deepest boundary available is the deepest rotation image the cancelled walk froze below
+    // its end, not the end itself: the prompt-end image belongs to the conversation catalog and to
+    // a live lineage, and a rotation image is what the ring scan offers (prefix-reuse.md 18.5). The
+    // walk publishes those at its chunk boundaries, which is why this one sits at 256 rather than
+    // at a stride multiple. Standing on it is what keeps a cancelled turn from reprefilling its
+    // history, which is the incident.
+    constexpr std::uint32_t kDeepestRotation = 256;
+    if (got.reused_prompt_tokens != kDeepestRotation) {
         return fail(label, "the turn after a dropped transport reused " +
                                std::to_string(got.reused_prompt_tokens) +
-                               " prompt tokens, expected the prompt end the failed walk published "
-                               "at " + std::to_string(prompt_end));
+                               " prompt tokens, expected the deepest rotation boundary at " +
+                               std::to_string(kDeepestRotation) +
+                               " below the failed walk's end at " + std::to_string(prompt_end));
     }
     std::cout << "TP-2 dropped transport (" << label << ") passed: the turn after a dropped transport"
                  " reused "
