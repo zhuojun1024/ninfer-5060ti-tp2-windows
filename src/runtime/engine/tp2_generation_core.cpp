@@ -2688,6 +2688,10 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         const auto offer = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source,
                                AnchorStorage storage) {
             if (position == 0 || position > shared_prefix || position >= prompt_tokens) { return; }
+            // A host image is only usable where the lane's pages hold its prefix: after a recall
+            // that restored a shallower boundary, an image past it describes KV this lane does not
+            // have.
+            if (storage == AnchorStorage::Host && position > lane_state.device_kv_limit) { return; }
             reachable.push_back(Reachable{position, slot, source});
             ReuseLedger::AnchorRequest request;
             request.position   = position;
@@ -2718,18 +2722,13 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                                                lane_state.cached_prompt_tokens.size());
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             const auto& checkpoint = shard_a_.host_checkpoints[slot];
-            // This lane's own images only: an image is the state after *its* token history, and the
-            // scan proves agreement only with this lane's lineage, not with another lane's. The
-            // pool may hand the slot to another lane later, which is why the writer is part of the
-            // test.
-            if (!checkpoint.valid || checkpoint.writer != static_cast<std::int32_t>(lane)) {
-                continue;
-            }
-            // The image must be the state of *this* prefix, and the stamp its writer left is the
-            // only evidence of that: a slot can hold another conversation's image at the same
-            // position, and an image that was never stamped cannot prove anything. Refusing is
-            // cheap - the next boundary down is offered anyway - while restoring the wrong prefix
-            // would poison the whole turn.
+            if (!checkpoint.valid) { continue; }
+            // Any lane's image, whichever conversation wrote it: the stamp is the evidence that it
+            // is the state of *this* prefix. A slot can hold another conversation's image at the
+            // same position, and an image that was never stamped cannot prove anything; refusing is
+            // cheap
+            // - the next boundary down is offered anyway - while restoring the wrong prefix would
+            // poison the whole turn.
             if (checkpoint.history_hash == 0 ||
                 checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
                 ++refused_fingerprint;
@@ -3022,6 +3021,9 @@ void TP2GenerationCore::publish_lane_prefill(
     // covered by its grid and tail checkpoints, so the span these anchors fill is the generated one.
     lane_state.next_generated_checkpoint = prompt_tokens + kReuseGeneratedTailStride;
     lane_state.cached_boundaries.fill(0);
+    // This prefill wrote the pages end to end, so every host image at or below the prompt is a
+    // state whose KV the lane holds.
+    lane_state.device_kv_limit    = RetentionState::kNoDeviceKvLimit;
     lane_state.cached_state_valid = true;
     session_publish(tokens, prompt_tokens, cache_hints, media, lane);
     if (lane_state.active_session != kNoSession) {
@@ -3101,6 +3103,7 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
     // written.
     lane_state.cached_state_valid = false;
     lane_state.cached_boundaries.fill(0);
+    lane_state.device_kv_limit  = RetentionState::kNoDeviceKvLimit;
     lane_state.live_state_valid = false;
     session_invalidate_active(lane);
 }
@@ -3316,13 +3319,15 @@ void TP2GenerationCore::release_lane_kv(std::uint32_t lane) noexcept {
     lane_state.cached_prompt_tokens.clear();
     lane_state.cached_media.clear();
     lane_state.cached_boundaries.fill(0);
+    lane_state.device_kv_limit         = RetentionState::kNoDeviceKvLimit;
     lane_state.cached_state_valid      = false;
     lane_state.live_state_valid        = false;
     lane_state.reuse_source            = ReuseSource::None;
     lane_state.anchor_session          = kNoSession;
     lane_state.block_anchor_position   = 0;
     lane_state.block_anchor_prefill_id = 0;
-    invalidate_host_checkpoints(lane);
+    // The images this lane wrote stay: an image is a fact about the prefix it froze, so the scan's
+    // fingerprint - not the writer - decides whether it describes this prompt (prefix-reuse.md 18).
     for (SessionEntry& entry : sessions_) {
         if (entry.device_lane == static_cast<std::int32_t>(lane)) { entry.device_lane = -1; }
     }
@@ -5772,7 +5777,11 @@ void TP2GenerationCore::zero_lane_state(const LaneStateGeometry& geometry, void*
 }
 
 void TP2GenerationCore::invalidate_host_checkpoints() {
-    for (std::uint32_t lane = 0; lane < lanes_; ++lane) { invalidate_host_checkpoints(lane); }
+    // Every image goes, whatever lane wrote it: this runs when the device itself was abandoned (an
+    // allreduce stall), so no slot describes a state anybody can reach any more.
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        for (auto& checkpoint : shard->host_checkpoints) { checkpoint.valid = false; }
+    }
 }
 
 std::uint64_t TP2GenerationCore::conversation_key(std::uint32_t lane) const {
@@ -5785,18 +5794,6 @@ std::uint64_t TP2GenerationCore::conversation_key(std::uint32_t lane) const {
                : (0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane));
 }
 
-void TP2GenerationCore::invalidate_host_checkpoints(std::uint32_t lane) {
-    // The lane's own lineage is what broke, so the images it wrote are the ones that go. The owner
-    // key cannot answer this: it may already describe the conversation that replaced the broken
-    // one.
-    Shard* const shards[2] = {&shard_a_, &shard_b_};
-    for (Shard* shard : shards) {
-        for (auto& checkpoint : shard->host_checkpoints) {
-            if (checkpoint.writer == static_cast<std::int32_t>(lane)) { checkpoint.valid = false; }
-        }
-    }
-}
-
 void TP2GenerationCore::session_invalidate_active(std::uint32_t lane) {
     RetentionState& lane_state = retention(lane);
     if (lane_state.active_session != kNoSession) { session_drop(lane_state.active_session); }
@@ -5805,7 +5802,8 @@ void TP2GenerationCore::session_invalidate_active(std::uint32_t lane) {
     lane_state.cached_state_valid = false;
     lane_state.cached_prompt_tokens.clear();
     lane_state.cached_media.clear();
-    invalidate_host_checkpoints(lane);
+    // No image is dropped here either: the walk that threw may have written checkpoints that are
+    // perfectly good states of their own prefixes, and another conversation may already name one.
     lane_state.reuse_source = ReuseSource::None;
 }
 
@@ -6627,10 +6625,13 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         lane_state.cached_media         = sessions_[best_host].media;
         // A recalled session has no device state snapshots of its own: those belong to the lineage
         // it displaces. Its frontier state is in the device pool already, which is what LiveState
-        // means to the scan below. The checkpoint ring belongs to that lineage too, and its
-        // positions can sit inside the recalled history while its states do not.
+        // means to the scan below. The checkpoint ring stays as it is: an image whose position sits
+        // inside the recalled history but whose prefix was another conversation's is refused by the
+        // scan's fingerprint rather than by dropping every image this lane happens to carry.
         lane_state.cached_boundaries.fill(0);
-        invalidate_host_checkpoints(lane);
+        // The recall restored pages up to `best_frontier` and no further, so an image past that
+        // point - however well its stamp matches this history - has no KV under it any more.
+        lane_state.device_kv_limit    = best_frontier;
         lane_state.cached_state_valid = true;
         lane_state.reuse_source       = ReuseSource::None;
         if (drop_previous) { session_drop(previous); }
@@ -7511,6 +7512,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 position <= reuse) {
                 return;
             }
+            // A host image is only usable where the lane's pages hold its prefix: a recall that
+            // restored a shallower boundary leaves nothing under a deeper image.
+            if (source == ReuseSource::HostCheckpoint && position > lane_state.device_kv_limit) {
+                return;
+            }
             reuse         = position;
             reuse_slot    = slot;
             lane_state.reuse_source = source;
@@ -7533,15 +7539,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                                                lane_state.cached_prompt_tokens.size());
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             const auto& checkpoint = shard_a_.host_checkpoints[index];
-            // This lane's own images only: an image is the state after *its* token history, and the
-            // scan proves agreement only with this lane's lineage, not with another lane's.
-            if (!checkpoint.valid || checkpoint.writer != static_cast<std::int32_t>(lane)) {
-                continue;
-            }
-            // The writer's stamp is the only evidence that this image is the state of *this*
-            // prefix: a slot can hold another conversation's image at the same position, and an
-            // image that was never stamped proves nothing. Refusing costs the next boundary down;
-            // restoring the wrong prefix would poison the turn.
+            if (!checkpoint.valid) { continue; }
+            // Any lane's image: the writer's stamp is the only evidence that this image is the
+            // state of *this* prefix. A slot can hold another conversation's image at the same
+            // position, and an image that was never stamped proves nothing. Refusing costs the next
+            // boundary down; restoring the wrong prefix would poison the turn.
             if (checkpoint.history_hash == 0 ||
                 checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
                 ++refused_fingerprint;

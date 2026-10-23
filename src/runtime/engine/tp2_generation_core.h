@@ -922,14 +922,12 @@ private:
     // engine status and discards every reusable prefix, because the stalled round may have
     // half-written KV and GDN state; the next request prefills from scratch.
     void abort_if_ar_stalled();
-    // Retires the prefix-reuse checkpoint ring. A checkpoint is only usable while every prompt that
-    // followed the prefill that wrote it agreed on the tokens before its position; once the device
-    // pools hold another session, that chain is broken even though the ring's positions may still
-    // sit inside the recalled history. The lane-scoped overload retires one lane's slice of the
-    // ring, which is what a single lane's own recall or abort must do; the global one is for a
-    // failure that leaves the device pools describing no lineage at all.
+    // Drops every host image. Only the device being abandoned calls this (an allreduce stall leaves
+    // the pools describing no lineage at all). An individual image is never invalidated by writer
+    // any more: an image is a fact about the prefix it froze, and the scan's fingerprint is what
+    // decides whether it describes a given prompt - which is also what lets a conversation keep
+    // using the images it wrote on a lane it has since left.
     void invalidate_host_checkpoints();
-    void invalidate_host_checkpoints(std::uint32_t lane);
     // The conversation a lane's images belong to: the session the request named, or a key that
     // keeps a session-less lane's images to itself. This is the ledger's conversation key, so a
     // session that comes back on another lane still finds its own anchors without the images moving
@@ -1059,6 +1057,15 @@ private:
         std::vector<MediaSpan> cached_media;
         std::array<std::uint32_t, kReuseSnapshotCount> cached_boundaries{};
         bool cached_state_valid = false;
+        // How far this lane's device KV really reaches: every host image at or below it is a state
+        // whose KV the lane holds, and one above it is not, because a recall only restored pages up
+        // to the boundary it restored. `kNoDeviceKvLimit` while the lane's own prefill filled the
+        // pages end to end, which is the ordinary case; a recall lowers it for as long as the lane
+        // carries that conversation. Without it an image written by another lane, or left over from
+        // a deeper history, could be restored onto pages that never held its prefix
+        // (prefix-reuse.md 18).
+        static constexpr std::uint32_t kNoDeviceKvLimit = 0xFFFF'FFFFU;
+        std::uint32_t device_kv_limit                   = kNoDeviceKvLimit;
         // The next committed frontier at which this lane's answer writes a tail checkpoint. The decode
         // writes them at a fixed spacing from the prompt end so a re-rendered answer has a boundary
         // inside it instead of only the prompt end behind it; zero means none is scheduled.
