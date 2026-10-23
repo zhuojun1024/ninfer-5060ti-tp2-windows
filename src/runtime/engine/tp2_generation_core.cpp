@@ -2686,6 +2686,10 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         const auto offer = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source,
                                AnchorStorage storage) {
             if (position == 0 || position > shared_prefix || position >= prompt_tokens) { return; }
+            // Only a position on the walk's chunk grid is a state this walk would compute
+            // identically: a chunk's rows carry the reduction shape of the chunk's own width, and
+            // the last chunk's width follows the prompt's length.
+            if (position % prefill_chunk_width(shard_a_.model->config().text) != 0) { return; }
             // A host image is only usable where the lane's pages hold its prefix: after a recall
             // that restored a shallower boundary, an image past it describes KV this lane does not
             // have.
@@ -7507,19 +7511,22 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             }
         }
         // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
-        // and KV beside it are this prompt's own prefix - which the shared prefix above proves - and a
-        // boundary inside a prefill chunk is no exception: the suffix this walk chunks from it rounds
-        // differently from a from-scratch walk, so the two can part at an exact logit tie. That is the
-        // tolerance a bounded recall has always had, and why a recall owes a from-scratch walk its
-        // boundary crossing rather than its whole trajectory. Rounding down to the prefill grid
-        // instead would re-prefill up to a whole chunk on every turn of a conversation that continues
-        // in place - the common agent case. Decode writes the position grid too (see the decode loop),
-        // so a boundary now exists inside the answer this lineage generated as well; what no boundary
-        // inside it can offer is a restart *after* a replay that does not describe this turn.
+        // and KV beside it are this prompt's own prefix - which the shared prefix above proves -
+        // and a boundary inside a prefill chunk is no exception: the suffix this walk chunks from
+        // it rounds differently from a from-scratch walk, so the two can part at an exact logit
+        // tie. That is the tolerance a bounded recall has always had, and why a recall owes a
+        // from-scratch walk its boundary crossing rather than its whole trajectory. Rounding down
+        // to the prefill grid instead would re-prefill up to a whole chunk on every turn of a
+        // conversation that continues in place - the common agent case. Decode writes the position
+        // grid too (see the decode loop), so a boundary now exists inside the answer this lineage
+        // generated as well; what no boundary inside it can offer is a restart *after* a replay
+        // that does not describe this turn.
         //
         // The masked draft stays live on such a boundary as well. Its ring belongs to the walk that
-        // froze it, so it proposes the block that walk would have proposed; the draft only proposes,
-        // and the target verify licenses every emitted token either way.
+        // froze it, so it proposes the block that walk would have proposed; the draft only
+        // proposes, and the target verify licenses every emitted token either way. A boundary is
+        // only this walk's own state where the walk's chunk grid puts it.
+        const std::uint32_t chunk_width = prefill_chunk_width(shard_a_.model->config().text);
         const auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
             if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
                 position <= reuse) {
@@ -7530,6 +7537,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             if (source == ReuseSource::HostCheckpoint && position > lane_state.device_kv_limit) {
                 return;
             }
+            if (position % chunk_width != 0) { return; }
             reuse         = position;
             reuse_slot    = slot;
             lane_state.reuse_source = source;

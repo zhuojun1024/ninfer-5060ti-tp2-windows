@@ -62,6 +62,15 @@ using ninfer::TokenId;
 
 constexpr std::uint32_t kMaxContext   = 2048;
 constexpr std::uint32_t kOutputTokens = 8;
+// The engine restarts only on a boundary that sits on its prefill chunk grid: a chunk carries the
+// reduction shape of its own width, and the last chunk's width follows the prompt's length, so a
+// boundary inside one is not a state a from-scratch walk would reproduce. Every expectation below
+// is therefore the grid floor of the boundary it names. `engine_options` sets this same width.
+constexpr std::uint32_t kChunkWidth = 256;
+
+constexpr std::uint32_t grid_floor(std::uint32_t position) {
+    return position - position % kChunkWidth;
+}
 // The catalog holds the resident conversation plus two host-resident ones.
 constexpr std::uint32_t kSessions = 3;
 // The whole --host-kv-mib value, split evenly between the two shards.
@@ -480,14 +489,15 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // A returns: the whole prefix comes back from the host slabs, so only the frontier token is
     // forwarded again.
     const ninfer::GenerationResult a_second = run(engine, a_continued);
-    if (a_second.reused_prompt_tokens != recalled_frontier) {
+    if (a_second.reused_prompt_tokens != grid_floor(recalled_frontier)) {
         return fail(label, "a recalled conversation reused " +
                                std::to_string(a_second.reused_prompt_tokens) +
                                " prompt tokens, expected " +
-                               std::to_string(recalled_frontier));
+                               std::to_string(grid_floor(recalled_frontier)));
     }
-    if (const int status = compare_recall(label, "a recalled conversation",
-                                          recalled_frontier, a_second, continued_answer);
+    if (const int status =
+            compare_recall(label, "a recalled conversation", grid_floor(recalled_frontier),
+                           a_second, continued_answer);
         status != 0) {
         return status;
     }
@@ -545,7 +555,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     const std::uint32_t shared_frontier =
         static_cast<std::uint32_t>(shared_a.size() + shared_answer.size()) - 1U;
     const ninfer::GenerationResult shared_a_second = run(engine, shared_a_continued);
-    const std::uint32_t shared_a_second_reuse = shared_frontier;
+    const std::uint32_t shared_a_second_reuse      = grid_floor(shared_frontier);
     if (shared_a_second.reused_prompt_tokens != shared_a_second_reuse) {
         return fail(label, "a conversation behind a shared system prompt reused " +
                                std::to_string(shared_a_second.reused_prompt_tokens) +
@@ -571,7 +581,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     }
     const ninfer::GenerationResult shared_c_first = run(engine, shared_c);
     const std::uint32_t shared_c_first_reuse =
-        static_cast<std::uint32_t>(system_prompt.size());
+        grid_floor(static_cast<std::uint32_t>(system_prompt.size()));
     if (shared_c_first.reused_prompt_tokens != shared_c_first_reuse) {
         return fail(label, "a conversation opening with a stored system prompt reused " +
                                std::to_string(shared_c_first.reused_prompt_tokens) +
@@ -597,7 +607,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     }
     (void)run(engine, aside);
     const ninfer::GenerationResult rerendered_first = run(engine, rerendered);
-    const std::uint32_t rerender_prompt_end = static_cast<std::uint32_t>(rerender_base.size());
+    const std::uint32_t rerender_prompt_end =
+        grid_floor(static_cast<std::uint32_t>(rerender_base.size()));
     if (rerendered_first.reused_prompt_tokens != rerender_prompt_end) {
         return fail(label, "a conversation behind a re-rendered answer reused " +
                                std::to_string(rerendered_first.reused_prompt_tokens) +
@@ -627,10 +638,10 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     std::vector<TokenId> resident_continued = resident_base;
     append(resident_continued, resident_first.generated_token_ids);
     append(resident_continued, follow_up);
-    const std::uint32_t resident_frontier = static_cast<std::uint32_t>(
-                                                resident_base.size() +
-                                                resident_first.generated_token_ids.size()) -
-                                            1U;
+    const std::uint32_t resident_frontier =
+        grid_floor(static_cast<std::uint32_t>(resident_base.size() +
+                                              resident_first.generated_token_ids.size()) -
+                   1U);
     // The previous turn's own answer is in the device state, so the scan takes the frontier and only
     // the last token is forwarded again - whatever the request's budget asks for.
     const ninfer::GenerationResult resident_second = run(engine, resident_continued);
@@ -661,8 +672,8 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     if (burst.generated_token_ids.empty()) {
         return fail(label, "the scenario's long turn generated nothing to reuse");
     }
-    const std::uint32_t burst_frontier =
-        burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()) - 1U;
+    const std::uint32_t burst_frontier = grid_floor(
+        burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()) - 1U);
     const ninfer::GenerationResult burst_continued =
         run_budget(engine, burst_history, kContinueBudget);
     if (burst_continued.reused_prompt_tokens != burst_frontier) {
@@ -685,7 +696,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     }
     const std::uint32_t interrupted_prefix = 256;
     const ninfer::GenerationResult retried = run(engine, interrupted);
-    const std::uint32_t retried_reuse = interrupted_prefix;
+    const std::uint32_t retried_reuse      = grid_floor(interrupted_prefix);
     if (retried.reused_prompt_tokens != retried_reuse) {
         return fail(label, "a retry of a cancelled prompt reused " +
                                std::to_string(retried.reused_prompt_tokens) +
@@ -730,7 +741,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
         return fail(label, "a probe beside a stored stable block reused a stale lineage");
     }
     (void)run(engine, family_aside);
-    const std::uint32_t family_shallow = family_probe_prefix - kDivergenceMargin;
+    const std::uint32_t family_shallow = grid_floor(family_probe_prefix - kDivergenceMargin);
     const ninfer::GenerationResult family_w1_first = run(engine, family_w1);
     if (family_w1_first.reused_prompt_tokens != family_shallow) {
         return fail(label, "a conversation opening with a shallowly stored stable block reused " +
@@ -742,7 +753,7 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // in front of the next conversation of the family.
     (void)run(engine, family_aside2);
     const std::uint32_t family_anchor =
-        static_cast<std::uint32_t>(family_block.size()) - kDivergenceMargin;
+        grid_floor(static_cast<std::uint32_t>(family_block.size()) - kDivergenceMargin);
     const ninfer::GenerationResult family_w2_first = run(engine, family_w2);
     if (family_w2_first.reused_prompt_tokens != family_anchor) {
         return fail(label,
@@ -1008,8 +1019,9 @@ int check_replayed_answer_keeps_prompt_end(const char* artifact, int device_a, i
 
     // The prompt the device pools were built from on the replayed turn is what the next turn has to
     // stand on. A replacement that shortened it leaves the client reproducing tokens the entry no
-    // longer holds, and the scan then stops at the replacement instead of at that prompt end.
-    if (third.reused_prompt_tokens < second.prompt.prompt_tokens) {
+    // longer holds, and the scan then stops at the replacement instead of at that prompt end. The
+    // boundary has to be on the walk's chunk grid, so the expectation is its grid floor.
+    if (third.reused_prompt_tokens < grid_floor(second.prompt.prompt_tokens)) {
         return fail(label, "the turn after a replayed answer reused " +
                                std::to_string(third.reused_prompt_tokens) + " of the " +
                                std::to_string(second.prompt.prompt_tokens) +
@@ -1107,10 +1119,12 @@ int check_replayed_answer_across_lanes(const char* artifact, int device_a, int d
     history.push_back(ask("Which of the six is closest to grey?"));
     const ninfer::GenerationResult third = engine.generate(prepare(history), request);
 
-    // Strictly deeper than the prompt the replayed turn was built from: the reuse has to reach into
-    // the answer that turn generated. Equality is the regression - the walk stopped at the previous
-    // prompt end because it could not see the turn the catalog still held.
-    if (third.reused_prompt_tokens <= second.prompt.prompt_tokens) {
+    // Reach into the turn the catalog still held, not merely to the prompt the replayed turn was
+    // built from. The boundary has to sit on the walk's chunk grid and
+    // `second.prompt.prompt_tokens` is not on it, so the expectation is the grid floor: standing on
+    // the turn's own grid image is what proves the scan read the catalog, because this lane's
+    // lineage offers nothing at all (the previous turn ran on the other lane).
+    if (third.reused_prompt_tokens < grid_floor(second.prompt.prompt_tokens)) {
         return fail(label, "the turn after a re-rendered answer reused " +
                                std::to_string(third.reused_prompt_tokens) + " of the " +
                                std::to_string(second.prompt.prompt_tokens) +
