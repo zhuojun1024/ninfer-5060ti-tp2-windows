@@ -73,8 +73,12 @@ constexpr std::uint32_t grid_floor(std::uint32_t position) {
 }
 // The catalog holds the resident conversation plus two host-resident ones.
 constexpr std::uint32_t kSessions = 3;
-// The whole --host-kv-mib value, split evenly between the two shards.
-constexpr std::size_t kHostKvBytes = 128ULL << 20;
+// The whole --host-kv-mib value, split evenly between the two shards. One full-context session of
+// this suite's prompts is 64 MiB per shard, so the budget has to hold kSessions of them or the
+// catalog evicts a conversation the moment the next one is stored - which is what the stable-block
+// scenario needs to survive, because it recalls the same conversation twice with requests in
+// between.
+constexpr std::size_t kHostKvBytes = 384ULL << 20;
 
 std::pair<int, int> pick_devices() {
     int count = 0;
