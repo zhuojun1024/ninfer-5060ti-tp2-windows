@@ -1095,23 +1095,39 @@ token，因为它只会被同一个 lane 加载，8 个 token 足以发现"尾�
 
 `Anchor.borrowed` 这个布尔量随之消失，换成"我是不是唯一持有者"的判断（`sole_holder(slot, session)`）。
 
-### 18.4 分步
+### 18.4 落地状态（2026-10-23）
 
-1. **指纹字段与写入侧**：`HostCheckpoint.history_hash`、`snapshot_host_checkpoint` 增加一个 token span 参数；
-   此时没有任何读取方，行为不变（可先用一次 `NINFER_TP2_CHECKPOINT_TRACE` 打印校验）。
-2. **扫描侧校验**：登记时比较指纹；仍限 `writer == lane`，即"同 lane 也不接受对不上的镜像"——这是纯加固，
-   单独可验证（改写一条 prompt 的中间一段，确认它不再命中旧检查点）。
-3. **引用计数替换 owner/borrower**：`holders` 集合、`sole_holder()`、`release_slot` 的触发条件。
-4. **打开跨 lane**：去掉 `writer == lane` 闸门，改用指纹 + 持有者集合。验证：同一会话在两条 lane 间往返，
-   `cached_tokens` 不应掉回 0。
+四步全部落地，但**第 4 步多出一个必须先成立的不变量**，以及两个实测结论：
 
-第 3、4 步必须一起落地（先开跨 lane 而没有引用计数会让借用者的镜像被提前回收）。
+1. **写入侧**（`443ef091`）：`HostCheckpoint.history_hash` 由 `publish_lane_checkpoints(lane, history, tail)`
+   盖章——放在"让槽变成可用"的那次扫描里，而不是 `snapshot_host_checkpoint`，因为只有扫描同时掌握"这一轮真正走过的
+   token 流"和这些槽。一个槽一个位置，排序后走一遍流取快照（FNV 可增量累积）。
+2. **扫描侧校验**（`7cf29038`）：两份扫描（`scan_lane_reuse` 与 `execute_walk` 自己的登记循环）都要求
+   `history_hash == prefix_fingerprint(lineage, position)`；0（没盖过章）一律拒绝。反向验证的办法是把写入侧盖章
+   故意改错，trace 里 `refused_hash=4`、复用掉到 0。
+3. **持有者集合**（`5a823986`）：`holders_[slot]`、`hold_slot`/`drop_hold`/`free_slot`，`Anchor.borrowed` 删除。
+4. **打开跨 lane**（`342192df`）：去掉 `writer == lane`，同时删掉按 lane 作废镜像的三处（退休、异常路径、召回）——
+   镜像是对"它冻结的那段前缀"的事实，作废与否由指纹回答。
 
-### 18.5 验证判据
+**新不变量：`RetentionState::device_kv_limit`。** 去掉了写者闸门之后，"镜像比它下面的 KV 还深"变成可能：
+一次召回只把页恢复到它恢复的那个边界，更深的镜像即使指纹对得上，也没有 KV 托着它。所以召回把 `device_kv_limit`
+设成恢复到的边界，自己 prefill 到底的路径设成无限；扫描侧只登记 `position <= device_kv_limit` 的宿主镜像。
+没有这一条，去掉写者闸门就是**不健全**的。
 
-- 正向：4 条 lane、同一会话按 lane 轮转发三轮，第二轮起每轮 `cached_tokens >= 8192`（今天换 lane 就掉到 0）。
-- 反向：把第二轮 prompt 的中间一段换掉、尾部保留，指纹必须拒绝恢复（今天的 `writer == lane` 之后没有第二道闸）。
-- 不变量：任何时刻 `Σ 持有者数 == 有效锚点数`；`free_slots()` 在无淘汰压力时不应因跨 lane 读取而下降。
+### 18.5 实测结论（双卡）
+
+- **走查路线（并发 1，默认）**：`0 → 8192` 不变，`refused_hash=0`。这条路线用的是本 lane 的活谱系 + ring 镜像，
+  不依赖 catalog 的 slab。
+- **多 lane 路线（`--max-concurrency 2`）**：两个前提都要满足才有跨请求复用，缺一个就是每轮从分歧点重来：
+  1. **host KV 预算要够装至少一个整会话镜像**：`--host-kv-mib 512`（256 MiB/shard）面对 512 MiB 的单会话镜像，
+     `session_capacity_` 虽然报 6，但 slab 一张都填不满，`host_kv_end=0`、`reach=0`，召回什么都不提供。
+     `--host-kv-mib 2048` 之后 `frontier_end/kv_end/host_prompt_end` 都正常填上。
+  2. **必须有一张 slab 镜像落在共同前缀之内**：`prompt_end=8452`、`shared=8451` 时（客户端重排答案后从 8451 分岔），
+     `offered > shared` 被排除，`reach=0`——语义上正确，那条历史本来就不能再用，代价是这一轮从 8451 重 prefill。
+     要让多 lane 路线真正吃到跨 lane 的收益，需要"共同前缀 +1"这类容差（prompt-end 落在分歧后一个 token），
+     那是独立的设计问题，本轮没动。
+- **镜像可以共享读**：`copy_lane_state` 的 H2D 分支只读宿主缓冲、只写本 lane 的 device 区；`load_dflash_image`
+  同理；每个 shard 一条 CUDA stream，且执行被 `execution_mutex_` 串行化，所以两条 lane 读同一张镜像没有竞争。
 
 ### 18.6 不参与指纹的两件事
 
