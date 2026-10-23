@@ -2999,7 +2999,7 @@ void TP2GenerationCore::publish_lane_prefill(
     snapshot_host_checkpoint(shard_b_, prompt_tokens, lane);
     // Only now are this prefill's checkpoints usable: their state is one the prefill reached and
     // their KV prefix is one it wrote.
-    publish_lane_checkpoints(lane);
+    publish_lane_checkpoints(lane, tokens);
     // A configuration without the ring keeps the device plane that carries the same image; with the
     // ring it is not carved and the checkpoint above is the only copy. execute_walk writes the whole
     // plane at its own prefill end; a batched lane writes only its own slice, which is all a
@@ -3050,7 +3050,7 @@ void TP2GenerationCore::publish_partial_prefill(std::uint32_t lane, std::uint32_
     // stand on it.
     snapshot_host_checkpoint(shard_a_, frontier, lane);
     snapshot_host_checkpoint(shard_b_, frontier, lane);
-    publish_lane_checkpoints(lane);
+    publish_lane_checkpoints(lane, tokens);
     session_publish(
         std::vector<TokenId>(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(frontier)),
         frontier, data.context_cache, collect_media_spans(data, frontier), lane);
@@ -3510,7 +3510,7 @@ void TP2GenerationCore::execute_plain_batch(
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
             // The anchors this answer wrote sit past a state the walk committed, so they become
             // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
-            publish_lane_checkpoints(lane.slot);
+            publish_lane_checkpoints(lane.slot, history);
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -4364,7 +4364,7 @@ void TP2GenerationCore::execute_spec_batch(
                             collect_media_spans(data, data.token_ids.size()), lane.slot);
             // The anchors this answer wrote sit past a state the walk committed, so they become
             // usable on the same terms as the prefill's: once the walk stopped naming its frontier.
-            publish_lane_checkpoints(lane.slot);
+            publish_lane_checkpoints(lane.slot, history);
         }
         const Clock::time_point done = Clock::now();
         lane.result.generated_token_ids = std::move(request.generated);
@@ -7127,7 +7127,12 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     const std::int32_t reserved = reuse_ledger_->reserve_image_slot();
     // Every image in the pool is held by an anchor that refused eviction: the capture is skipped,
     // and the caller already tolerates a boundary without a checkpoint.
-    if (reserved == kNoSlot) { return; }
+    if (reserved == kNoSlot) {
+        if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
+            std::fprintf(stderr, "[tp2-cp] skip lane=%u pos=%u pool exhausted\n", lane, frontier);
+        }
+        return;
+    }
     const std::size_t slot = static_cast<std::size_t>(reserved);
     if (slot >= shard.host_checkpoints.size()) {
         throw std::logic_error("TP-2 ledger reserved a slot outside the host ring");
@@ -7179,9 +7184,52 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     // used to rotate them are gone; the pool decides which slot an image lands in.
 }
 
-void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane) {
+void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
+                                                 std::span<const TokenId> history,
+                                                 std::span<const TokenId> tail) {
     const std::uint64_t live_id = retention(lane).host_checkpoint_live_id;
-    std::size_t published       = 0;
+
+    // Stamp before publishing: an image whose prefix is unknown must never become a boundary
+    // another lane can read. One pass over the stream serves every slot, because FNV-1a
+    // accumulates: sort the positions this lane wrote, walk the tokens once, and snapshot the hash
+    // at each of them.
+    struct PendingStamp {
+        Shard* shard;
+        std::size_t slot;
+        std::uint32_t position;
+    };
+
+    std::array<PendingStamp, 64> pending{};
+    std::size_t pending_count = 0;
+    for (Shard* shard : {&shard_a_, &shard_b_}) {
+        for (std::size_t slot = 0; slot < shard->host_checkpoints.size(); ++slot) {
+            const Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
+            if (checkpoint.prefill_id != live_id || pending_count == pending.size()) { continue; }
+            pending[pending_count++] = PendingStamp{shard, slot, checkpoint.position};
+        }
+    }
+    std::sort(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(pending_count),
+              [](const PendingStamp& left, const PendingStamp& right) {
+                  return left.position < right.position;
+              });
+    const std::size_t total = history.size() + tail.size();
+    std::uint64_t hash      = 1469598103934665603ULL;
+    std::size_t next        = 0;
+    const auto step         = [&hash](TokenId token) {
+        hash = (hash ^ static_cast<std::uint64_t>(token)) * 1099511628211ULL;
+    };
+    for (std::size_t index = 0; index < pending_count; ++index) {
+        const std::uint32_t position = pending[index].position;
+        const std::size_t end        = std::min<std::size_t>(position, total);
+        for (; next < end; ++next) {
+            step(next < history.size() ? history[next] : tail[next - history.size()]);
+        }
+        // A position past the stream is not this history's image at all: leave it unstamped rather
+        // than record a hash of a prefix the walk never stood on.
+        pending[index].shard->host_checkpoints[pending[index].slot].history_hash =
+            position <= total ? hash : 0;
+    }
+    std::size_t published = 0;
     for (Shard* shard : {&shard_a_, &shard_b_}) {
         for (auto& checkpoint : shard->host_checkpoints) {
             // The id is unique to this prefill, so it already identifies the writes; publication is
@@ -7193,8 +7241,17 @@ void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane) {
         }
     }
     if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
-        std::fprintf(stderr, "[tp2-cp] publish lane=%u id=%llu published=%zu\n", lane,
-                     static_cast<unsigned long long>(live_id), published);
+        std::fprintf(stderr, "[tp2-cp] publish lane=%u id=%llu published=%zu stream=%zu\n", lane,
+                     static_cast<unsigned long long>(live_id), published, total);
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            for (std::size_t slot = 0; slot < shard->host_checkpoints.size(); ++slot) {
+                const Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
+                if (checkpoint.prefill_id != live_id) { continue; }
+                std::fprintf(stderr, "[tp2-cp]   slot=%zu pos=%u hash=%016llx\n", slot,
+                             checkpoint.position,
+                             static_cast<unsigned long long>(checkpoint.history_hash));
+            }
+        }
     }
 }
 
@@ -7780,7 +7837,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                 // frontier names the same position.
                 snapshot_host_checkpoint(shard_a_, t0, lane);
                 snapshot_host_checkpoint(shard_b_, t0, lane);
-                publish_lane_checkpoints(lane);
+                publish_lane_checkpoints(lane, token_ids, request.generated);
                 session_publish(
                     std::vector<TokenId>(token_ids.begin(),
                                          token_ids.begin() + static_cast<std::ptrdiff_t>(t0)),
@@ -8033,7 +8090,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (lane_state.active_session != kNoSession) { sessions_[lane_state.active_session].prompt_end = prompt_tokens; }
     // Only now are this prefill's checkpoints usable: their state is one the walk reached and their
     // KV prefix is one the walk wrote.
-    publish_lane_checkpoints(lane);
+    publish_lane_checkpoints(lane, token_ids, request.generated);
 
     if (prefill_trace) {
         const auto millis = [](Clock::time_point from, Clock::time_point to) {

@@ -211,11 +211,17 @@ private:
             // The prefill that wrote this image. A prefill that never completed (cancelled) leaves
             // its slots invalid instead of usable state.
             std::uint64_t prefill_id = 0;
-            // The lane that wrote it. An image is the state after *its* own token history, and the
-            // reuse scan proves agreement only with the writing lane's lineage, so the image is
-            // only offered back to that lane - the pool may hand the slot to another one in the
-            // meantime.
+            // The lane that wrote it. Kept for the trace and for the single-lane ownership rule
+            // the scan still applies while no image can prove which prefix it froze; once
+            // `history_hash` is compared, this stops being what makes an image usable.
             std::int32_t writer = -1;
+            // FNV-1a of the whole token prefix this image is the state of, stamped by the publish
+            // that makes the slot usable. Position alone is not identity: two conversations can
+            // reach the same count over different tokens. A full-prefix hash is what lets an image
+            // be offered to a lane other than its writer (see prefix-reuse.md 18), and it is much
+            // stronger than the eight-token tag the boundary image uses, which only ever has to
+            // notice a rewritten tail because only its own lane loads it. Zero means not stamped.
+            std::uint64_t history_hash = 0;
             // Set when the writing prefill completes and cleared as soon as a later request's
             // shared prefix stops covering this frontier: the state is only the state of *this*
             // prompt's prefix while the whole lineage agrees on the tokens before it.
@@ -836,10 +842,14 @@ private:
     // Called beside each `computed_prefill_tokens_ += ...`, so both counters cover one population.
     void record_reuse(const GenerationResult& result);
     void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, std::uint32_t lane);
-    // Makes every checkpoint the lane's current prefill wrote usable. Only a completed prefill (or a
-    // cancelled walk that published its truncation) calls this, because the sweep is what turns a
-    // written slot into a boundary the next request can restore.
-    void publish_lane_checkpoints(std::uint32_t lane);
+    // Makes every checkpoint the lane's current prefill wrote usable, and stamps each of them with
+    // the prefix it froze: `history` is the token stream the walk really stood on (the prompt, plus
+    // `tail` when the answer decode extended it). Only a completed prefill (or a cancelled walk
+    // that published its truncation) calls this, because the sweep is what turns a written slot
+    // into a boundary the next request can restore - and the stamp is what makes it identifiable
+    // without knowing which lane wrote it.
+    void publish_lane_checkpoints(std::uint32_t lane, std::span<const TokenId> history,
+                                  std::span<const TokenId> tail = {});
     // Copies one lane's image between a whole-pool device buffer and its compact pinned image, or
     // between two whole-pool device buffers. `other` is the compact pinned image for a host copy
     // and the source pool for a device-to-device one.
