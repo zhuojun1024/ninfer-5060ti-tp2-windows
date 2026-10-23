@@ -2721,14 +2721,21 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         const std::span<const TokenId> lineage(lane_state.cached_prompt_tokens.data(),
                                                lane_state.cached_prompt_tokens.size());
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
-            const auto& checkpoint = shard_a_.host_checkpoints[slot];
+            auto& checkpoint = const_cast<Shard::HostCheckpoint&>(shard_a_.host_checkpoints[slot]);
             if (!checkpoint.valid) { continue; }
+            // The ledger owns the pool, the ring only owns the bytes. A slot the ledger released
+            // has been or is about to be handed to another image, so this description names a
+            // buffer that no longer holds it - the slot's retirement never reaches the ring, which
+            // is why the question is asked here.
+            if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(slot))) {
+                checkpoint.valid = false;
+                continue;
+            }
             // Any lane's image, whichever conversation wrote it: the stamp is the evidence that it
             // is the state of *this* prefix. A slot can hold another conversation's image at the
             // same position, and an image that was never stamped cannot prove anything; refusing is
-            // cheap
-            // - the next boundary down is offered anyway - while restoring the wrong prefix would
-            // poison the whole turn.
+            // cheap - the next boundary down is offered anyway - while restoring the wrong prefix
+            // would poison the whole turn.
             if (checkpoint.history_hash == 0 ||
                 checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
                 ++refused_fingerprint;
@@ -7535,8 +7542,14 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         const std::span<const TokenId> lineage(lane_state.cached_prompt_tokens.data(),
                                                lane_state.cached_prompt_tokens.size());
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
-            const auto& checkpoint = shard_a_.host_checkpoints[index];
+            auto& checkpoint = const_cast<Shard::HostCheckpoint&>(shard_a_.host_checkpoints[index]);
             if (!checkpoint.valid) { continue; }
+            // The ledger owns the pool, the ring only owns the bytes: a slot it released names a
+            // buffer that no longer holds this image.
+            if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(index))) {
+                checkpoint.valid = false;
+                continue;
+            }
             // Any lane's image: the writer's stamp is the only evidence that this image is the
             // state of *this* prefix. A slot can hold another conversation's image at the same
             // position, and an image that was never stamped proves nothing. Refusing costs the next

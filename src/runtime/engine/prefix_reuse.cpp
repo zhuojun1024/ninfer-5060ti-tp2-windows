@@ -50,6 +50,11 @@ std::uint32_t ReuseLedger::free_slots() const noexcept {
     return static_cast<std::uint32_t>(std::count(used_slots_.begin(), used_slots_.end(), false));
 }
 
+bool ReuseLedger::holds_slot(std::int32_t slot) const noexcept {
+    return slot >= 0 && static_cast<std::size_t>(slot) < used_slots_.size() &&
+           used_slots_[static_cast<std::size_t>(slot)];
+}
+
 ConversationLog& ReuseLedger::conversation(std::uint64_t session) {
     ConversationLog& log = conversations_[session];
     log.session          = session;

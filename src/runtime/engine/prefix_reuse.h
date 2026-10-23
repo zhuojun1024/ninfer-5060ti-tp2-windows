@@ -127,6 +127,10 @@ public:
     [[nodiscard]] std::uint32_t stride() const noexcept { return budget_.stride; }
     [[nodiscard]] std::uint32_t capacity() const noexcept { return budget_.capacity; }
     [[nodiscard]] std::uint32_t free_slots() const noexcept;
+    // Whether this ledger still holds the image in `slot`. The ring owns the bytes of a slot but
+    // not its lifetime: once the ledger releases a slot it may be handed to another image, and a
+    // description the ring still keeps for it names a buffer that no longer holds that image.
+    [[nodiscard]] bool holds_slot(std::int32_t slot) const noexcept;
 
     // Creates the conversation on first use. The reference stays valid across later insertions.
     ConversationLog& conversation(std::uint64_t session);
