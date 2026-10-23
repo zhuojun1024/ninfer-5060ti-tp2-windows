@@ -43,6 +43,24 @@ using namespace ninfer;
 namespace qwen = ninfer::models::qwen3_5;
 using Clock = std::chrono::steady_clock;
 
+// FNV-1a over a token stream. A host image records one of these over the prefix it froze, because a
+// position alone is not identity: two conversations reach the same count over different tokens, and
+// a rewritten history changes the prefix without changing its length. The same pair of constants is
+// used by the boundary image's eight-token tag, so an image and a boundary that name the same
+// prefix agree on what a hash is.
+constexpr std::uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
+constexpr std::uint64_t kFnvPrime       = 1099511628211ULL;
+
+[[nodiscard]] std::uint64_t prefix_fingerprint(std::span<const TokenId> tokens,
+                                               std::size_t position) {
+    std::uint64_t hash    = kFnvOffsetBasis;
+    const std::size_t end = std::min(position, tokens.size());
+    for (std::size_t index = 0; index < end; ++index) {
+        hash = (hash ^ static_cast<std::uint64_t>(tokens[index])) * kFnvPrime;
+    }
+    return hash;
+}
+
 // Phase timing for the TP-2 prefill/decode walk, enabled with NINFER_TP2_TIMING=1. It exists to
 // attribute a decode round to its phases while the round is being optimised (see the worklog, Round 11);
 // with the flag off every call is one branch on a cached bool. The marks are recorded on shard A's
@@ -2611,6 +2629,10 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
     LaneReuse result;
     ReuseReason reuse_reason  = ReuseReason::NoAnchorAtOrBefore;
     std::size_t shared_prefix = 0;
+    // Host images whose stamp does not describe this prompt's prefix. They are never offered; the
+    // count is reported so a fingerprint that starts refusing everything is visible in the trace
+    // rather than only as a smaller reuse number.
+    std::size_t refused_fingerprint = 0;
     lane_state.reuse_source   = ReuseSource::None;
     if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
         const std::size_t common =
@@ -2692,15 +2714,28 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
             offer(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot,
                   AnchorStorage::Device);
         }
+        const std::span<const TokenId> lineage(lane_state.cached_prompt_tokens.data(),
+                                               lane_state.cached_prompt_tokens.size());
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             const auto& checkpoint = shard_a_.host_checkpoints[slot];
             // This lane's own images only: an image is the state after *its* token history, and the
             // scan proves agreement only with this lane's lineage, not with another lane's. The
             // pool may hand the slot to another lane later, which is why the writer is part of the
             // test.
-            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane)) {
-                offer(checkpoint.position, slot, ReuseSource::HostCheckpoint, AnchorStorage::Host);
+            if (!checkpoint.valid || checkpoint.writer != static_cast<std::int32_t>(lane)) {
+                continue;
             }
+            // The image must be the state of *this* prefix, and the stamp its writer left is the
+            // only evidence of that: a slot can hold another conversation's image at the same
+            // position, and an image that was never stamped cannot prove anything. Refusing is
+            // cheap - the next boundary down is offered anyway - while restoring the wrong prefix
+            // would poison the whole turn.
+            if (checkpoint.history_hash == 0 ||
+                checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
+                ++refused_fingerprint;
+                continue;
+            }
+            offer(checkpoint.position, slot, ReuseSource::HostCheckpoint, AnchorStorage::Host);
         }
         const DecideResult decision = reuse_ledger_->decide(conversation, token_ids);
         reuse_reason                = decision.reason;
@@ -2732,13 +2767,13 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                                                                              : "none";
         std::fprintf(stderr,
                      "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
-                     "adopted=%d prefill_end=%u host=%zu/%zu lane_slots=%zu stride=%u "
-                     "-> reuse=%u slot=%u src=%s reason=%s\n",
+                     "adopted=%d prefill_end=%u host=%zu/%zu lane_slots=%zu refused_hash=%zu "
+                     "stride=%u -> reuse=%u slot=%u src=%s reason=%s\n",
                      lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
                      valid_checkpoints, shard_a_.host_checkpoints.size(), lane_checkpoints,
-                     host_checkpoint_stride_, result.tokens, result.slot, source,
-                     reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
+                     refused_fingerprint, host_checkpoint_stride_, result.tokens, result.slot,
+                     source, reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
     }
     // Tag the checkpoints this prefill leaves behind and start the ring at the first stride multiple
     // past the reused boundary: a checkpoint at the boundary itself would only duplicate the device
@@ -7425,6 +7460,9 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // final prompt token is always forwarded, because its logits drive the first sample.
     std::uint32_t reuse       = 0;
     std::size_t reuse_slot    = 0;
+    // Host images whose stamp does not describe this prompt's prefix; they are never taken, and the
+    // count is reported so a fingerprint that starts refusing everything is visible in the trace.
+    std::size_t refused_fingerprint     = 0;
     std::size_t shared_prefix = 0;
     lane_state.reuse_source             = ReuseSource::None;
     if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
@@ -7491,13 +7529,25 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             if (shard_a_.state_snapshots[slot].data == nullptr) { continue; }
             take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
         }
+        const std::span<const TokenId> lineage(lane_state.cached_prompt_tokens.data(),
+                                               lane_state.cached_prompt_tokens.size());
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             const auto& checkpoint = shard_a_.host_checkpoints[index];
             // This lane's own images only: an image is the state after *its* token history, and the
             // scan proves agreement only with this lane's lineage, not with another lane's.
-            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane)) {
-                take(checkpoint.position, index, ReuseSource::HostCheckpoint);
+            if (!checkpoint.valid || checkpoint.writer != static_cast<std::int32_t>(lane)) {
+                continue;
             }
+            // The writer's stamp is the only evidence that this image is the state of *this*
+            // prefix: a slot can hold another conversation's image at the same position, and an
+            // image that was never stamped proves nothing. Refusing costs the next boundary down;
+            // restoring the wrong prefix would poison the turn.
+            if (checkpoint.history_hash == 0 ||
+                checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
+                ++refused_fingerprint;
+                continue;
+            }
+            take(checkpoint.position, index, ReuseSource::HostCheckpoint);
         }
     }
     if (prefill_trace) { scan_done = Clock::now(); }
@@ -7520,13 +7570,13 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
             lane_state.active_session != kNoSession ? sessions_[lane_state.active_session].prompt_end : 0;
         std::fprintf(stderr,
                      "[tp2-reuse] prompt=%u cached=%zu shared=%zu replay_split=%zu adopted=%d "
-                     "prev_prompt=%u prefill_end=%u rewind=%u host=%zu/%zu stride=%u -> reuse=%u "
-                     "slot=%zu src=%s\n",
+                     "prev_prompt=%u prefill_end=%u rewind=%u host=%zu/%zu refused_hash=%zu "
+                     "stride=%u -> reuse=%u slot=%zu src=%s\n",
                      prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      adoption.divergence, adoption.adopted ? 1 : 0, previous_prompt,
                      lane_state.cached_boundaries[0], rewind_boundary, valid_checkpoints,
-                     shard_a_.host_checkpoints.size(), host_checkpoint_stride_, reuse, reuse_slot,
-                     source);
+                     shard_a_.host_checkpoints.size(), refused_fingerprint, host_checkpoint_stride_,
+                     reuse, reuse_slot, source);
     }
 
     // Tag the checkpoints this walk leaves behind and start the ring at the first stride multiple
