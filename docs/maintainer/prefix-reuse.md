@@ -495,25 +495,43 @@ FP8 AllReduce（`NINFER_TP2_AR_CODEC=bf16` 后所有复用数字一位不差，�
 因此根因在 **`DevicePair` 构造后留下的状态：它使随后的第一次 `cudaMalloc` 在驱动内部崩溃**。未修复。下一步应在一个不经过 HTTP 的
 最小程序里把这两步串起来复现，再对 `DevicePair` 里的 peer access / 映射分配 / 通道单元格逐个二分。
 
-**2026-10-23 用最小复现把上一条推翻**（源码在 `_temp/20261023-0800_tp2_pair_repro.cpp`，落盘时临时加过
-`ninfer_add_test` 目标，验完已从受版本管理的树里移除）：
+**2026-10-23 用最小复现把上一条推翻**（复现程序现在是正式测试 `tests/models/qwen3_5/test_tp2_startup_order.cpp`）：
 
 | 复现程序 | 做的事 | 结果 |
 |---|---|---|
-| `--mode none` | 只 materialize | 通过 |
-| `--mode pair` | `DevicePair`，然后 materialize | 4/4 通过 |
-| `--mode mapped` | 映射分配 + 通道单元格 + materialize | 通过 |
-| `--mode core` | 复刻 `TP2GenerationCore` 构造体：`DevicePair`、`DeviceContext` 移动赋值、`Reader`、`plan_load`、`materialize_model_tp2`、两个 `Parameters` | 3/3 通过 |
-| `--mode engine` | `ninfer::Engine`，选项与失败的命令行一致 | **7/7 失败**（0.4 s 与 28 s 两档） |
+| `plain` | 只 materialize | 通过 |
+| `pair` | `DevicePair`，然后 materialize | 4/4 通过 |
+| `mapped` | 映射分配 + 通道单元格 + materialize | 通过 |
+| `core` | 复刻 `TP2GenerationCore` 构造体：`DevicePair`、`DeviceContext` 移动赋值、`Reader`、`plan_load`、`materialize_model_tp2`、两个 `Parameters` | 3/3 通过 |
+| `engine` | `ninfer::Engine`，选项与失败的命令行一致 | **7/7 失败**（0.4 s 与 28 s 两档） |
 
 所以"`DevicePair` 留下坏状态"**也不成立**：`DevicePair` + materialize 是干净的。要复现必须是一个更大的进程
 （`Engine` 或 `ninfer-serve`）。同时排掉：`--no-prefix-reuse`（关掉 host checkpoint ring）照样崩、`--max-context 2048`
 与 `16384` 都崩、`--spec`/`--vision`/`--embedding-host` 都无关，所以 ring 和上下文大小都不是原因。
 
-剩下的差异只有 `Engine` 在 materialize 之前多做的 `normalize_engine_options` 和 `Engine::Impl` 的成员布局，两者都是纯 C++；
-而崩溃里有 `0xC0000374`（堆校验失败），说明**已经有一次主机侧越界写**，驱动只是碰到坏结构的第一个受害者。
-下一个该用的手段是守卫页堆：在复现程序里重写全局 `operator new`/`delete`，把每个块尾贴到 `PAGE_NOACCESS` 页前面，
-配一个 vectored handler 打模块+偏移，就能在真正越界写的那条指令上停下，而不是等驱动去碰它。
+**根因：陈旧的目标文件，即一次主机堆越界写。** 给复现程序装上守卫页堆（重写全局 `operator new`/`delete`，把每个块尾贴到
+`PAGE_NOACCESS` 页之前）后，故障当场变成确定性的：两次运行都停在同一条**写**指令上，
+
+```
+写地址 0x25f07565000（正好是某堆块后面的守卫页）
+#0 TP2GenerationCore::TP2GenerationCore+0x3ec
+#1 Engine::Impl::Impl+0x290
+#2 Engine::Engine+0x134
+```
+
+也就是这个构造函数往 `Engine::Impl` 为它申请的堆块之外写了东西：块的大小由 `engine.cpp` 按**它的** `sizeof(TP2GenerationCore)`
+申请，成员却由 `tp2_generation_core.cpp` 按**它的**布局写入，而 `engine.cpp` 的目标文件还是加 `reuse_stats_` 之前的版本。
+只重新编译 `engine.cpp` 后，同一个程序从 7/7 失败变成 2/2 通过；随后触摸 `include/ninfer/types.h` 与
+`tp2_generation_core.h` 全量重建，`ninfer-serve --devices 0,1` 从 0/10 变成 **4/4 存活 50 秒**，真实请求也通了
+（59 prompt / 8 completion token）。此前所有"设备释放窗口""`DevicePair` 留坏状态""第三张卡""FP8 codec"的结论全部作废。
+
+教训：改了被广泛包含的头文件后必须确认所有依赖它的 TU 都重编过。这类不一致不会报错，只会让另一侧的堆块被写穿，
+症状是驱动内部随机 AV，而栈看上去总在无辜的地方（`cudaMalloc`、`cudaGetDeviceProperties`、空闲线程跳 0）。
+`tests/models/qwen3_5/test_tp2_startup_order.cpp` 现在覆盖"`Engine` 在两张卡上完成加载"这条产品启动路径，
+`NINFER_GUARD_HEAP=1` 可以在下次出现同类症状时直接定位到越界写的那条指令。
+
+方案 B 随后改为**惰性分配**（首次捕获时才申请），实测正常：捕获到 `pos=21641 / 21667 / 21825`，正是每轮的一致点，
+比共享块边界 21,504 深 137–321 token。**但 recall 尚未把它当候选**，所以复用数字仍是 21,504。
 方案 B 随后改为**惰性分配**（首次捕获时才申请），实测正常：捕获到 `pos=21641 / 21667 / 21825`，正是每轮的一致点，
 比共享块边界 21,504 深 137–321 token。**但 recall 尚未把它当候选**，所以复用数字仍是 21,504。
 
@@ -883,5 +901,6 @@ ReuseReasonKind last_reuse_reason     = ReuseReasonKind::NoAnchorAtOrBefore;
 两个未定项推迟，`context_cache.selections` 因此暂时保留。
 
 构建通过；`test_request_log` 新增的 `reuse` 断言通过，`test_resource_manager`、`test_engine_options` 通过。
-**双卡端到端未验证**：复现脚本在这台机器上启动即崩（见 §12 历史那条的 2026-10-22 复核：与本次改动无关，
-但也没有修好），所以这次改动在双卡上没有跑过一次真实请求。
+**双卡端到端已跑通（2026-10-23）**：启动崩溃的根因是陈旧目标文件（§12 历史那条），重建后 `ninfer-serve --devices 0,1`
+连续 4 次启动存活、并完成一次真实请求（59 prompt / 8 completion token）。这次请求是全新对话，没有可复用前缀，
+所以 `context_cache.reuse` 的计数正确停在 0——**计数本身的非零路径仍未在真实双卡请求上验证**，只有单元断言覆盖。

@@ -14,6 +14,19 @@ set_tests_properties(
   ninfer_qwen3_5_tp2_load_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# The product's TP-2 startup order (both devices, then one Engine load). It is the only test that
+# constructs an Engine on the dual-card route, which is where a stale, differently sized object turns
+# into a heap overrun. The map is the only symbol source: Release builds carry no PDB.
+ninfer_add_test(ninfer_qwen3_5_tp2_startup_order_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_startup_order.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_tp2_startup_order_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+target_link_options(ninfer_qwen3_5_tp2_startup_order_test PRIVATE /MAP)
+
 ninfer_add_test(ninfer_qwen3_5_tp2_forward_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2_forward.cpp"
   LIBRARIES ninfer_engine ninfer_core)

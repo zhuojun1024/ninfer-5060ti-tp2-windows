@@ -35,6 +35,17 @@ Products land in `build-win/apps/{ninfer,ninfer-serve,ninfer-perplexity}.exe`. `
 `vcvars64` environment into the PowerShell session (see `tools/win_port/vcvars.ps1`), so no cmd wrapper
 is needed.
 
+After editing a widely included header, confirm its dependents really recompiled. A translation unit
+that was compiled against an older layout does not fail to link: it allocates the object at one size
+while a fresh constructor fills it at another, so the constructor writes past the end of the block.
+The first symptom is then an access violation inside the CUDA driver (in `cudaMalloc` or
+`cudaGetDeviceProperties`) or a `0xC0000374` heap-validation break, with a stack that names innocent
+code. If an incremental build produces a driver-side crash that a rebuild makes disappear, recompile
+the whole tree (`cmake --build build-win -j` after touching the header) before looking for a memory
+bug in the engine. `NINFER_GUARD_HEAP=1` on
+`tests/models/qwen3_5/test_tp2_startup_order.cpp` puts every allocation against a guard page and
+prints the faulting instruction, which localizes such an overrun in one run.
+
 ## Run
 
 ```powershell
