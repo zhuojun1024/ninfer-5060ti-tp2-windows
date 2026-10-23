@@ -237,27 +237,18 @@ int main() {
                           "replacing a reserved anchor did not return its slot");
     }
 
-    // A fixed-role slot (a divergence, block or prompt-end image that never rotates) is neither
-    // handed out nor reclaimed, so the ring can keep its structural images beside the rotating
-    // pool.
+    // An exhausted pool hands out nothing: the caller skips the capture instead of overwriting an
+    // image that a Pinned anchor still needs.
     {
-        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 3});
-        ledger.mark_slot_fixed(0);
-        failures += check(ledger.free_slots() == 2, "a fixed slot was left available");
-        for (int reserved = 0; reserved < 2; ++reserved) {
-            const std::int32_t slot = ledger.reserve_image_slot();
-            failures += check(slot > 0, "a fixed slot was handed out to a rotating image");
-        }
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 2});
+        ledger.record(ledger.conversation(2), pinned(4096, AnchorProvenance::PromptEnd));
+        ledger.record(ledger.conversation(2), pinned(8192, AnchorProvenance::Grid));
+        failures += check(ledger.free_slots() == 0, "the pinned anchors did not take the pool");
         failures += check(ledger.reserve_image_slot() == kNoSlot,
                           "an exhausted pool still handed out a slot");
-        ConversationLog& conversation    = ledger.conversation(2);
-        ReuseLedger::AnchorRequest fixed = pinned(4096, AnchorProvenance::PromptEnd);
-        fixed.slot                       = 0;
-        ledger.record(conversation, fixed);
-        // Eviction may take the rotating anchors, never the fixed image's slot.
-        ledger.record(ledger.conversation(3), grid(8192));
-        failures +=
-            check(ledger.free_slots() == 0, "eviction returned a slot the fixed image still uses");
+        // Both anchors stay: refusing to evict a Pinned image is the guarantee they exist for.
+        failures += check(ledger.conversation(2).anchors.floor(8192) != nullptr,
+                          "a pinned anchor was evicted to make room");
     }
 
     // An image can serve more than one conversation, but only one of them keeps it alive: a

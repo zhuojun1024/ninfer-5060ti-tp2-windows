@@ -84,13 +84,6 @@ std::int32_t ReuseLedger::reserve_image_slot() {
     return allocate_slot();
 }
 
-void ReuseLedger::mark_slot_fixed(std::int32_t slot) {
-    if (slot < 0 || static_cast<std::size_t>(slot) >= used_slots_.size()) { return; }
-    const std::size_t index = static_cast<std::size_t>(slot);
-    used_slots_[index]      = true;
-    owned_slots_[index]     = false;
-}
-
 std::int32_t ReuseLedger::allocate_slot() {
     for (std::size_t slot = 0; slot < used_slots_.size(); ++slot) {
         if (used_slots_[slot]) { continue; }

@@ -588,10 +588,9 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   stride"的分配方式；张数改为由 §7.1 的需求反推，`stride` 固定 8192（§7 第 4 条），`host_checkpoint_stride_`
   那条预算反推路径整体删除；
 - `valid[lane]` / `position[lane]` / `prefill_id[lane]` 这套按 lane 寻址的镜像记账，包括槽号
-  `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）。**2026-10-23 已完成元数据部分**：
-  四个字段都是标量（一个槽一张镜像、一个写者），`valid/position/prefill_id` 不再按 lane 索引；
-  越过 shared prefix 的裁剪改为按 `writer` 判定；轮转槽已由 `reserve_image_slot()` 分配（§15.4）。
-  剩下的只有 lane 分片的**固定角色槽**（divergence/block/prompt-end）与它们的布局常量；
+  `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）。**2026-10-23 已完成**：四个元数据字段都是标量，
+  写路径不再算地址（所有宿主镜像都由 `reserve_image_slot()` 给槽），`HostRing` 角色枚举、固定角色槽的
+  `mark_slot_fixed()` 与 `host_checkpoint_next/tail_next` 计数一并删除。布局常量只剩定容与定 stride 的用途；
 - 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
 - `session_publish` 的三条分支与字段清零；
 - `reuse_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
@@ -704,21 +703,23 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 
 | 谁 | 做什么 |
 |---|---|
-| 池的构造 | `ReuseLedger` 的容量就是整个 ring 的槽数；ring 里那些**固定角色**的槽（divergence、block、prompt-end，写一次不再轮转）用 `mark_slot_fixed()` 标掉——池既不发出去，也不会释放它们 |
-| 写镜像（`snapshot_host_checkpoint`） | 先 `reserve_image_slot()` 拿槽，再 `cudaMemcpy` 写进去；池满且全是 Pinned 时拿不到槽，这次捕获直接跳过（边界没有检查点，调用方本来就能容忍） |
+| 池的构造 | `ReuseLedger` 的容量就是整个 ring 的槽数；没有"保留组"，任何槽都可以给任何一张镜像 |
+| 写镜像（`snapshot_host_checkpoint`） | 先 `reserve_image_slot()` 拿槽，再 `cudaMemcpy` 写进去；池满且无可淘汰锚点时拿不到槽，这次捕获直接跳过（边界没有检查点，调用方本来就能容忍） |
 | 记账（`record()`） | 槽只要 `reserve` 过就记在 ledger 名下：替换或淘汰这个锚点时槽回到预算。传一个**当前没人持有**的槽（淘汰后 ring 里还留着的旧镜像）会重新认领它，否则后来的镜像可能盖到一个活锚点的缓冲上 |
 | 读镜像（`restore_lane_state` / `restore_lane_dflash`） | 仍用 `reuse.slot` 直接索引 `host_checkpoints`，不需要知道它是怎么分配的 |
 
 顺序上的一个细节：**必须在拷贝入队之前 reserve**。池满时的淘汰发生在那一步，被淘汰锚点的镜像正是这次拷贝要覆盖的
 那块内存——先 reserve 就把"谁被覆盖"和"谁失去锚点"绑成了同一件事。
 
-已落地（2026-10-23）：grid/tail 两个旋转环的槽改由 `reserve_image_slot()` 分配，per-lane 的
-`host_checkpoint_next/tail_next` 轮转计数退役；固定角色的三个槽改用 `mark_slot_fixed()` 保留。
-证据：双卡真实请求，首轮 8452 token（在 8192 处留下一张检查点），次轮 `cached_tokens=8192`——
-这张镜像就是写进 ledger 分配的槽、再由 `restore_lane_state` 读回来的。
+已落地（2026-10-23）：**每一张宿主镜像都来自同一个池**——grid、tail、divergence、block、prompt-end 不再各有
+地址，`HostRing` 枚举与写路径里的 `lane * per_lane + offset` 布局算术整体删除，`mark_slot_fixed()` 随之退场；
+`host_checkpoint_next/tail_next` 两个轮转计数也删了。布局常量（`grid/tail/divergence/block`）只剩**定容与定
+stride** 的用途：`host_checkpoint_tail_slots_` 还决定 tail 锚点的写入间隔，`host_checkpoint_grid_slots_` 还决定
+位置栅格的 stride。
 
-还没做的：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，
-没有收成一个入口。
+证据：双卡真实请求同一会话三轮，`cached_tokens = 0 / 8192 / 8192`，第二次恢复的 `slot=8` 是池分配的（不是公式算出来的）。
+
+还没做的：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，没有收成一个入口。
 
 ### 15.5 跨 lane 复用的真正条件：镜像属于"对话"，不属于"lane"
 

@@ -176,11 +176,6 @@ public:
     // kNoSlot means the pool holds nothing evictable; the caller then skips the capture.
     [[nodiscard]] std::int32_t reserve_image_slot();
 
-    // Marks a slot the caller uses for a fixed role (a divergence, block or prompt-end image that
-    // never rotates). The ledger neither hands it out nor frees it; an anchor recorded against it
-    // is caller-owned and survives eviction of its anchor.
-    void mark_slot_fixed(std::int32_t slot);
-
     struct CommitResult {
         std::uint32_t trimmed = 0;  // anchors dropped because their store no longer covers them
         std::uint32_t evicted = 0;  // anchors dropped to honour the budget

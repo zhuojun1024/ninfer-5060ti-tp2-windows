@@ -165,14 +165,10 @@ private:
         std::ptrdiff_t recurrent_pitch = 0;
         std::uint32_t layers           = 0;
     };
-    // Which reserved group of the host checkpoint ring a write lands in. The grid and the tail
-    // anchors rotate through their own slots; the divergence anchor and the block anchor own a fixed
-    // slot each and are rewritten in place, so they advance no cursor and neither rotation can evict
-    // them. The prompt-end slot is the prefill end of the lane that owns it: it is written once per
-    // completed prefill and lives outside every lane's grid, so it is the one ring slot the reuse
-    // boundaries can be read from without a device plane.
-    enum class HostRing { Grid, Tail, Divergence, Block, PromptEnd };
 
+    // Which reuse boundary a write is taking: the position grid, the tail anchors behind a prompt
+    // end, the divergence anchor, the block anchor or the prompt end itself. The pool decides where
+    // the image lands, so the role is a label for the callers and the trace, not an address.
     struct Shard {
         DeviceContext device;
         std::unique_ptr<models::qwen3_5::Model> model;
@@ -225,16 +221,10 @@ private:
             // prompt's prefix while the whole lineage agrees on the tokens before it.
             bool valid = false;
         };
-        // Within a lane's slice the ring is split in two: [0, grid_slots) holds the position grid,
-        // which keeps the whole context covered and is never evicted by the tail anchors;
-        // [grid_slots, size) holds the tail anchors, refreshed every prefill, which land within one
-        // chunk of a prompt end. Past every lane's slice sits the prompt-end slot that lane owns.
+
+        // One image per slot, all of them from the same pool: the ledger decides which slot a write
+        // lands in, so there is no per-lane slice and no reserved group to address around any more.
         std::vector<HostCheckpoint> host_checkpoints;
-        std::size_t host_checkpoint_grid_slots = 0;
-        // One round-robin cursor per lane: a lane's coverage belongs to its own conversation, so a
-        // store on one lane must not advance where another lane writes next.
-        std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_next{};
-        std::array<std::size_t, kTp2GenerationMaxConcurrency> host_checkpoint_tail_next{};
         // One state image covering every lane at the position its prompt stopped agreeing with that
         // lane's history: the only anchor between the shared block boundary (where this conversation
         // hits today) and the divergence, which is the 350 tokens every turn otherwise re-prefills.
@@ -845,8 +835,7 @@ private:
     // published rather than from the request plan: the plan's estimate is not what the request did.
     // Called beside each `computed_prefill_tokens_ += ...`, so both counters cover one population.
     void record_reuse(const GenerationResult& result);
-    void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, HostRing ring,
-                                  std::uint32_t lane);
+    void snapshot_host_checkpoint(Shard& shard, std::uint32_t frontier, std::uint32_t lane);
     // Makes every checkpoint the lane's current prefill wrote usable. Only a completed prefill (or a
     // cancelled walk that published its truncation) calls this, because the sweep is what turns a
     // written slot into a boundary the next request can restore.
