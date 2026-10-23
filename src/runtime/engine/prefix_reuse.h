@@ -54,10 +54,6 @@ struct Anchor {
     AnchorKvSource kv_source    = AnchorKvSource::Device;
     std::int32_t lane           = kAnyLane;
     std::int32_t slot           = kNoSlot;  // host image slot; kNoSlot for a device anchor
-    // A borrower names an image another conversation owns. The state after [0, position) does not
-    // depend on the lane that produced it, so more than one conversation may point at one image -
-    // but only the owner keeps it alive: when the owner's anchor goes, every borrower goes with it.
-    bool borrowed = false;
 };
 
 // Every decision names why it did or did not reuse. A free-text log line cannot be asserted on, so
@@ -178,26 +174,30 @@ public:
     [[nodiscard]] std::int32_t reserve_image_slot();
 
 private:
-    // One conversation's claim on an image it does not own.
-    struct Borrower {
-        std::uint64_t session  = 0;
-        std::uint32_t position = 0;
-    };
     [[nodiscard]] std::int32_t allocate_slot();
+    // Registers `session` as a holder of the image in `slot`. Idempotent: a conversation that names
+    // one image twice holds it once, and re-registering the same image after a scan rebuild is
+    // free.
+    void hold_slot(std::size_t slot, std::uint64_t session);
+    // Removes one holder; the slot itself is only freed when the last one goes.
+    void drop_hold(std::size_t slot, std::uint64_t session);
+    // Returns the slot to the budget if this ledger owns it and nobody holds it any more. An image
+    // another conversation still names is not the caller's to free.
     void release_slot(std::int32_t slot);
-    // Drops every borrowed anchor that names `slot`: the image below it is about to be overwritten.
-    void release_borrowers(std::int32_t slot);
-    // Evicts the farthest Lru anchor of any conversation; false when none is evictable.
+    // Frees unconditionally; only called once the holder set is empty.
+    void free_slot(std::size_t slot);
+    // Evicts the farthest Lru anchor this ledger may take; false when none is evictable.
     bool evict_one();
 
     ReuseBudget budget_;
     std::vector<bool> used_slots_;
     // Slots this ledger allocated, as opposed to ones a caller owns. Only these come back.
     std::vector<bool> owned_slots_;
-    // Per slot, the conversation that owns the image (0 when no conversation claimed it).
-    std::vector<std::uint64_t> owner_sessions_;
-    // Per slot, the conversations that point at the image without owning it.
-    std::vector<std::vector<Borrower>> borrowers_;
+    // Per slot, every conversation whose anchor names that image. An image lives while any of them
+    // still names it: ownership is a reference count, not a single owner, because a conversation
+    // that wrote the image can leave while another one is still restoring from it (the lane that
+    // wrote it is not necessarily the lane that reads it next).
+    std::vector<std::vector<std::uint64_t>> holders_;
     std::unordered_map<std::uint64_t, ConversationLog> conversations_;
 };
 

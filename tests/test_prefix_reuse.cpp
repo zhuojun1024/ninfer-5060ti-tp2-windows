@@ -250,32 +250,40 @@ int main() {
                           "a pinned anchor was evicted to make room");
     }
 
-    // An image can serve more than one conversation, but only one of them keeps it alive: a
-    // borrower goes when the owner's slot is reclaimed, so a restore can never read a buffer that
-    // moved on.
+    // An image lives while any conversation still names it. The conversation that wrote it can
+    // leave while another one is still restoring from it - the lane that wrote an image is not
+    // necessarily the one that reads it next - so leaving takes only the leaver's hold.
     {
         ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 1});
-        ConversationLog& owner  = ledger.conversation(1);
+        ConversationLog& writer = ledger.conversation(1);
         ConversationLog& reader = ledger.conversation(2);
 
-        const ReuseLedger::RecordResult owned = ledger.record(owner, grid(8192));
-        failures += check(owned.recorded, "the owning anchor was refused");
+        const ReuseLedger::RecordResult written = ledger.record(writer, grid(8192));
+        failures += check(written.recorded, "the writing anchor was refused");
 
-        ReuseLedger::AnchorRequest borrowed = grid(8192);
-        borrowed.slot                       = owned.slot;
+        ReuseLedger::AnchorRequest shared = grid(8192);
+        shared.slot                       = written.slot;
+        failures += check(ledger.record(reader, shared).recorded, "the second anchor was refused");
         failures +=
-            check(ledger.record(reader, borrowed).recorded, "the borrowing anchor was refused");
-        failures +=
-            check(reader.anchors.floor(8192) != nullptr, "the borrowing anchor was not recorded");
+            check(reader.anchors.floor(8192) != nullptr, "the second anchor was not recorded");
 
-        // The pool is full; only the owner can make room, because the borrower holds no slot. The
-        // borrower must disappear with the image it names.
-        failures += check(ledger.record(ledger.conversation(3), grid(16384)).recorded,
-                          "the pool refused an anchor that the owner's eviction made room for");
+        // Two conversations name the image, so it is not evictable: taking it would free nothing
+        // and would break the other reader.
+        failures += check(!ledger.record(ledger.conversation(3), grid(16384)).recorded,
+                          "a shared image was evicted from under its reader");
+
+        // The writer leaves. Its anchor goes, the image does not: the reader still names it.
+        ledger.forget(1);
+        // The third conversation was created by the refused record and stays; the writer's is gone.
         failures +=
-            check(owner.anchors.floor(8192) == nullptr, "the evicted owner kept its anchor");
-        failures += check(reader.anchors.floor(8192) == nullptr,
-                          "a borrowed anchor survived the eviction of its image");
+            check(ledger.conversation_count() == 2, "the writer's conversation survived forget");
+        failures += check(reader.anchors.floor(8192) != nullptr,
+                          "the reader lost its anchor when the writer left");
+        failures += check(ledger.free_slots() == 0, "the image came back while it was still named");
+
+        // The last holder leaves and only then does the slot return to the budget.
+        ledger.forget(2);
+        failures += check(ledger.free_slots() == 1, "the image stayed after its last holder left");
     }
 
     std::cout << (failures == 0 ? "ok" : "failures") << '\n';
