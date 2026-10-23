@@ -591,14 +591,13 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）；
 - 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
 - `session_publish` 的三条分支与字段清零；
-- `reuse_path` 及 `PrefixReusePath` 枚举，由 §17 的 `reuse_source`/`reuse_reason` 取代。**注意：这一项不是"只服务日志"的清理。**
-  实施时核对发现，该枚举驱动 `record_prefix_selection()` 里六个累计计数器（`root_selections`、`private_endpoint_selections`、
-  `private_turn_closure_selections`、`private_response_replay_selections`、`private_long_anchor_selections`、
-  `shared_stable_prefix_selections`），它们进 `RuntimeStats`、只在单卡路线上被累加（双卡恒零，见 §17.5）、
-  并被 `test_resource_manager` 与 `test_engine_prefix_real` 断言。删枚举等于删掉这六个复用选择指标，
-  因此必须**先加替代再删旧**：新指标按 §17 定义（`source` × `reason` 两个轴），
-  双卡先装上（它今天一个都没有），单卡接线后再删旧计数器、枚举与那个 switch；
-- `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）；
+- `reuse_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
+  收窄作用域**：该枚举在单卡路线里是程序内部的**恢复路径**（`is_rewrite_checkpoint_restore()` 与
+  `PrivateEndpoint`/`SharedStablePrefix`/`PrivateLongAnchor` 在 `program/prefill.cpp`、`context.cpp`、`pressure.cpp` 里做路由判定），
+  不是存储标签——§17.6 已经写明"旧枚举是角色，不是存储"。删它就得重新编码那套路由，是净增复杂度。
+  已完成的删除：`record_prefix_selection()`、六个 `*_selections`、`last_selected_frontier_tokens`、`context_cache.selections`
+  与 `last_selection`。**保留**：枚举本身，作为单卡程序的路由词汇（要更诚实可改名 `RestorePath`，与 §17.6 一致，属可选整理）；
+- `cached_prompt_tokens` 与 `entry.tokens` 的双份维护（合并为单一 `log.tokens`）——不需要 ledger，可独立做；
 - device/host 双份代码路径。
 
 ### 13.1 改名：让单位诚实
@@ -648,6 +647,7 @@ context cache 的通用容量（TP-2 上它实际只管 prefix-reuse 的镜像�
 | 内存参数怎么命名 | `--host-state-images` / `--device-state-images`，按"张"计；`--host-kv-mib` 保持 MiB（§13.1） | 状态镜像是定长的（146.8 MiB/张），张数才是用户能对上内存的单位；`slots` 是内部索引，不该出现在 CLI |
 | `--host-state-images` 的默认值 | **20**（≈2.9 GiB，覆盖 64K 提示 + 64K 生成） | 按 §7.1 反推；旧的 8（实占 12 张 ≈1.7 GiB）只够 40K 双段覆盖 |
 | 规整失败时是否允许强制续写 | **不允许**（第 5 节）。失败就用客户端流并把代价暴露出来 | 静默改写历史的正确性风险远大于一次全量 prefill；要重开需要独立开关，不作为默认路径 |
+| 单卡路线是否也迁到 ledger | **不迁**。单卡保留自己的 context cache / `StateImageStore`；`PrefixReusePath` 收窄为程序内部的路由词汇（§13 第 5 条） | 单卡那套是参考路线的在线特性（device/host 双副本、跨会话 shared prefix、long anchor、rewrite checkpoint、压力驱逐、MTP 桥接），是 ledger 今天能力的**真超集**；且它与准入控制（`ResourceManager`/`PressurePlanner`/`MaterializationPlanner`/`AdmissionCandidate`）耦合，迁移必须连 admission 一起重写。收益只是"少一套代码"，代价是数值参考路线与一到两周工期 |
 
 ### 14.2 仍开放
 
@@ -691,6 +691,32 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 
 不这么做的后果很具体：`ConversationLog` 没有 owner 就没有 TTL，`max_private_continuations` 无处可落，重启后的会话
 恢复会先于锚点设计被打破。
+
+### 15.4 存储所有权：池归 ledger，镜像归 ring
+
+一句话：**ledger 决定一张镜像落在哪个槽，ring 只是那块内存。** 这样"两个分配器管一个池"不会出现，
+淘汰规则也只有一个（按位置最远的 Lru 先走）。
+
+契约（都在 `src/runtime/engine/prefix_reuse.h` 上）：
+
+| 谁 | 做什么 |
+|---|---|
+| 池的构造 | `ReuseLedger` 的容量就是整个 ring 的槽数；ring 里那些**固定角色**的槽（divergence、block、prompt-end，写一次不再轮转）用 `mark_slot_fixed()` 标掉——池既不发出去，也不会释放它们 |
+| 写镜像（`snapshot_host_checkpoint`） | 先 `reserve_image_slot()` 拿槽，再 `cudaMemcpy` 写进去；池满且全是 Pinned 时拿不到槽，这次捕获直接跳过（边界没有检查点，调用方本来就能容忍） |
+| 记账（`record()`） | 槽只要 `reserve` 过就记在 ledger 名下：替换或淘汰这个锚点时槽回到预算。传一个**当前没人持有**的槽（淘汰后 ring 里还留着的旧镜像）会重新认领它，否则后来的镜像可能盖到一个活锚点的缓冲上 |
+| 读镜像（`restore_lane_state` / `restore_lane_dflash`） | 仍用 `reuse.slot` 直接索引 `host_checkpoints`，不需要知道它是怎么分配的 |
+
+顺序上的一个细节：**必须在拷贝入队之前 reserve**。池满时的淘汰发生在那一步，被淘汰锚点的镜像正是这次拷贝要覆盖的
+那块内存——先 reserve 就把"谁被覆盖"和"谁失去锚点"绑成了同一件事。
+
+已落地（2026-10-23）：grid/tail 两个旋转环的槽改由 `reserve_image_slot()` 分配，per-lane 的
+`host_checkpoint_next/tail_next` 轮转计数退役；固定角色的三个槽改用 `mark_slot_fixed()` 保留。
+证据：双卡真实请求，首轮 8452 token（在 8192 处留下一张检查点），次轮 `cached_tokens=8192`——
+这张镜像就是写进 ledger 分配的槽、再由 `restore_lane_state` 读回来的。
+
+还没做的两件：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，
+没有收成一个入口；`kAnyLane` 的**跨 lane** 复用还没打开——槽不再按 lane 分片了，但 `offer()` 仍按
+`checkpoint.valid[lane]` 只登记本 lane 的检查点，所以一条 lane 还不能用另一条 lane 留下的镜像。
 
 ---
 

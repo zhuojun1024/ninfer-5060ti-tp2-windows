@@ -203,6 +203,63 @@ int main() {
         failures += check(ledger.conversation_count() == 0, "forget left the conversation behind");
     }
 
+    // A slot the caller writes itself is reserved before the image exists and stays the ledger's to
+    // reclaim: that is what lets the host ring hand its image pool to one allocator instead of two.
+    {
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 3});
+        ConversationLog& conversation = ledger.conversation(1);
+
+        const std::int32_t reserved = ledger.reserve_image_slot();
+        failures += check(reserved >= 0, "a free pool refused to reserve an image slot");
+        failures += check(ledger.free_slots() == 2, "reserving an image slot did not take it");
+
+        ReuseLedger::AnchorRequest request = grid(8192);
+        request.slot                       = reserved;
+        failures += check(ledger.record(conversation, request).slot == reserved,
+                          "recording a reserved slot did not keep it");
+
+        // Re-recording the same anchor must not free the slot it names.
+        failures += check(ledger.record(conversation, request).recorded,
+                          "re-recording a reserved slot was refused");
+        failures +=
+            check(ledger.free_slots() == 2, "re-recording an anchor freed the slot it still names");
+
+        // A fresh anchor takes another slot; replacing the first anchor with a different one must
+        // return the slot the first anchor held.
+        const ReuseLedger::RecordResult second = ledger.record(conversation, grid(16384));
+        failures += check(second.recorded && second.slot != reserved,
+                          "the second anchor did not take another slot");
+        ReuseLedger::AnchorRequest replacing = grid(8192);
+        replacing.slot                       = 2;
+        failures += check(ledger.record(conversation, replacing).recorded,
+                          "replacing a reserved anchor was refused");
+        failures += check(ledger.reserve_image_slot() == reserved,
+                          "replacing a reserved anchor did not return its slot");
+    }
+
+    // A fixed-role slot (a divergence, block or prompt-end image that never rotates) is neither
+    // handed out nor reclaimed, so the ring can keep its structural images beside the rotating
+    // pool.
+    {
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 3});
+        ledger.mark_slot_fixed(0);
+        failures += check(ledger.free_slots() == 2, "a fixed slot was left available");
+        for (int reserved = 0; reserved < 2; ++reserved) {
+            const std::int32_t slot = ledger.reserve_image_slot();
+            failures += check(slot > 0, "a fixed slot was handed out to a rotating image");
+        }
+        failures += check(ledger.reserve_image_slot() == kNoSlot,
+                          "an exhausted pool still handed out a slot");
+        ConversationLog& conversation    = ledger.conversation(2);
+        ReuseLedger::AnchorRequest fixed = pinned(4096, AnchorProvenance::PromptEnd);
+        fixed.slot                       = 0;
+        ledger.record(conversation, fixed);
+        // Eviction may take the rotating anchors, never the fixed image's slot.
+        ledger.record(ledger.conversation(3), grid(8192));
+        failures +=
+            check(ledger.free_slots() == 0, "eviction returned a slot the fixed image still uses");
+    }
+
     std::cout << (failures == 0 ? "ok" : "failures") << '\n';
     return failures == 0 ? 0 : 1;
 }

@@ -62,6 +62,22 @@ void ReuseLedger::forget(std::uint64_t session) {
     conversations_.erase(found);
 }
 
+std::int32_t ReuseLedger::reserve_image_slot() {
+    std::int32_t slot = allocate_slot();
+    if (slot != kNoSlot) { return slot; }
+    // Every image is held by a Pinned anchor: refusing is the honest outcome, because clearing a
+    // pinned image to make room would break the guarantee it exists for.
+    if (!evict_one()) { return kNoSlot; }
+    return allocate_slot();
+}
+
+void ReuseLedger::mark_slot_fixed(std::int32_t slot) {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= used_slots_.size()) { return; }
+    const std::size_t index = static_cast<std::size_t>(slot);
+    used_slots_[index]      = true;
+    owned_slots_[index]     = false;
+}
+
 std::int32_t ReuseLedger::allocate_slot() {
     for (std::size_t slot = 0; slot < used_slots_.size(); ++slot) {
         if (used_slots_[slot]) { continue; }
@@ -136,29 +152,33 @@ ReuseLedger::RecordResult ReuseLedger::record(ConversationLog& conversation,
 
     if (anchor.storage == AnchorStorage::Host) {
         if (!needs_allocation) {
-            // The caller owns this image; the ledger only tracks where it lives.
+            // A slot that came from `reserve_image_slot` is already owned, and staying owned is
+            // what returns it to the budget when this anchor is replaced or evicted. A slot the
+            // ledger is not holding at all - an image the ring still carries after its anchor was
+            // evicted - is claimed here, or a later image could be placed on top of a live anchor's
+            // buffer. A fixed slot is held but never owned, so it is left alone.
             anchor.slot = request.slot;
+            if (anchor.slot >= 0 && static_cast<std::size_t>(anchor.slot) < used_slots_.size() &&
+                !used_slots_[static_cast<std::size_t>(anchor.slot)]) {
+                used_slots_[static_cast<std::size_t>(anchor.slot)]  = true;
+                owned_slots_[static_cast<std::size_t>(anchor.slot)] = true;
+            }
         } else {
-            std::int32_t slot = allocate_slot();
+            const std::int32_t slot = reserve_image_slot();
             if (slot == kNoSlot) {
-                if (!evict_one()) {
-                    // Every image is Pinned. Refusing the new anchor is the honest outcome: clearing a
-                    // Pinned image to make room would break the guarantee it exists for.
-                    result.degraded = true;
-                    return result;
-                }
-                slot = allocate_slot();
-                if (slot == kNoSlot) {
-                    result.degraded = true;
-                    return result;
-                }
+                // Every image is Pinned. Refusing the new anchor is the honest outcome: clearing a
+                // Pinned image to make room would break the guarantee it exists for.
+                result.degraded = true;
+                return result;
             }
             anchor.slot = slot;
         }
     }
 
     const std::optional<Anchor> replaced = conversation.anchors.insert(anchor);
-    if (replaced) { release_slot(replaced->slot); }
+    // Re-recording the slot that serves this very anchor must not free it: the image is still the
+    // one the anchor names, and clearing it would hand the same buffer to a second anchor.
+    if (replaced && replaced->slot != anchor.slot) { release_slot(replaced->slot); }
     result.recorded = true;
     result.slot     = anchor.slot;
     return result;

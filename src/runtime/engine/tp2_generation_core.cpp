@@ -473,11 +473,24 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
                 host_checkpoint_grid_slots_;
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
-            // The decision layer. It owns the positions and their slots; the ring above owns the
-            // images. The slot count is the ring's, because for now the ring allocates them.
+            // The decision layer owns the positions and allocates the slots; the ring below owns
+            // the images. The pool spans the whole ring, and the slots the ring keeps for a fixed
+            // role (a divergence, block or prompt-end image that never rotates) are marked fixed
+            // here so that the rotating pool can hand out every remaining slot without ever
+            // colliding with one of them.
             reuse_ledger_ = std::make_unique<ReuseLedger>(
                 ReuseBudget{host_checkpoint_stride_, lanes_ * host_checkpoint_slots_per_lane_ +
                                                          lanes_});
+            for (std::uint32_t lane = 0; lane < lanes_; ++lane) {
+                const std::uint32_t slice = lane * host_checkpoint_slots_per_lane_ +
+                                            host_checkpoint_grid_slots_ +
+                                            host_checkpoint_tail_slots_;
+                reuse_ledger_->mark_slot_fixed(static_cast<std::int32_t>(slice));
+                reuse_ledger_->mark_slot_fixed(
+                    static_cast<std::int32_t>(slice + host_checkpoint_divergence_slots_));
+                reuse_ledger_->mark_slot_fixed(
+                    static_cast<std::int32_t>(lanes_ * host_checkpoint_slots_per_lane_ + lane));
+            }
         }
         // The masked-draft route carries its draft context through this same ring (stage B6): each
         // checkpoint holds the target state image and the draft ring at the same frontier, so a
@@ -7105,9 +7118,31 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     std::size_t begin      = 0;
     std::size_t count      = grid;
     bool appended          = false;
-    switch (ring) {
-        case HostRing::Grid: break;
-        case HostRing::Tail: begin = grid; count = tail; break;
+    std::size_t slot       = 0;
+    if (ring == HostRing::Grid || ring == HostRing::Tail) {
+        // The rotating images come out of the ledger's pool, which owns every slot the ring does
+        // not use for a fixed role. One allocator over one pool: a lane is no longer confined to
+        // its own slice, and the slot an image lands in follows the same eviction rule as its
+        // anchor. Reserving before the copy is what makes that safe - the slot handed back is free
+        // the moment it is returned, so the evicted anchor was the one whose image this copy
+        // overwrites.
+        if (reuse_ledger_ == nullptr) { return; }
+        const std::int32_t reserved = reuse_ledger_->reserve_image_slot();
+        // Every image in the pool is held by a pinned anchor: refusing the capture is the honest
+        // outcome, and the caller already tolerates a boundary without a checkpoint.
+        if (reserved == kNoSlot) { return; }
+        slot = static_cast<std::size_t>(reserved);
+        if (slot >= shard.host_checkpoints.size()) {
+            throw std::logic_error("TP-2 ledger reserved a slot outside the host ring");
+        }
+    } else {
+        switch (ring) {
+        case HostRing::Grid:
+            break;
+        case HostRing::Tail:
+            begin = grid;
+            count = tail;
+            break;
         case HostRing::Divergence:
             begin = grid + tail;
             count = host_checkpoint_divergence_slots_;
@@ -7117,28 +7152,29 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
             count = host_checkpoint_block_slots_;
             break;
         case HostRing::PromptEnd:
-            // The prompt end is written once per completed prefill and never rotates, so it gets one
-            // slot per lane appended after every lane's slice instead of a place in the grid. A place
-            // in the grid would have to be carved out of the position stride, and the ring layout is
-            // only per_lane wide when the configured slot budget is large enough (see the ring sizing
-            // in build_shard), so a fixed offset inside a slice can alias a neighbour's slot.
-            begin    = static_cast<std::size_t>(lanes_) * host_checkpoint_slots_per_lane_ +
-                       static_cast<std::size_t>(lane);
+            // The prompt end is written once per completed prefill and never rotates, so it gets
+            // one slot per lane appended after every lane's slice instead of a place in the
+            // grid. A place in the grid would have to be carved out of the position stride, and
+            // the ring layout is only per_lane wide when the configured slot budget is large
+            // enough (see the ring sizing in build_shard), so a fixed offset inside a slice can
+            // alias a neighbour's slot.
+            begin = static_cast<std::size_t>(lanes_) * host_checkpoint_slots_per_lane_ +
+                    static_cast<std::size_t>(lane);
             count    = 1;
             appended = true;
             break;
+        }
+        if (!appended) {
+            // The fixed roles keep their own slice of the ring, laid out exactly like the whole
+            // ring at lanes=1. The ledger marked these slots fixed, so the pool never hands them
+            // out.
+            begin += static_cast<std::size_t>(lane) * host_checkpoint_slots_per_lane_;
+        }
+        if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
+        slot = begin;
     }
-    if (!appended) {
-        // Each lane owns its own slice of the ring, laid out exactly like the whole ring at lanes=1,
-        // so a write never evicts another lane's checkpoints.
-        begin += static_cast<std::size_t>(lane) * host_checkpoint_slots_per_lane_;
-    }
-    if (count == 0 || begin + count > shard.host_checkpoints.size()) { return; }
-    const std::size_t index = ring == HostRing::Tail   ? shard.host_checkpoint_tail_next[lane]
-                              : ring == HostRing::Grid ? shard.host_checkpoint_next[lane]
-                                                       : 0;
     shard.device.bind_to_current_thread();
-    Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[begin + index];
+    Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[slot];
     // Overwriting the slot already destroys the checkpoint it held, so retire it before the copy is
     // enqueued: a prefill that throws between here and the publish sweep must not leave a torn buffer
     // behind a flag that still says the last completed prefill wrote it. Only the sweep below, which
@@ -7173,11 +7209,8 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
             static_cast<std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
             static_cast<std::int32_t>(lane));
     }
-    if (ring == HostRing::Tail) {
-        shard.host_checkpoint_tail_next[lane] = (index + 1) % count;
-    } else if (ring == HostRing::Grid) {
-        shard.host_checkpoint_next[lane] = (index + 1) % count;
-    }
+    // The rotating images are the ledger's to place now, so the per-lane next-index counters that
+    // used to rotate them are gone; the pool decides which slot an image lands in.
 }
 
 void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane) {
