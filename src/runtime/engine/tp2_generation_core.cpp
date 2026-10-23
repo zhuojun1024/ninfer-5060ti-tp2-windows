@@ -492,10 +492,13 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
             const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
             host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
             // The decision layer owns the positions and allocates the slots; the ring below owns
-            // the images. The pool spans every slot: a fixed role is a label on the write, not an
-            // address.
+            // the images. The rotation pool spans the per-lane slices, and the prompt-end images
+            // get their own tail of the ring: reserving one of those is a role, not an address, so
+            // the ledger has to be told the role exists. A budget with no prompt-end capacity makes
+            // every such reservation fail, and then the walk never writes the image its own prompt
+            // ends on.
             reuse_ledger_ = std::make_unique<ReuseLedger>(ReuseBudget{
-                host_checkpoint_stride_, lanes_ * host_checkpoint_slots_per_lane_ + lanes_});
+                host_checkpoint_stride_, lanes_ * host_checkpoint_slots_per_lane_, lanes_});
         }
         // The masked-draft route carries its draft context through this same ring (stage B6): each
         // checkpoint holds the target state image and the draft ring at the same frontier, so a
