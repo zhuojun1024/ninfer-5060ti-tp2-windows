@@ -2907,78 +2907,68 @@ void TP2GenerationCore::capture_lane_anchor_frozen(std::uint32_t lane, std::uint
                                  frozen_draft, lane);
 }
 
-void TP2GenerationCore::restore_lane_gdn(std::uint32_t lane, const LaneReuse& reuse) {
-    const ReuseSource source = retention(lane).reuse_source;
+// The one place a reused prefix becomes device state: the target GDN image and the masked draft's
+// context are restored to the same boundary, on every shard, from whichever store the scan chose.
+// Both halves have to move together - the walk starts at the boundary, so the skipped prefix
+// produces no target residual to rebuild the draft from, and a boundary that restores one half and
+// not the other is a hole rather than a shortcut. Callers that rebuild their draft ring themselves
+// pass `zero_draft_when_none = false`; a route with no draft ring at all (`dflash_round ==
+// nullptr`) is a no-op for the draft half either way.
+void TP2GenerationCore::restore_lane(std::uint32_t lane, std::uint32_t slot,
+                                     bool zero_draft_when_none) {
+    const ReuseSource source      = retention(lane).reuse_source;
+    const std::int32_t lane_index = static_cast<std::int32_t>(lane);
     for (Shard* shard : {&shard_a_, &shard_b_}) {
         shard->device.bind_to_current_thread();
         switch (source) {
         case ReuseSource::None:
             // A lane only owns its own slot, so a reset must not touch its neighbours.
-            zero_lane_state(shard->lane_state_geometry, shard->state_backing.data,
-                            static_cast<std::int32_t>(lane), shard->device.stream);
+            zero_lane_state(shard->lane_state_geometry, shard->state_backing.data, lane_index,
+                            shard->device.stream);
+            if (zero_draft_when_none && shard->dflash_round != nullptr) {
+                shard->dflash_round->zero_context();
+            }
             break;
         case ReuseSource::LiveState:
             // The device state already sits at this boundary: a restored session put it there, or
-            // the conversation that just decoded left it exactly at its frontier.
+            // the conversation that just decoded left it exactly at its frontier. Nothing to copy,
+            // and the draft ring was flushed to the same frontier at publish.
             break;
         case ReuseSource::DeviceSnapshot:
-            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
-                            static_cast<std::int32_t>(lane),
-                            shard->state_snapshots[reuse.slot].data, cudaMemcpyDeviceToDevice,
+            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data, lane_index,
+                            shard->state_snapshots[slot].data, cudaMemcpyDeviceToDevice,
                             shard->device.stream);
+            if (shard->dflash_round != nullptr) {
+                const std::size_t lane_bytes = shard->dflash_round->lane_context_image_bytes();
+                shard->dflash_round->copy_context_from_device(
+                    DeviceSpan{static_cast<std::byte*>(shard->dflash_snapshots[slot].data) +
+                                   static_cast<std::size_t>(lane) * lane_bytes,
+                               lane_bytes},
+                    shard->device.stream, lane_index);
+            }
             break;
-        case ReuseSource::HostCheckpoint:
-            // The slot belongs to this lane, so its buffer *is* the lane's compact state image:
-            // the lane is expressed by the slot index (begin + lane * slots_per_lane), never by
-            // a byte offset into the slot.
-            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
-                            static_cast<std::int32_t>(lane),
-                            static_cast<std::byte*>(
-                                shard->host_checkpoints[reuse.slot].buffer->data()),
+        case ReuseSource::HostCheckpoint: {
+            // The slot holds exactly one image and not a slice of a multi-lane one, so the lane is
+            // expressed by the geometry and never by a byte offset into the buffer.
+            const Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
+            copy_lane_state(shard->lane_state_geometry, shard->state_backing.data, lane_index,
+                            static_cast<std::byte*>(checkpoint.buffer->data()),
                             cudaMemcpyHostToDevice, shard->device.stream);
+            if (shard->dflash_round != nullptr) {
+                // The draft half is only trustworthy when its writer froze it at the frontier the
+                // slot reports, so a checkpoint whose halves disagree is refused instead of used.
+                if (checkpoint.dflash_buffer == nullptr ||
+                    checkpoint.dflash_frontier != checkpoint.position) {
+                    throw std::logic_error(
+                        "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
+                }
+                shard->dflash_round->copy_context_from_host(
+                    static_cast<const std::byte*>(checkpoint.dflash_buffer->data()),
+                    shard->device.stream, lane_index);
+            }
             break;
         }
-    }
-}
-
-void TP2GenerationCore::restore_lane_dflash(std::uint32_t lane, const LaneReuse& reuse,
-                                            bool zero_when_none) {
-    Shard& shard = shard_a_;
-    if (shard.dflash_round == nullptr) { return; }
-    shard.device.bind_to_current_thread();
-    switch (retention(lane).reuse_source) {
-    case ReuseSource::None:
-        if (zero_when_none) { shard.dflash_round->zero_context(); }
-        return;
-    case ReuseSource::LiveState:
-        // The live ring already reaches this boundary: a recall restored it, or the conversation
-        // that just decoded left it flushed to its frontier at publish.
-        return;
-    case ReuseSource::DeviceSnapshot: {
-        const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
-        shard.dflash_round->copy_context_from_device(
-            DeviceSpan{static_cast<std::byte*>(shard.dflash_snapshots[reuse.slot].data) +
-                           static_cast<std::size_t>(lane) * lane_bytes,
-                       lane_bytes},
-            shard.device.stream, static_cast<std::int32_t>(lane));
-        return;
-    }
-    case ReuseSource::HostCheckpoint: {
-        const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse.slot];
-        // The draft half is only trustworthy when its writer froze it at the frontier the slot
-        // reports, so a checkpoint whose halves disagree is refused instead of restored.
-        if (checkpoint.dflash_buffer == nullptr ||
-            checkpoint.dflash_frontier != checkpoint.position) {
-            throw std::logic_error(
-                "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
         }
-        // The slot carries this lane's image and not a slice of a multi-lane image: the lane that
-        // owns the slot is the one that wrote it, so the image starts at the buffer.
-        shard.dflash_round->copy_context_from_host(
-            static_cast<const std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
-            static_cast<std::int32_t>(lane));
-        return;
-    }
     }
 }
 
@@ -3831,9 +3821,10 @@ void TP2GenerationCore::execute_plain_batch(
         const bool block_anchor             = anchors.block_anchor;
         const std::uint32_t block_position  = anchors.block_position;
 
-        // Restore this lane's GDN state to the boundary the scan accepted. A reused prefix needs no KV
-        // work at all: the pages already hold it.
-        restore_lane_gdn(lane_id, lane_reuse);
+        // Restore this lane to the boundary the scan accepted. A reused prefix needs no KV work at
+        // all: the pages already hold it. The plain route carries no draft ring (it runs only when
+        // neither speculative backend is enabled), so there is nothing to zero there either.
+        restore_lane(lane_id, lane_reuse.slot, /*zero_draft_when_none=*/false);
         // The device state still stands on the boundary this lane inherited, so freeze it before the
         // first chunk overwrites it.
         capture_lane_anchor_from_device(lane_id, reuse, lane_reuse.shared_prefix);
@@ -5193,10 +5184,9 @@ void TP2GenerationCore::execute_spec_batch(
         const std::uint32_t anchor_position = anchors.anchor_position;
         const bool block_anchor             = anchors.block_anchor;
         const std::uint32_t block_position  = anchors.block_position;
-        restore_lane_gdn(lane_id, lane_reuse);
         // The batched lane rebuilds its whole draft ring from its own prefill sink below, so there is
         // nothing to zero here: the ring is only read once this lane's prefill has primed it.
-        restore_lane_dflash(lane_id, lane_reuse, false);
+        restore_lane(lane_id, lane_reuse.slot, /*zero_draft_when_none=*/false);
         retention(lane_id).dflash_context_frontier = reuse;
         // The device state still stands on the boundary this lane inherited, so freeze it before the
         // first chunk overwrites it.
@@ -7503,78 +7493,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
 
     // Reset per-request state on both shards. The KV pages and execution row 0 are materialized
     // once at startup (build_shard) and reused in place, so a reused prefix needs no KV work at
-    // all; only the GDN state must be restored to (or reset at) the prefill frontier.
-    auto begin_gdn_state = [&](Shard& shard) {
-        shard.device.bind_to_current_thread();
-        switch (lane_state.reuse_source) {
-        case ReuseSource::None:
-            // A lane only owns its own slot, so a reset must not touch its neighbours.
-            zero_lane_state(shard.lane_state_geometry, shard.state_backing.data,
-                            static_cast<std::int32_t>(lane), shard.device.stream);
-            return;
-        case ReuseSource::LiveState:
-            // The device state already sits at this boundary: a restored session put it there, or
-            // the conversation that just decoded left it exactly at its frontier. Nothing to copy.
-            return;
-        case ReuseSource::DeviceSnapshot:
-            copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
-                            static_cast<std::int32_t>(lane), shard.state_snapshots[reuse_slot].data,
-                            cudaMemcpyDeviceToDevice, shard.device.stream);
-            return;
-        case ReuseSource::HostCheckpoint:
-            // The slot belongs to this lane, so its buffer *is* the lane's compact state image:
-            // the lane is expressed by the slot index, never by a byte offset into the slot.
-            copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
-                            static_cast<std::int32_t>(lane),
-                            static_cast<std::byte*>(
-                                shard.host_checkpoints[reuse_slot].buffer->data()),
-                            cudaMemcpyHostToDevice, shard.device.stream);
-            return;
-        }
-    };
-    begin_gdn_state(shard_a_);
-    begin_gdn_state(shard_b_);
-    // The masked draft's context is restored to that same boundary through the same sources. It
-    // cannot be left for the walk to rebuild: the walk starts at `reuse`, and the skipped prefix
-    // produces no target residual, so a boundary that does not restore these bytes is a hole. A
-    // captured conversation is only offered a boundary whose draft image exists (see the session
-    // slab allocation), so every source here has one.
-    auto begin_dflash_state = [&](Shard& shard) {
-        if (shard.dflash_round == nullptr) { return; }
-        shard.device.bind_to_current_thread();
-        switch (lane_state.reuse_source) {
-        case ReuseSource::None:
-            shard.dflash_round->zero_context();
-            return;
-        case ReuseSource::LiveState:
-            // The live ring already reaches this boundary: a recall restored it, or the conversation
-            // that just decoded left it flushed to its frontier at publish.
-            return;
-        case ReuseSource::DeviceSnapshot: {
-            const std::size_t lane_bytes = shard.dflash_round->lane_context_image_bytes();
-            shard.dflash_round->copy_context_from_device(
-                DeviceSpan{static_cast<std::byte*>(shard.dflash_snapshots[reuse_slot].data) +
-                               static_cast<std::size_t>(lane) * lane_bytes,
-                           lane_bytes},
-                shard.device.stream, static_cast<std::int32_t>(lane));
-            return;
-        }
-        case ReuseSource::HostCheckpoint: {
-            const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse_slot];
-            if (checkpoint.dflash_buffer == nullptr ||
-                checkpoint.dflash_frontier != checkpoint.position) {
-                throw std::logic_error(
-                    "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
-            }
-            shard.dflash_round->copy_context_from_host(
-                static_cast<const std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
-                static_cast<std::int32_t>(lane));
-            return;
-        }
-        }
-    };
-    begin_dflash_state(shard_a_);
-    begin_dflash_state(shard_b_);
+    // all; only the GDN state and the draft ring must be restored to (or reset at) the frontier.
+    // The walk may leave the draft ring at another lineage's frontier, so it clears it when there
+    // is no boundary to stand on.
+    restore_lane(lane, static_cast<std::uint32_t>(reuse_slot), /*zero_draft_when_none=*/true);
     lane_state.dflash_context_frontier = reuse;
     if (prefill_trace) {
         CUDA_CHECK(cudaStreamSynchronize(shard_a_.device.stream));

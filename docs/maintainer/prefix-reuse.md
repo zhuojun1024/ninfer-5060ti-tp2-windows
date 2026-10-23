@@ -719,7 +719,16 @@ stride** 的用途：`host_checkpoint_tail_slots_` 还决定 tail 锚点的写�
 
 证据：双卡真实请求同一会话三轮，`cached_tokens = 0 / 8192 / 8192`，第二次恢复的 `slot=8` 是池分配的（不是公式算出来的）。
 
-还没做的：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，没有收成一个入口。
+**`restore()` 已收成一个入口（同日）**：`restore_lane(lane, slot, zero_draft_when_none)` 是"复用变回设备状态"的
+唯一去处——目标 GDN 镜像与 draft 环在同一处、按同一个 `reuse_source` 恢复，两个 shard 一起走。收口前有**四份**
+实现：`restore_lane_gdn`（两个 shard）、`restore_lane_dflash`（只有 shard A）、以及 `execute_walk` 里两个各管半边
+的内联 lambda。三者现在共用一条路径，所以"目标状态恢复了、draft 没恢复"这类分歧在结构上不可能再出现。
+
+一个参数保留了两种调用语义：`zero_draft_when_none`。单机走查（`execute_walk`）传 `true`，因为它可能把 draft 环
+留在另一条谱系的前沿；批处理（`execute_plain_batch` / `execute_spec_batch`）传 `false`，因为批处理 lane 会用自己的
+prefill sink 重建整个 draft 环。plain 路线本来就没有 draft 环（只有两个投机后端都关掉时才走它），所以那一路是空操作。
+
+证据：同一会话三轮 `cached = 0 / 8192 / 8192` 不变；`tp2_forward` 的"批处理 prefill 与逐 token walk 一致"通过。
 
 ### 15.5 跨 lane 复用的真正条件：镜像属于"对话"，不属于"lane"
 

@@ -993,13 +993,13 @@ private:
     [[nodiscard]] static std::size_t media_prefix_cap(std::span<const MediaSpan> cached,
                                                       std::span<const MediaSpan> incoming,
                                                       std::size_t shared_prefix);
-    // Brings this lane's GDN state to the scanned boundary on both shards.
-    void restore_lane_gdn(std::uint32_t lane, const LaneReuse& reuse);
-    // Brings this lane's masked-draft ring to the same boundary, on the shard that owns the draft.
-    // 'zero_when_none' clears the whole ring when there is no boundary: the single-lane walk needs
-    // that because it may leave the ring at another lineage's frontier, while a batched lane rebuilds
-    // the whole ring from its own prefill sink.
-    void restore_lane_dflash(std::uint32_t lane, const LaneReuse& reuse, bool zero_when_none);
+    // Brings this lane to the boundary the scan accepted, on both shards: the GDN image and the
+    // masked draft's context come from whichever store `retention(lane).reuse_source` names. Every
+    // route that reuses a prefix goes through here, so the two halves cannot disagree about the
+    // boundary. `zero_draft_when_none` clears the whole draft ring when there is no boundary: the
+    // single-lane walk needs that because it may leave the ring at another lineage's frontier,
+    // while a batched lane rebuilds the whole ring from its own prefill sink.
+    void restore_lane(std::uint32_t lane, std::uint32_t slot, bool zero_draft_when_none);
     // Publishes a completed lane prefill: the catalog entry, the checkpoint sweep that makes this
     // prefill's ring slots usable, and this lane's slice of snapshot plane 0 (GDN state and, on a
     // masked-draft route, the draft ring).
