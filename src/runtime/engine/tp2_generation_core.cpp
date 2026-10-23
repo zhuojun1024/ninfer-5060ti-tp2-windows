@@ -2647,13 +2647,15 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         // priority that scan used, so an equal position still resolves to the same source.
         ConversationLog& conversation = reuse_ledger_->conversation(key);
         conversation.anchors.clear();
-        // Only the part this prompt agrees with is comparable, and the media identity already capped
-        // it: registering the rest would let the decision answer with a position the prompt left.
+        // Only the part this prompt agrees with is comparable, and the media identity already
+        // capped it: registering the rest would let the decision answer with a position the prompt
+        // left. A store's own contents are the bound on what gets registered below - an anchor is
+        // offered only from an image that really holds its position - so the table never needs a
+        // trim step afterwards, and a short device state can never take the host-backed anchors
+        // with it.
         conversation.tokens.assign(lane_state.cached_prompt_tokens.begin(),
                                    lane_state.cached_prompt_tokens.begin() +
                                        static_cast<std::ptrdiff_t>(shared_prefix));
-        conversation.device_extent = static_cast<std::uint32_t>(shared_prefix);
-        conversation.host_extent   = static_cast<std::uint32_t>(shared_prefix);
 
         struct Reachable {
             std::uint32_t position;

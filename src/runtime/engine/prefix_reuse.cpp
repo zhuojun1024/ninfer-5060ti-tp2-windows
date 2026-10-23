@@ -241,36 +241,4 @@ DecideResult ReuseLedger::decide(const ConversationLog& conversation,
     return result;
 }
 
-std::uint32_t ReuseLedger::extent_for(const ConversationLog& conversation,
-                                      AnchorKvSource source) const {
-    return source == AnchorKvSource::HostSlab ? conversation.host_extent
-                                              : conversation.device_extent;
-}
-
-ReuseLedger::CommitResult ReuseLedger::commit(ConversationLog& conversation,
-                                              std::span<const TokenId> history,
-                                              std::uint32_t device_extent,
-                                              std::uint32_t host_extent) {
-    conversation.tokens.assign(history.begin(), history.end());
-    conversation.device_extent = device_extent;
-    conversation.host_extent   = host_extent;
-
-    // The one trim rule, applied per store. A divergence shortens the device extent and must not take
-    // the host-backed anchors with it: those are the only images deep history can still use.
-    std::vector<std::uint32_t> stale;
-    for (const Anchor& anchor : conversation.anchors.all()) {
-        if (anchor.position > extent_for(conversation, anchor.kv_source)) {
-            stale.push_back(anchor.position);
-        }
-    }
-    CommitResult result;
-    for (const std::uint32_t position : stale) {
-        const std::optional<Anchor> erased = conversation.anchors.erase_at(position);
-        if (!erased) { continue; }
-        if (!erased->borrowed) { release_slot(erased->slot); }
-        ++result.trimmed;
-    }
-    return result;
-}
-
 } // namespace ninfer::runtime

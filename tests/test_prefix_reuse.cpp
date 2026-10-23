@@ -87,8 +87,6 @@ int main() {
         ConversationLog& conversation = ledger.conversation(1);
         conversation.tokens           = make_tokens(20000);
         conversation.tokens.resize(20000);
-        conversation.device_extent = 20000;
-        conversation.host_extent   = 20000;
         failures += check(ledger.record(conversation, grid(8192)).recorded, "grid anchor was refused");
         failures += check(ledger.record(conversation, grid(16384)).recorded, "grid anchor was refused");
 
@@ -135,7 +133,6 @@ int main() {
     {
         ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 3});
         ConversationLog& conversation = ledger.conversation(1);
-        conversation.device_extent    = 100000;
         for (const std::uint32_t position : {8192u, 16384u, 24576u, 32768u}) {
             failures += check(ledger.record(conversation, grid(position)).recorded,
                               "a grid anchor was refused while the pool had room to evict");
@@ -161,8 +158,9 @@ int main() {
                           "the Pinned anchor was evicted");
     }
 
-    // The two stores trim independently: a divergence shortens the device pages, and the host-backed
-    // anchor beyond that point is exactly the one deep history still needs.
+    // The two stores are independent: a device anchor that a shorter device state cannot serve must
+    // not take the host-backed anchor beyond it with it - that one is what deep history still
+    // needs.
     {
         ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 4});
         ConversationLog& conversation = ledger.conversation(1);
@@ -178,19 +176,20 @@ int main() {
         host_request.kv_source                   = AnchorKvSource::HostSlab;
         ledger.record(conversation, host_request);
 
-        const std::vector<TokenId> history = make_tokens(4096);
-        const ReuseLedger::CommitResult commit = ledger.commit(conversation, history, 1000, 2000);
-        failures += check(commit.trimmed == 1, "the trim did not drop exactly the uncovered anchor");
-        failures += check(conversation.anchors.floor(2000) != nullptr &&
-                              conversation.anchors.floor(2000)->position == 1800,
-                          "the host-slab anchor was trimmed with the device pages");
-        failures += check(conversation.tokens.size() == history.size(),
-                          "commit did not publish the canonical stream");
+        // The prompt agrees with the shared history up to 1800 and nothing further: the scan
+        // compares against that much of the stream, so only anchors inside it may be offered.
+        const std::vector<TokenId> history = make_tokens(1800);
+        conversation.tokens.assign(history.begin(), history.end());
+        const DecideResult deep = ledger.decide(conversation, history);
+        failures += check(deep.reuse == 1800 && deep.reason == ReuseReason::Used,
+                          "the deepest anchor was not offered to a prompt that covers it");
 
-        // A prompt identical to the published history reuses the surviving anchor.
-        const DecideResult decision = ledger.decide(conversation, history);
-        failures += check(decision.reuse == 1800 && decision.reason == ReuseReason::Used,
-                          "the surviving anchor was not offered to an identical prompt");
+        // A prompt that stops agreeing at 1500 can still use the device anchor there and nothing
+        // deeper, whichever store the deeper anchor came from.
+        const std::vector<TokenId> shorter = make_tokens(1500);
+        conversation.tokens.assign(shorter.begin(), shorter.end());
+        const DecideResult shallow = ledger.decide(conversation, shorter);
+        failures += check(shallow.reuse == 1500, "the decision passed the agreed prefix");
     }
 
     // Forgetting a conversation returns its images: a catalog reload must not leak the pool.

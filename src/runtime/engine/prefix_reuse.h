@@ -116,10 +116,11 @@ struct ConversationLog {
     std::vector<TokenId> tokens;
     // Identity of the media items in order. Token equality alone cannot tell two images apart.
     std::vector<std::uint64_t> media;
+    // Everything an anchor may name. Registration is what bounds this table: an anchor is offered
+    // only when its own store really holds that position, so the table can never name a position a
+    // store does not cover, and there is no post-hoc trim that could delete one store's anchors
+    // because another store is shorter.
     AnchorTable anchors;
-    // How far each store actually covers. An anchor may not claim a position beyond its own store.
-    std::uint32_t device_extent = 0;
-    std::uint32_t host_extent   = 0;
 };
 
 // Owns the conversations and the host-image budget. One instance per engine core.
@@ -176,15 +177,6 @@ public:
     // kNoSlot means the pool holds nothing evictable; the caller then skips the capture.
     [[nodiscard]] std::int32_t reserve_image_slot();
 
-    struct CommitResult {
-        std::uint32_t trimmed = 0;  // anchors dropped because their store no longer covers them
-        std::uint32_t evicted = 0;  // anchors dropped to honour the budget
-    };
-    // Publication: the canonical stream, the two store extents, then the one trim rule. An anchor is
-    // clipped against the store it depends on, never against the other one.
-    CommitResult commit(ConversationLog& conversation, std::span<const TokenId> history,
-                        std::uint32_t device_extent, std::uint32_t host_extent);
-
 private:
     // One conversation's claim on an image it does not own.
     struct Borrower {
@@ -197,8 +189,6 @@ private:
     void release_borrowers(std::int32_t slot);
     // Evicts the farthest Lru anchor of any conversation; false when none is evictable.
     bool evict_one();
-    [[nodiscard]] std::uint32_t extent_for(const ConversationLog& conversation,
-                                           AnchorKvSource source) const;
 
     ReuseBudget budget_;
     std::vector<bool> used_slots_;

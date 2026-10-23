@@ -312,39 +312,41 @@ restore(log, anchor, lane) -> Result<P, RestoreFailure>
 ## 9. 提交规则（唯一）
 
 ```
-commit(log, history, device_extent, host_extent, new_anchors):
-  log.tokens        = history          # 规范流
-  log.device_extent = device_extent
-  log.host_extent   = host_extent
-  log.anchors      |= new_anchors
-  # 唯一的一条裁剪规则，按锚点依赖的那份存储分别判定（见 9.1）
-  log.anchors.drop(a.position > kv_extent(log, a.kv_source))
-  log.anchors.drop_over_budget()       # 见 7 的取舍顺序
+register(log, history_prefix, anchors):
+  log.tokens = history_prefix   # 本请求与自身谱系真正一致的那一段
+  log.anchors.clear()           # 每个请求从各存储的真实内容重建
+  log.anchors |= anchors        # 每个锚点都来自一张真的持有该位置的镜像
 ```
 
-删除现行 `session_publish` 的三条分支与其中"把 `prompt_end`/`shared_end` 清零"的逻辑：那些字段不再存在，
-边界由锚点表本身表达。
+三条性质：
 
-### 9.1 两份 KV，两个 extent
+- **没有事后裁剪这一步**。锚点只在"某张镜像真的持有这个位置"时才被登记（§15.4、§15.6），表里不可能出现超出存储
+  覆盖的位置，所以没有"提交时按 extent 裁一遍"的动作，也就不会发生"设备侧变短、把 host 侧仍然有效的锚点一起删掉"。
+- **每次请求重建**。可用镜像随 lane、ring 内容、catalog 每个请求都在变，重建比增量维护更难出错；重建也顺带把
+  "这个会话上次记住但没有镜像支撑的边界"清掉。
+- **一条真正的边界**：`offer()` 只登记 `position <= shared_prefix` 的位置——超过提示词与自身谱系一致点的锚点，
+  对**这个**提示词没有任何意义（见 §9.1）。这条比"按 extent 裁剪"更早生效，也更难写错。
 
-`[0, P)` 的 KV 可以落在两处，两者的覆盖范围不同步，所以不能共用一个数字：
+### 9.1 两份存储，各自覆盖
 
-| 存储 | extent | 什么时候变短 |
+`[0, P)` 的状态与 KV 可以落在两处，两者的覆盖范围不同步：
+
+| 存储 | 提供哪些位置 | 什么时候变短 |
 |---|---|---|
-| 设备分页池 | `device_extent` | 分歧裁剪（`drop(position > shared)`）、会话退休 |
-| host KV 板（slab） | `host_extent` | slab 被 catalog 淘汰或容量回收 |
+| 设备状态与快照 | 本 lane 谱系与提示词共同前缀之内的边界 | 分歧、会话退休 |
+| host 检查点环（ledger 池） | 环里当前有效、且属于本 lane 的那些镜像位置 | 池淘汰、被后写覆盖 |
 
-`kv_extent(log, source)` 按 `Anchor.kv_source` 取对应的那一个。裁剪必须分开做，理由是一个具体的事故：
-分歧裁剪只缩短**设备侧**，host slab 仍然覆盖着旧位置。若用单一 extent 裁剪，一次分歧就会把 host 侧仍然完全有效、
-而且是深历史复用唯一救兵的锚点全部删掉——这正是现在 `session_publish` 里 `prompt_end = 0` 清零的同构错误，
-换了个位置重现。
+两条都在**登记阶段**成立，所以不需要两个 extent 数字：
 
-另外两条：
+- 位置来自存储，不是先声明后补：没有"先声明 `HostSlab`、内容后补"的窗口；
+- 分歧只影响设备侧能提供的位置；host 侧由环里还在的镜像决定，不受设备谱系变短的影响。§9.1 原本要防的事故
+  （一次分歧把深历史唯一能用的 host 锚点全删掉）现在就防在这里。
 
-- host slab 落后于设备时（还没转存），新拍的锚点一律 `kv_source = Device`。不允许"先声明 `HostSlab`、内容后补"：
-  那样 `position <= kv_extent` 会在一段时间内是假话。
-- `host_extent` 由 slab 容量决定，与锚点预算无关。这两个数字不要合并：一个管 KV 存得下多少 token，
-  一个管状态镜像存得下几张。
+**2026-10-23 的调整**：`ReuseLedger::commit()` 与 `ConversationLog::device_extent`/`host_extent` 已删除。核对发现
+`commit()` 从未被生产路径调用（只有 `test_prefix_reuse` 用），因为扫描每个请求都会重建锚点表并只登记真实位置，
+它那条"按 store 裁剪"的规则在实现上永远不会触发。原有那句"唯一提交规则"描述的是更早的代码形状；规则本身
+（两份存储各自覆盖、分歧不得连累 host 锚点）保留，落点从提交阶段搬到登记阶段。单测里对应的保证改成行为断言：
+更深的 host 锚点在提示词覆盖它时仍然被选中，而提示词只覆盖到 1500 时决策不会越过 1500。
 
 ---
 
@@ -591,8 +593,14 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）。**2026-10-23 已完成**：四个元数据字段都是标量，
   写路径不再算地址（所有宿主镜像都由 `reserve_image_slot()` 给槽），`HostRing` 角色枚举、固定角色槽的
   `mark_slot_fixed()` 与 `host_checkpoint_next/tail_next` 计数一并删除。布局常量只剩定容与定 stride 的用途；
-- 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
-- `session_publish` 的三条分支与字段清零；
+- 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）。
+  **2026-10-23 核对后不适用**：`host_kv_end` 是 host slab 的覆盖长度，而 `host_prompt_end`/`host_shared_end`/
+  `host_frontier_end` 是**三张具名镜像各自的边界**（`session_recall` 用它们选该加载哪一张），不是两个 store 的
+  extent；那几处清零发生在历史被改写、镜像不再描述新历史的时候，是正确的失效而不是 §9.1 的事故。要把它们换成
+  "锚点持有 slab 引用"需要 slab 引用计数与跨会话共享锚点（第 4 批），不是本轮能删的东西；
+- `session_publish` 的三条分支与字段清零。**2026-10-23 核对后不适用**：三条分支是 catalog 的**发布策略**
+  （驻留条目原地更新 / 延续的条目原地重写 / 新建条目 + 容量淘汰），编码的是"这条请求延续哪个条目"，
+  属于会话注册职责，不是锚点记账；删掉它们等于删掉 catalog 的发布语义；
 - `reuse_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
   收窄作用域**：该枚举在单卡路线里是程序内部的**恢复路径**（`is_rewrite_checkpoint_restore()` 与
   `PrivateEndpoint`/`SharedStablePrefix`/`PrivateLongAnchor` 在 `program/prefill.cpp`、`context.cpp`、`pressure.cpp` 里做路由判定），
@@ -764,8 +772,34 @@ prefill sink 重建整个 draft 环。plain 路线本来就没有 draft 环（�
 | 槽被释放（拥有者被淘汰） | `release_borrowers()` 把借用的锚点一起删掉——镜像即将被覆盖 |
 | 淘汰 | 只考虑非 `borrowed` 的锚点：删一个借用者腾不出任何空间 |
 
-`evict_one()`、`commit()` 的裁剪、`forget()`、以及替换同位置的锚点，都只释放**非 `borrowed`** 的槽——
-否则一个借用者会把别人还在用的缓冲还给池子。
+`evict_one()`、`forget()`、以及替换同位置的锚点，都只释放**非 `borrowed`** 的槽——否则一个借用者会把别人还在用的
+缓冲还给池子。
+
+### 15.7 `SessionEntry` 的三个职责（核对结果）
+
+`SessionEntry` 一直被当成"锚点记账"的替身，实际清点下来它承担三件互不相干的事，**没有一件该由 ledger 接管**：
+
+| 字段 | 职责 | 归谁 | 能否删 |
+|---|---|---|---|
+| `tokens`, `media` | **身份**：这段历史是哪一段（前缀比对、采纳、谱系恢复都要它） | catalog | 不能。ledger 的 `ConversationLog.tokens` 只存"本请求与自身谱系一致的那一段"，是按请求重建的比较用流，不是持久身份 |
+| `frontier`, `prompt_end` | **身份**：设备停在哪、上一轮 prompt 有多长（`prompt_end` 是"这是同一会话的下一轮"的判据，也是 `adopt_generated_turn` 的 `turn_begin`） | catalog | 不能 |
+| `device_lane` | **注册**：这条会话此刻驻留在哪条 lane（一个条目一份驻留，配 `mark_device_lane` 维护） | catalog | 不能 |
+| `session`, `retention_weight`, `lru_clock` | **注册**：客户端命名的会话、淘汰权重、LRU 次序 | catalog | 不能（`session` 的 `optional` 语义见下） |
+| `host_kv`, `host_state`, `host_prompt_state`, `host_shared_state`, `host_dflash*`, `host_mtp_kv` | **持久化**：被逐出设备的会话的 KV 板与三组状态镜像（frontier / prompt-end / shared，各自配一份 draft） | catalog | 不能（跨会话 recall 的唯一载体） |
+| `host_kv_end` | **持久化的覆盖**：host slab 覆盖到哪（所有与 slab 配对的操作都必须落在它之内） | catalog | 不能 |
+| `host_frontier_end`, `host_prompt_end`, `host_shared_end` | **三张具名镜像各自的边界**：`session_recall` 按"要恢复到哪个位置"选该加载哪一张 | catalog | 不能 |
+
+结论一：**catalog 没有"锚点记账"这一职责**。锚点表在 ledger 里，由图上的镜像（ring 槽、设备快照、活前沿）登记；
+catalog 记的是**持久化副本**——一组具名镜像加它们的边界。两者地址空间不同：ring 槽会淘汰、会被后写覆盖，
+catalog 的 slab 只在条目被逐出时消失。
+
+结论二：因此 §13 剩下的两条（删单一 `kv_extent`、删 `session_publish` 的三条分支）**不成立**：前者的三个
+`*_end` 不是 extent 而是镜像位置，后者是发布策略而不是锚点记账。真正能做的版本是"让锚点持有一个 slab 引用、
+活得比登记它的会话久"（§10、§4.4 的共享锚点），那需要 slab 引用计数——属于第 4 批。
+
+结论三：`session` 那个 `optional` 是注册语义的支点：一个具名会话在 catalog 里占且只占一个条目，新的一轮把名字从旧
+条目移到新条目（`bind_entry_session`），这也是"一个会话不会用变体填满所有槽位"的实现。删任何与它配套的分支都会
+先破坏这条。
 
 ---
 
