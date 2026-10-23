@@ -2645,21 +2645,23 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         // which is 350 tokens earlier on every turn.
         lane_state.reuse_boundary_target   = static_cast<std::uint32_t>(shared_prefix);
         lane_state.reuse_boundary_captured = false;
+        const std::uint64_t key            = conversation_key(lane);
         // A checkpoint is only this prompt's while the lineage agrees on the tokens before it, so a
-        // checkpoint past the shared prefix can never become usable again.
+        // checkpoint past the shared prefix can never become usable again. Only this conversation's
+        // images are retracted: another conversation's image at the same position belongs to its
+        // own token history and is none of this prompt's business.
         for (Shard* shard : {&shard_a_, &shard_b_}) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.position[lane] > shared_prefix) { checkpoint.valid[lane] = false; }
+                if (checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                    checkpoint.position > shared_prefix) {
+                    checkpoint.valid = false;
+                }
             }
         }
         // Every image this lane can reach is registered in the ledger, which then makes the one
         // decision. Registration replaces the old "take the deepest" scan; the order below is the
         // priority that scan used, so an equal position still resolves to the same source.
-        const std::uint64_t conversation_key =
-            lane_state.active_session != kNoSession
-                ? static_cast<std::uint64_t>(lane_state.active_session)
-                : (0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane));
-        ConversationLog& conversation = reuse_ledger_->conversation(conversation_key);
+        ConversationLog& conversation = reuse_ledger_->conversation(key);
         conversation.anchors.clear();
         // Only the part this prompt agrees with is comparable, and the media identity already capped
         // it: registering the rest would let the decision answer with a position the prompt left.
@@ -2706,13 +2708,12 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
         }
         for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
             const auto& checkpoint = shard_a_.host_checkpoints[slot];
-            // Only this lane's own images are offered: an image is the state after *its* token
-            // history, so it only means something to the conversation that produced it. The pool
-            // may hand the slot to another lane, which is why a write clears every lane's
-            // description of it above.
-            if (checkpoint.valid[lane]) {
-                offer(checkpoint.position[lane], slot, ReuseSource::HostCheckpoint,
-                      AnchorStorage::Host);
+            // This lane's own images only: an image is the state after *its* token history, and the
+            // scan proves agreement only with this lane's lineage, not with another lane's. The
+            // pool may hand the slot to another lane later, which is why the writer is part of the
+            // test.
+            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane)) {
+                offer(checkpoint.position, slot, ReuseSource::HostCheckpoint, AnchorStorage::Host);
             }
         }
         const DecideResult decision = reuse_ledger_->decide(conversation, token_ids);
@@ -2731,7 +2732,13 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
     if (trace) {
         std::size_t valid_checkpoints = 0;
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
-            valid_checkpoints += checkpoint.valid[lane] ? 1U : 0U;
+            valid_checkpoints += checkpoint.valid ? 1U : 0U;
+        }
+        std::size_t lane_checkpoints = 0;
+        for (const auto& checkpoint : shard_a_.host_checkpoints) {
+            lane_checkpoints +=
+                (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane)) ? 1U
+                                                                                           : 0U;
         }
         const char* source = lane_state.reuse_source == ReuseSource::HostCheckpoint ? "host"
                              : lane_state.reuse_source == ReuseSource::LiveState    ? "live"
@@ -2739,12 +2746,12 @@ TP2GenerationCore::LaneReuse TP2GenerationCore::scan_lane_reuse(std::uint32_t la
                                                                              : "none";
         std::fprintf(stderr,
                      "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
-                     "adopted=%d prefill_end=%u host=%zu/%zu stride=%u -> reuse=%u slot=%u "
-                     "src=%s reason=%s\n",
+                     "adopted=%d prefill_end=%u host=%zu/%zu lane_slots=%zu stride=%u "
+                     "-> reuse=%u slot=%u src=%s reason=%s\n",
                      lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
-                     valid_checkpoints, shard_a_.host_checkpoints.size(), host_checkpoint_stride_,
-                     result.tokens, result.slot, source,
+                     valid_checkpoints, shard_a_.host_checkpoints.size(), lane_checkpoints,
+                     host_checkpoint_stride_, result.tokens, result.slot, source,
                      reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
     }
     // Tag the checkpoints this prefill leaves behind and start the ring at the first stride multiple
@@ -2768,11 +2775,12 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
     RetentionState& lane_state = retention(lane);
     LaneAnchors anchors;
     // A checkpoint that already sits on a boundary stays untouched, which is what keeps a reused
+    // A checkpoint that already sits on a boundary stays untouched, which is what keeps a reused
     // stable prefix free of work: the state the anchor would freeze is one the ring already holds.
-    const auto has_valid_host_checkpoint_at = [](const Shard& shard, std::uint32_t position,
-                                                 std::uint32_t checkpoint_lane) {
+    const auto has_valid_host_checkpoint_at = [lane](const Shard& shard, std::uint32_t position) {
         for (const auto& checkpoint : shard.host_checkpoints) {
-            if (checkpoint.valid[checkpoint_lane] && checkpoint.position[checkpoint_lane] == position) {
+            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                checkpoint.position == position) {
                 return true;
             }
         }
@@ -2832,8 +2840,8 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
     anchors.anchor_session    = lane_state.anchor_session;
     anchors.anchor_divergence = host_checkpoint_stride_ != 0 && anchors.anchor_position > reuse &&
                                 anchors.anchor_position < prompt_tokens &&
-                                !has_valid_host_checkpoint_at(shard_a_, anchors.anchor_position, lane) &&
-                                !has_valid_host_checkpoint_at(shard_b_, anchors.anchor_position, lane);
+                                !has_valid_host_checkpoint_at(shard_a_, anchors.anchor_position) &&
+                                !has_valid_host_checkpoint_at(shard_b_, anchors.anchor_position);
     // Block anchor. The prompt names where its own leading instruction block ends, and the prefill
     // that walks it is the only one that can freeze the state there: the block is what every
     // conversation of the same agent re-renders, but the first conversation that shares it is the one
@@ -2854,8 +2862,8 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
     }
     anchors.block_anchor = host_checkpoint_stride_ != 0 && anchors.block_position > reuse &&
                            anchors.block_position < prompt_tokens &&
-                           !has_valid_host_checkpoint_at(shard_a_, anchors.block_position, lane) &&
-                           !has_valid_host_checkpoint_at(shard_b_, anchors.block_position, lane);
+                           !has_valid_host_checkpoint_at(shard_a_, anchors.block_position) &&
+                           !has_valid_host_checkpoint_at(shard_b_, anchors.block_position);
     return anchors;
 }
 
@@ -2891,8 +2899,9 @@ void TP2GenerationCore::capture_lane_anchor_frozen(std::uint32_t lane, std::uint
             // The ring has not been published yet, so the search is by the id this prefill tagged its
             // own writes with rather than by `valid`.
             if (checkpoint.buffer != nullptr &&
-                checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id &&
-                checkpoint.position[lane] == anchor_position) {
+                checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                checkpoint.prefill_id == lane_state.host_checkpoint_live_id &&
+                checkpoint.position == anchor_position) {
                 frozen[shard_index] = checkpoint.buffer->data();
                 // The draft half of the anchor lives in the same checkpoint slot, so a checkpoint
                 // without it cannot carry the boundary.
@@ -2972,11 +2981,10 @@ void TP2GenerationCore::restore_lane_dflash(std::uint32_t lane, const LaneReuse&
     }
     case ReuseSource::HostCheckpoint: {
         const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse.slot];
-        // The metadata belongs to the lane that wrote the image, which need not be this one: the
-        // draft half is only trustworthy when that lane froze it at the frontier it reports.
-        const std::int32_t writer = checkpoint.writer;
-        if (checkpoint.dflash_buffer == nullptr || writer < 0 ||
-            checkpoint.dflash_frontier[writer] != checkpoint.position[writer]) {
+        // The draft half is only trustworthy when its writer froze it at the frontier the slot
+        // reports, so a checkpoint whose halves disagree is refused instead of restored.
+        if (checkpoint.dflash_buffer == nullptr ||
+            checkpoint.dflash_frontier != checkpoint.position) {
             throw std::logic_error(
                 "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
         }
@@ -5756,11 +5764,25 @@ void TP2GenerationCore::invalidate_host_checkpoints() {
     for (std::uint32_t lane = 0; lane < lanes_; ++lane) { invalidate_host_checkpoints(lane); }
 }
 
+std::uint64_t TP2GenerationCore::conversation_key(std::uint32_t lane) const {
+    const RetentionState& state = retention(lane);
+    // A request that named a session shares one conversation with every lane that serves it, so a
+    // session that comes back on another lane still finds its own images. One that named nothing
+    // gets a key of its own, which keeps its images out of every other lane's scan.
+    return state.active_session != kNoSession
+               ? static_cast<std::uint64_t>(state.active_session)
+               : (0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane));
+}
+
 void TP2GenerationCore::invalidate_host_checkpoints(std::uint32_t lane) {
-    // The ring is sliced by lane, so one lane's stale lineage says nothing about another's.
+    // The lane's own lineage is what broke, so the images it wrote are the ones that go. The owner
+    // key cannot answer this: it may already describe the conversation that replaced the broken
+    // one.
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     for (Shard* shard : shards) {
-        for (auto& checkpoint : shard->host_checkpoints) { checkpoint.valid[lane] = false; }
+        for (auto& checkpoint : shard->host_checkpoints) {
+            if (checkpoint.writer == static_cast<std::int32_t>(lane)) { checkpoint.valid = false; }
+        }
     }
 }
 
@@ -6128,8 +6150,9 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
         // with this lane's live prefill id, which is what tells this conversation's own image from a
         // later rewrite of the same slot.
         for (const Shard::HostCheckpoint& checkpoint : shard.host_checkpoints) {
-            if (checkpoint.valid[lane] && checkpoint.position[lane] == entry.prompt_end &&
-                checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
+            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                checkpoint.position == entry.prompt_end &&
+                checkpoint.prefill_id == lane_state.host_checkpoint_live_id) {
                 prompt_end_checkpoints[index] = &checkpoint;
                 break;
             }
@@ -6245,9 +6268,9 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (std::size_t index = 0; index < 2; ++index) {
             for (const Shard::HostCheckpoint& checkpoint : shards[index]->host_checkpoints) {
-                if (!checkpoint.valid[lane] ||
-                    checkpoint.position[lane] != lane_state.block_anchor_position ||
-                    checkpoint.prefill_id[lane] != lane_state.block_anchor_prefill_id ||
+                if (!checkpoint.valid || checkpoint.writer != static_cast<std::int32_t>(lane) ||
+                    checkpoint.position != lane_state.block_anchor_position ||
+                    checkpoint.prefill_id != lane_state.block_anchor_prefill_id ||
                     checkpoint.buffer == nullptr) {
                     continue;
                 }
@@ -6478,9 +6501,9 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
             }
         }
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
-            if (checkpoint.valid[lane] && checkpoint.position[lane] <= active_shared &&
-                checkpoint.position[lane] > resident_depth) {
-                resident_depth = checkpoint.position[lane];
+            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                checkpoint.position <= active_shared && checkpoint.position > resident_depth) {
+                resident_depth = checkpoint.position;
             }
         }
     }
@@ -7186,14 +7209,16 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
     // enqueued: a prefill that throws between here and the publish sweep must not leave a torn
     // buffer behind a flag that still says the last completed prefill wrote it. Only the sweep
     // below, which runs after the prefill finished, makes a checkpoint usable again. The slot holds
-    // exactly one image, and this lane is about to replace whatever sat there: every lane's
-    // description of it goes with the overwrite, not just the writing lane's. Without that a later
-    // request could be offered a position whose image is already this one.
-    for (bool& valid : checkpoint.valid) { valid = false; }
-    checkpoint.writer           = static_cast<std::int32_t>(lane);
-    checkpoint.valid[lane]      = false;
-    checkpoint.position[lane]   = frontier;
-    checkpoint.prefill_id[lane] = retention(lane).host_checkpoint_live_id;
+    // exactly one image, and this lane is about to replace whatever sat there: the description of
+    // it goes with the overwrite, and so does the conversation it belonged to.
+    checkpoint.valid      = false;
+    checkpoint.writer     = static_cast<std::int32_t>(lane);
+    checkpoint.position   = frontier;
+    checkpoint.prefill_id = retention(lane).host_checkpoint_live_id;
+    if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
+        std::fprintf(stderr, "[tp2-cp] write lane=%u slot=%zu pos=%u id=%llu\n", lane, slot,
+                     frontier, static_cast<unsigned long long>(checkpoint.prefill_id));
+    }
     // The slot belongs to this lane, so its buffer *is* the lane's compact state image: the lane
     // is expressed by the slot index this ring's layout gives it, never by a byte offset into the
     // slot. The slot is sized for exactly one such image, so a mismatch here would mean the ring
@@ -7216,7 +7241,7 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
         if (checkpoint.dflash_buffer->size() < shard.dflash_round->lane_context_image_bytes()) {
             throw std::logic_error("TP-2 host checkpoint slot is smaller than one lane's draft ring");
         }
-        checkpoint.dflash_frontier[lane] = retention(lane).dflash_context_frontier;
+        checkpoint.dflash_frontier = retention(lane).dflash_context_frontier;
         shard.dflash_round->copy_context_to_host(
             static_cast<std::byte*>(checkpoint.dflash_buffer->data()), shard.device.stream,
             static_cast<std::int32_t>(lane));
@@ -7227,10 +7252,20 @@ void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::uint32_t fro
 
 void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane) {
     const std::uint64_t live_id = retention(lane).host_checkpoint_live_id;
+    std::size_t published       = 0;
     for (Shard* shard : {&shard_a_, &shard_b_}) {
         for (auto& checkpoint : shard->host_checkpoints) {
-            if (checkpoint.prefill_id[lane] == live_id) { checkpoint.valid[lane] = true; }
+            // The id is unique to this prefill, so it already identifies the writes; publication is
+            // also the first moment a restore may read one.
+            if (checkpoint.prefill_id == live_id) {
+                checkpoint.valid = true;
+                ++published;
+            }
         }
+    }
+    if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
+        std::fprintf(stderr, "[tp2-cp] publish lane=%u id=%llu published=%zu\n", lane,
+                     static_cast<unsigned long long>(live_id), published);
     }
 }
 
@@ -7427,7 +7462,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (Shard* shard : shards) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.position[lane] > shared_prefix) { checkpoint.valid[lane] = false; }
+                if (checkpoint.writer == static_cast<std::int32_t>(lane) &&
+                    checkpoint.position > shared_prefix) {
+                    checkpoint.valid = false;
+                }
             }
         }
         // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
@@ -7469,10 +7507,10 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
             const auto& checkpoint = shard_a_.host_checkpoints[index];
-            // This lane's own images only; see the serial path for why an image belongs to the
-            // conversation whose token history produced it.
-            if (checkpoint.valid[lane]) {
-                take(checkpoint.position[lane], index, ReuseSource::HostCheckpoint);
+            // This lane's own images only: an image is the state after *its* token history, and the
+            // scan proves agreement only with this lane's lineage, not with another lane's.
+            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane)) {
+                take(checkpoint.position, index, ReuseSource::HostCheckpoint);
             }
         }
     }
@@ -7480,7 +7518,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
-            valid_checkpoints += checkpoint.valid[lane] ? 1U : 0U;
+            valid_checkpoints += checkpoint.valid ? 1U : 0U;
         }
         // The deepest rewind slot this lane still carries. A configuration that keeps no rewind slot
         // reports zero instead of reading past the boundary array.
@@ -7586,9 +7624,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         }
         case ReuseSource::HostCheckpoint: {
             const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[reuse_slot];
-            const std::int32_t writer               = checkpoint.writer;
-            if (checkpoint.dflash_buffer == nullptr || writer < 0 ||
-                checkpoint.dflash_frontier[writer] != checkpoint.position[writer]) {
+            if (checkpoint.dflash_buffer == nullptr ||
+                checkpoint.dflash_frontier != checkpoint.position) {
                 throw std::logic_error(
                     "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
             }
@@ -8772,8 +8809,8 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         Shard* const shards[2] = {&shard_a_, &shard_b_};
         for (Shard* shard : shards) {
             for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.prefill_id[lane] == lane_state.host_checkpoint_live_id) {
-                    checkpoint.valid[lane] = true;
+                if (checkpoint.prefill_id == lane_state.host_checkpoint_live_id) {
+                    checkpoint.valid = true;
                 }
             }
         }

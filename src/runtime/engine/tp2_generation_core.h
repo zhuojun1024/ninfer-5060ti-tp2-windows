@@ -208,21 +208,22 @@ private:
             // The masked draft's context at the same frontier, on the shard that owns the draft
             // (shard 0). The draft cannot be recomputed from the target state, so a checkpoint that
             // carries only the GDN image would leave the draft context describing the wrong tokens.
-            // Like buffer, it holds one compact ring image - for the lane that owns this slot.
+            // Like buffer, it holds one compact ring image.
             std::unique_ptr<HostBuffer> dflash_buffer;
-            std::array<std::uint32_t, kTp2GenerationMaxConcurrency> dflash_frontier{};
-            std::array<std::uint32_t, kTp2GenerationMaxConcurrency> position{};
-            // The prefill that wrote this lane's checkpoint. A prefill that never completed
-            // (cancelled) leaves its slots invalid instead of usable state.
-            std::array<std::uint64_t, kTp2GenerationMaxConcurrency> prefill_id{};
-            // Set when that prefill completes and cleared as soon as a later request's shared prefix
-            // stops covering this frontier: the state is only the state of *this* prompt's prefix
-            // while the whole lineage agrees on the tokens before it.
-            std::array<bool, kTp2GenerationMaxConcurrency> valid{};
-            // The lane whose metadata describes this slot's image: the pool hands a slot to
-            // whichever lane reserves it next, and every other lane's view of it goes with the
-            // overwrite.
+            std::uint32_t position        = 0;
+            std::uint32_t dflash_frontier = 0;
+            // The prefill that wrote this image. A prefill that never completed (cancelled) leaves
+            // its slots invalid instead of usable state.
+            std::uint64_t prefill_id = 0;
+            // The lane that wrote it. An image is the state after *its* own token history, and the
+            // reuse scan proves agreement only with the writing lane's lineage, so the image is
+            // only offered back to that lane - the pool may hand the slot to another one in the
+            // meantime.
             std::int32_t writer = -1;
+            // Set when the writing prefill completes and cleared as soon as a later request's
+            // shared prefix stops covering this frontier: the state is only the state of *this*
+            // prompt's prefix while the whole lineage agrees on the tokens before it.
+            bool valid = false;
         };
         // Within a lane's slice the ring is split in two: [0, grid_slots) holds the position grid,
         // which keeps the whole context covered and is never evicted by the tail anchors;
@@ -930,6 +931,11 @@ private:
     // failure that leaves the device pools describing no lineage at all.
     void invalidate_host_checkpoints();
     void invalidate_host_checkpoints(std::uint32_t lane);
+    // The conversation a lane's images belong to: the session the request named, or a key that
+    // keeps a session-less lane's images to itself. This is the ledger's conversation key, so a
+    // session that comes back on another lane still finds its own anchors without the images moving
+    // lanes.
+    [[nodiscard]] std::uint64_t conversation_key(std::uint32_t lane) const;
     // Drops only the resident entry and invalidates the device lineage: the paths that abort a
     // walk leave the device pools holding a prefix no catalog entry describes, while every
     // host-resident entry stays valid.

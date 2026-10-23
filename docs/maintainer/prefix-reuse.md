@@ -588,7 +588,10 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
   stride"的分配方式；张数改为由 §7.1 的需求反推，`stride` 固定 8192（§7 第 4 条），`host_checkpoint_stride_`
   那条预算反推路径整体删除；
 - `valid[lane]` / `position[lane]` / `prefill_id[lane]` 这套按 lane 寻址的镜像记账，包括槽号
-  `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）；
+  `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）。**2026-10-23 已完成元数据部分**：
+  四个字段都是标量（一个槽一张镜像、一个写者），`valid/position/prefill_id` 不再按 lane 索引；
+  越过 shared prefix 的裁剪改为按 `writer` 判定；轮转槽已由 `reserve_image_slot()` 分配（§15.4）。
+  剩下的只有 lane 分片的**固定角色槽**（divergence/block/prompt-end）与它们的布局常量；
 - 单一的 `kv_extent` 与"分歧时把 `prompt_end`/`shared_end` 清零"的裁剪方式（改为 §9.1 的两份 extent）；
 - `session_publish` 的三条分支与字段清零；
 - `reuse_path` 在**指标**上的用途，按 §17 的 `reuse_source`/`reuse_reason` 取代。原计划是连枚举一起删，**2026-10-23 改为
@@ -714,22 +717,30 @@ req#8 / req#10 判决的形态（对照 `tests/test_turn_replay.cpp` 已有的�
 证据：双卡真实请求，首轮 8452 token（在 8192 处留下一张检查点），次轮 `cached_tokens=8192`——
 这张镜像就是写进 ledger 分配的槽、再由 `restore_lane_state` 读回来的。
 
-还没做的两件：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，
-没有收成一个入口；跨 lane 复用还没打开——**但原因变了，而且比原先以为的更根本**（见下）。
+还没做的：`restore()` 仍是 `restore_lane_state` / `restore_lane_dflash` 两个函数各自 switch，
+没有收成一个入口。
 
 ### 15.5 跨 lane 复用的真正条件：镜像属于"对话"，不属于"lane"
 
-槽不再按 lane 分片之后，"一条 lane 用另一条 lane 的镜像"看起来只剩下一行判断，但它是**错的**：一张镜像
-是**某段 token 历史之后**的状态，只有产生它的那段历史才认得它。lane 只是执行位置，两条 lane 在同一位置的两张
-镜像可以对应完全不同的 token。所以正确条件不是"任何 lane 都能用任何镜像"，而是**镜像属于写它的那个会话**。
+槽不再按 lane 分片之后，"一条 lane 用另一条 lane 的镜像"看起来只剩下一行判断。**试过再回退**，两次都失败，
+原因比预想的根本：
 
-今天的 `offer()` 正是靠 lane 过滤实现这条语义的（`checkpoint.valid[lane]` + 位置不超过本 lane 的
-`shared_prefix`）。换成池分配之后，这条语义必须换成**按会话**判断，否则会出现"位置对得上、历史对不上"的静默错误。
-已经做掉的一半：写入时清掉**所有** lane 对这个槽的描述（`writer` 记下真正写它的 lane），因为池会把同一个槽
-交给另一条 lane；没做的一半是给槽记上**写它的会话**，让 `offer()` 按会话而不是按 lane 过滤。
+一张镜像是**某段 token 历史之后**的状态，只有产生它的那段历史才认得它。lane 只是执行位置——两条 lane 在同一
+位置的两张镜像可以对应完全不同的 token。所以"任何 lane 都能用任何镜像"是**静默错误**，不是优化。
 
-结论：跨 lane 复用不是"打开一个开关"，而是"把镜像的归属从 lane 换成会话"——这也是 §13 里 `valid/position/
-prefill_id` 那套按 lane 记账该被删掉的原因：它们的粒度从一开始就选错了。
+按会话归属也走不通，两个具体障碍（都实测过）：
+
+1. **会话号在扫描之后才有**。`lane_state.active_session` 在请求开始时被重置为 `kNoSession`，到
+   `session_publish()` 才绑定；而 reuse 扫描发生在两者之间。实测：写入时 `conversation_key` 是 lane 回退键
+   `0x8000…`，发布时变成 `0`，于是"发布时认领 owner"永远对不上，`host=0/11`、`reused=0`。
+2. **扫描只校验本 lane 的谱系**。`shared_prefix` 是拿本 lane 的 `cached_prompt_tokens` 比的；另一条 lane 的
+   镜像属于别的历史，没有被校验过。要让别的 lane 也能用，镜像必须自带**它自己那段 token 的标识**，
+   而不是"写它的会话号"。
+
+所以现在的落点：镜像归属仍是 **lane 作用域**（`writer == lane`），跨 lane 复用推到"镜像自带历史标识"之后。
+这一轮真正拿到的收益是**每槽单份元数据**：`valid/position/prefill_id/dflash_frontier` 从按 lane 的数组变成标量
+（§13 第 ② 条），因为一个槽同一时刻只有一张镜像、一个写者。池把槽交给另一条 lane 时，写入会清掉整个描述，
+`writer` 记下是谁写的。
 
 ### 15.6 borrower：一张镜像可以被几个会话同时读到，但只有一个会话让它活着
 
