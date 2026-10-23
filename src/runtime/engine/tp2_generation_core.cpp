@@ -6725,6 +6725,11 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
     lane_state.block_anchor_position     = 0;
     lane_state.block_anchor_prefill_id   = 0;
     if (!stored) { session_drop(resident); }
+    // The pools still hold the outgoing conversation until the prefill below overwrites them, and
+    // its rows below `active_shared` are this prompt's own prefix: same tokens, same prefill. That
+    // is the depth a host image may stand on here, and leaving the field at whatever the last
+    // request left is what kept a shared system prompt from being reused at all.
+    lane_state.device_kv_limit  = static_cast<std::uint32_t>(active_shared);
     lane_state.active_session   = kNoSession;
     lane_state.live_state_valid = false;
     lane_state.reuse_source     = ReuseSource::None;
@@ -7601,12 +7606,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         std::fprintf(stderr,
                      "[tp2-reuse] prompt=%u cached=%zu shared=%zu replay_split=%zu adopted=%d "
                      "prev_prompt=%u prefill_end=%u rewind=%u host=%zu/%zu refused_hash=%zu "
-                     "stride=%u -> reuse=%u slot=%zu src=%s\n",
+                     "stride=%u kv_limit=%u -> reuse=%u slot=%zu src=%s\n",
                      prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      adoption.divergence, adoption.adopted ? 1 : 0, previous_prompt,
                      lane_state.cached_boundaries[0], rewind_boundary, valid_checkpoints,
                      shard_a_.host_checkpoints.size(), refused_fingerprint, host_checkpoint_stride_,
-                     reuse, reuse_slot, source);
+                     lane_state.device_kv_limit, reuse, reuse_slot, source);
     }
 
     // Tag the checkpoints this walk leaves behind and start the ring at the first stride multiple
@@ -8157,6 +8162,11 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         lane_state.cached_boundaries[slot] = snapshot_at[slot];
     }
     lane_state.cached_state_valid = true;
+    // This walk wrote the pages end to end, so every host image at or below the prompt is a state
+    // whose KV the lane holds. The batch route states the same invariant in publish_lane_prefill; a
+    // path that forgot it left the previous request's limit behind, and every host image was
+    // refused.
+    lane_state.device_kv_limit = RetentionState::kNoDeviceKvLimit;
     // The prompt end is a boundary like any other: it goes into the ring's prompt-end slot, which is
     // where a store reads the prompt-end image and where a returning turn stands when the
     // configuration keeps no device plane.
