@@ -1137,6 +1137,65 @@ int check_replayed_answer_across_lanes(const char* artifact, int device_a, int d
     return 0;
 }
 
+// A reused boundary may only stand on rows this walk would have computed itself. The strongest form
+// the engine can be held to: two walks whose chunk sequence is the same up to the boundary have to
+// produce the same answer, whether the rows below it are recomputed or loaded from an image.
+//
+// The writer cuts the block in whole chunks and stops a little past it; the reader shares exactly
+// the block, so the deepest boundary the grid allows is the block's end, and the image under it was
+// written by the same chunks a cold walk of the reader's own prompt would cut. A difference can
+// then only come from the image, not from the shape of the walk that wrote it - which is what
+// separates "the model layer's tiles are length-dependent" from "the reuse path is not exact".
+int check_image_equals_a_cold_prefix(const char* artifact, int device_a, int device_b,
+                                     Route route) {
+    const std::string label = std::string("image equality (") + route_name(route) + ")";
+
+    // How many whole chunks of shared block the writer and the reader agree on. A larger block puts
+    // the image deeper into the walk; the knob exists so one build can measure several depths.
+    const std::uint32_t block_chunks =
+        std::getenv("NINFER_IMAGE_BLOCK") != nullptr
+            ? static_cast<std::uint32_t>(std::atoi(std::getenv("NINFER_IMAGE_BLOCK")))
+            : 4U;
+    const std::uint32_t kBlock       = block_chunks * kChunkWidth;
+    const std::vector<TokenId> block = make_prompt(81000, kBlock);
+    std::vector<TokenId> writer      = block;
+    append(writer, make_prompt(82000, 152));
+    std::vector<TokenId> reader = block;
+    append(reader, make_prompt(83000, 160));
+
+    // The cold answer comes first and its engine goes away before the second one exists: two
+    // engines do not fit on the pair at once, which is the same reason run_scenario computes its
+    // oracles in their own scope.
+    std::vector<TokenId> cold_answer;
+    {
+        ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
+        cold_answer = run(oracle, reader).generated_token_ids;
+    }
+
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
+    const ninfer::GenerationResult writer_turn = run(engine, writer);
+    if (writer_turn.reused_prompt_tokens != 0) {
+        return fail(label, "the writer prefilled the block from a stale lineage: reused " +
+                               std::to_string(writer_turn.reused_prompt_tokens) + " prompt tokens");
+    }
+    const ninfer::GenerationResult reused_turn = run(engine, reader);
+    if (reused_turn.reused_prompt_tokens != kBlock) {
+        return fail(label, "the reader reused " + std::to_string(reused_turn.reused_prompt_tokens) +
+                               " prompt tokens, expected the block at " + std::to_string(kBlock));
+    }
+    if (reused_turn.generated_token_ids != cold_answer) {
+        return fail(
+            label,
+            "a walk standing on the image diverged from the cold walk of the same prompt: got " +
+                tokens_text(reused_turn.generated_token_ids) + " expected " +
+                tokens_text(cold_answer));
+    }
+    std::cout << "TP-2 image equality (" << label << ") passed: the walk that stood on the "
+              << reused_turn.reused_prompt_tokens
+              << "-token image produced the cold walk's own answer\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1195,6 +1254,17 @@ int main() {
                                                                      devices.second, route);
                 status != 0) {
                 return status;
+            }
+            // Not part of the gate: it is red today at two of three boundary depths, and its
+            // subject is the image path rather than the reuse decisions the rest of this file pins.
+            // Run it by hand with NINFER_IMAGE_EQUALITY=1 (and NINFER_IMAGE_BLOCK=<chunks> for a
+            // given depth).
+            if (std::getenv("NINFER_IMAGE_EQUALITY") != nullptr) {
+                if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
+                                                                        devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
             if (const int status = run_scenario(artifact, devices.first, devices.second, route);
                 status != 0) {
