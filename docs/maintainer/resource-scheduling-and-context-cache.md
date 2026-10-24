@@ -32,6 +32,9 @@ replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-c
 Prefix reuse 是 admission 的一种来源选择。它复用具有完整身份和状态覆盖的已计算前缀，减少重复
 prefill，保持模型语义和请求顺序。不同 prefill 分块或数值路径之间不要求 logits 或生成 token 完全相同。
 
+本文只定义这条规则在单 GPU 路线上的资源选择；TP-2 路线的 prefix-reuse 层（记账、决策、镜像池、召回与
+精确定律）由 [TP-2 前缀复用层](prefix-reuse.md)维护，两者按路线分工，不互相重复。
+
 当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8` 和非抢占 active requests。
 由此得到两个基本规则：
 

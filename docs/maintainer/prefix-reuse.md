@@ -8,9 +8,12 @@ catalog 的 store/recall）都改为向 ledger 取槽与取决策，`§18.7` 记
 决策保持不变；§15、§16 给出文件划分、纯函数边界与测试处置。本文只覆盖 prefix reuse 的**记账与锚点层**；
 prefill 执行、Program、图捕获、KV page 物理合同和协议层不在范围内。
 
-实测证据与夹具脚本放在工作区 `_temp/`（`20261022-1515_phase0.ps1` 及捕获目录），属于本地复现材料、不入库；
-文中引用的行号以提交 `fd9d6ded` 为准。最终的归属仍是
-[资源调度与上下文缓存](resource-scheduling-and-context-cache.md) 的 prefix-reuse 章节——本文暂作为该章节的完整草稿。
+实测证据与夹具脚本放在工作区 `_temp/`，属于本地复现材料、不入库；文中引用的早期行号以提交 `fd9d6ded` 为准。
+
+**权威边界**：本文是 TP-2 路线 prefix-reuse 层的维护者权威——记账（`ConversationLog`/`Anchor`）、决策
+（`ReuseLedger::decide`）、镜像池与召回规则、以及精确定律都在这里。[资源调度与上下文缓存]
+(resource-scheduling-and-context-cache.md) 定义单 GPU 路线的 admission 与资源选择规则，两者按路线分工，
+不互相重复：那边的 prefix-reuse 段落只保留概念与指向本文的链接。
 
 ---
 
