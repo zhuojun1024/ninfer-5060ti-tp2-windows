@@ -3865,17 +3865,6 @@ void TP2GenerationCore::execute_plain_batch(
         const LaneReuse lane_reuse =
             scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens,
                             adoption.divergence, adoption.adopted, reuse_trace);
-        // The position this prompt stops agreeing with the lane history. The batched prefill cuts
-        // the chunk that would step over it so the state it freezes sits on an exact token
-        // boundary. It belongs to this route rather than to the scan: the serial walk plans the
-        // same boundary as a grid anchor, and a scan that wrote it for both would cut the walk
-        // chunks at a position its from-scratch oracle never cuts.
-        if (const RetentionState& scanned = retention(lane_id);
-            scanned.cached_state_valid && !scanned.cached_prompt_tokens.empty()) {
-            RetentionState& writable         = retention(lane_id);
-            writable.reuse_boundary_target   = lane_reuse.shared_prefix;
-            writable.reuse_boundary_captured = false;
-        }
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -3962,13 +3951,6 @@ void TP2GenerationCore::execute_plain_batch(
             if (block_anchor && block_position > t0 && block_position < t0 + length) {
                 length = block_position - t0;
             }
-            // The boundary is where this prompt stopped agreeing with the lane's history, so the chunk
-            // that would step over it ends on it: an image captured there is only loadable if it sits
-            // exactly on that token. One extra short chunk per request is the price.
-            if (retention(lane_id).reuse_boundary_target > t0 &&
-                retention(lane_id).reuse_boundary_target < t0 + length) {
-                length = retention(lane_id).reuse_boundary_target - t0;
-            }
             qwen::execution::Tp2VisionChunk media_chunk;
             const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
             if (media) {
@@ -3994,11 +3976,6 @@ void TP2GenerationCore::execute_plain_batch(
                 // dense tail window. The prompt end is skipped either way: the lane publishes it as
                 // its frontier into the ring's own prompt-end slot.
                 const std::uint32_t frontier = t0 + length;
-                if (!retention(lane_id).reuse_boundary_captured &&
-                    retention(lane_id).reuse_boundary_target != 0 &&
-                    frontier >= retention(lane_id).reuse_boundary_target) {
-                    capture_reuse_boundary(lane_id);
-                }
                 if (frontier >= next_host_checkpoint) {
                     snapshot_host_pair(frontier, lane_id);
 
@@ -5237,17 +5214,6 @@ void TP2GenerationCore::execute_spec_batch(
         const LaneReuse lane_reuse =
             scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens,
                             adoption.divergence, adoption.adopted, reuse_trace);
-        // The position this prompt stops agreeing with the lane history. The batched prefill cuts
-        // the chunk that would step over it so the state it freezes sits on an exact token
-        // boundary. It belongs to this route rather than to the scan: the serial walk plans the
-        // same boundary as a grid anchor, and a scan that wrote it for both would cut the walk
-        // chunks at a position its from-scratch oracle never cuts.
-        if (const RetentionState& scanned = retention(lane_id);
-            scanned.cached_state_valid && !scanned.cached_prompt_tokens.empty()) {
-            RetentionState& writable         = retention(lane_id);
-            writable.reuse_boundary_target   = lane_reuse.shared_prefix;
-            writable.reuse_boundary_captured = false;
-        }
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -5330,13 +5296,6 @@ void TP2GenerationCore::execute_spec_batch(
             if (block_anchor && block_position > t0 && block_position < t0 + length) {
                 length = block_position - t0;
             }
-            // The boundary is where this prompt stopped agreeing with the lane's history, so the chunk
-            // that would step over it ends on it: an image captured there is only loadable if it sits
-            // exactly on that token. One extra short chunk per request is the price.
-            if (retention(lane_id).reuse_boundary_target > t0 &&
-                retention(lane_id).reuse_boundary_target < t0 + length) {
-                length = retention(lane_id).reuse_boundary_target - t0;
-            }
             qwen::execution::Tp2VisionChunk media_chunk;
             const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
             if (media) {
@@ -5370,11 +5329,6 @@ void TP2GenerationCore::execute_spec_batch(
                 // dense tail window. The prompt end is skipped either way: the lane publishes it as
                 // its frontier into the ring's own prompt-end slot.
                 const std::uint32_t frontier = t0 + length;
-                if (!retention(lane_id).reuse_boundary_captured &&
-                    retention(lane_id).reuse_boundary_target != 0 &&
-                    frontier >= retention(lane_id).reuse_boundary_target) {
-                    capture_reuse_boundary(lane_id);
-                }
                 if (frontier >= next_host_checkpoint) {
                     snapshot_host_pair(frontier, lane_id);
 
@@ -6365,7 +6319,6 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
                 frozen_image = entry.host_prompt_state[index]->data();
                 break;
             case RecallState::Shared: frozen_image = entry.host_shared_state[index]->data(); break;
-            case RecallState::Boundary: frozen_image = shard.reuse_boundary_state->data(); break;
         }
         copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
                         static_cast<std::int32_t>(lane),
@@ -6391,10 +6344,6 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
                 case RecallState::Shared:
                     frozen_dflash = entry.host_dflash_shared[index]->data();
                     frozen_bytes  = entry.host_dflash_shared[index]->size();
-                    break;
-                case RecallState::Boundary:
-                    frozen_dflash = shard.reuse_boundary_dflash->data();
-                    frozen_bytes  = shard.reuse_boundary_dflash->size();
                     break;
             }
             load_dflash_image(shard, frozen_dflash, frozen_bytes, lane);
@@ -6575,39 +6524,20 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         std::size_t shared       = 0;
         while (shared < common && entry.tokens[shared] == prompt_tokens[shared]) { ++shared; }
         shared = media_prefix_cap(entry.media, media, shared);
-        // The lane-local boundary is offered under the same rules as the entry's own images, plus the
-        // token tag: it is the state of a prefix, so it applies to whichever conversation carries that
-        // prefix, and to none whose tokens differ. It needs its draft pair to be loadable.
-        const std::uint32_t boundary_position = shard_a_.reuse_boundary_position[lane];
-        std::uint64_t boundary_tag            = 0;
-        if (boundary_position != 0 && boundary_position <= entry.tokens.size()) {
-            boundary_tag = 1469598103934665603ULL;
-            for (std::size_t position = boundary_position > 8 ? boundary_position - 8 : 0;
-                 position < boundary_position; ++position) {
-                boundary_tag = (boundary_tag ^ static_cast<std::uint64_t>(entry.tokens[position])) *
-                               1099511628211ULL;
-            }
-        }
-        // NINFER_TP2_REUSE_BOUNDARY=0 ignores the lane-local boundary: the A/B switch the exactness
-        // check needs, so the same prompt reuses at the shared block instead.
-        const char* boundary_env    = std::getenv("NINFER_TP2_REUSE_BOUNDARY");
-        const bool boundary_enabled = boundary_env == nullptr || boundary_env[0] != '0';
-        const bool boundary_ready =
-            boundary_enabled && shard_a_.reuse_boundary_state != nullptr &&
-            (shard_a_.dflash_round == nullptr || shard_a_.reuse_boundary_dflash != nullptr);
-        static constexpr const char* kReachName[4] = {"frontier", "prompt-end", "shared",
-                                                      "boundary"};
-        const std::uint32_t offered[4] = {
-            entry.host_frontier_end, entry.host_prompt_end, entry.host_shared_end,
-            (boundary_ready && boundary_tag != 0 &&
-             shard_a_.reuse_boundary_tag[lane] == boundary_tag)
-                ? boundary_position
-                : 0};
+        // Three images, deepest wins: the frontier the entry reached on the device, the prompt end
+        // it published, and the stable block it shares with a later conversation. A fourth source
+        // used to sit here - a lane-local state frozen at the exact position the prompt diverged -
+        // and it is gone: its image sat off the prefill grid, so a recall through it cut different
+        // chunks than a from-scratch walk and could flip a near tie (fd9d6ded measured the gain it
+        // bought at 137 tokens on a 21K prompt, and said so itself). The divergence anchor covers
+        // the same need on the grid, and it is exact.
+        static constexpr const char* kReachName[3] = {"frontier", "prompt-end", "shared"};
+        const std::uint32_t offered[3] = {entry.host_frontier_end, entry.host_prompt_end,
+                                          entry.host_shared_end};
         std::uint32_t reach = 0;
         RecallState via     = RecallState::Frontier;
-        for (std::size_t kind = 0; kind < 4; ++kind) {
+        for (std::size_t kind = 0; kind < 3; ++kind) {
             // Every image is capped by the extent the slabs were actually filled to, so a recall
-            // only reads pages this entry really carries. At a store the frontier is that extent,
             // and the prompt-end and shared images are taken at or behind it, so no image needs a
             // wider bound. An entry the device no longer holds *and* that was never stored - the
             // shape of publishing a conversation whose opening prompt the resident one already
@@ -7131,60 +7061,6 @@ ReuseSourceKind TP2GenerationCore::reuse_source_kind(ReuseSource source) noexcep
     return ReuseSourceKind::None;
 }
 
-// Copies the GDN state this lane's device slot holds right now into the ring slot the group owns,
-// tagged with the frontier it captures. It rides the shard stream, so it sees exactly the tokens the
-// enclosing loop has enqueued and none of the later ones, and the ring slot it lands in is only
-// revisited by a later prefill's checkpoint at the same index.
-void TP2GenerationCore::capture_reuse_boundary(std::uint32_t lane) {
-    RetentionState& state = retention(lane);
-    if (state.reuse_boundary_target == 0 || state.reuse_boundary_captured) { return; }
-    const std::uint32_t position = state.reuse_boundary_target;
-    for (Shard* shard : {&shard_a_, &shard_b_}) {
-        if (shard->lane_state_geometry.image_bytes == 0) { return; }
-        if (shard->reuse_boundary_state == nullptr) {
-            shard->reuse_boundary_state = std::make_unique<HostBuffer>(
-                static_cast<std::size_t>(lanes_) * shard->lane_state_geometry.image_bytes,
-                HostPinning::Pageable);
-        }
-        shard->device.bind_to_current_thread();
-        copy_lane_state(shard->lane_state_geometry, shard->state_backing.data,
-                        static_cast<std::int32_t>(lane),
-                        static_cast<std::byte*>(shard->reuse_boundary_state->data()) +
-                            static_cast<std::size_t>(lane) *
-                                shard->lane_state_geometry.image_bytes,
-                        cudaMemcpyDeviceToHost, shard->device.stream);
-        if (shard->dflash_round != nullptr) {
-            const std::size_t lane_bytes = shard->dflash_round->lane_context_image_bytes();
-            if (shard->reuse_boundary_dflash == nullptr) {
-                shard->reuse_boundary_dflash = std::make_unique<HostBuffer>(
-                    static_cast<std::size_t>(lanes_) * lane_bytes, HostPinning::Pageable);
-            }
-            store_dflash_image(*shard, shard->reuse_boundary_dflash->data(),
-                               shard->reuse_boundary_dflash->size(), lane);
-        }
-        shard->reuse_boundary_position[lane] = position;
-        shard->reuse_boundary_session[lane]  =
-            state.active_session == kNoSession ? 0 : state.active_session + 1;
-    }
-    // The eight tokens before the boundary are the image's identity: it is that prefix's state
-    // whoever wrote it, and a rewritten entry whose tokens changed must not load it.
-    std::uint64_t tag          = 1469598103934665603ULL;
-    const auto& prefix_tokens  = state.cached_prompt_tokens;
-    if (position <= prefix_tokens.size()) {
-        for (std::size_t index = position > 8 ? position - 8 : 0; index < position; ++index) {
-            tag = (tag ^ static_cast<std::uint64_t>(prefix_tokens[index])) * 1099511628211ULL;
-        }
-    } else {
-        tag = 0;
-    }
-    for (Shard* shard : {&shard_a_, &shard_b_}) { shard->reuse_boundary_tag[lane] = tag; }
-    state.reuse_boundary_captured = true;
-    if (const char* probe = std::getenv("NINFER_TP2_REUSE_TRACE");
-        probe != nullptr && probe[0] == '1') {
-        std::fprintf(stderr, "[tp2-reuse] boundary lane=%u pos=%u session=%zu\n", lane, position,
-                     state.active_session);
-    }
-}
 
 void TP2GenerationCore::snapshot_host_checkpoint(Shard& shard, std::size_t slot,
                                                  std::uint32_t frontier, std::uint32_t lane,
@@ -7925,13 +7801,6 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         if (block_anchor && block_position > t0 && block_position < t0 + length) {
             length = block_position - t0;
         }
-            // The boundary is where this prompt stopped agreeing with the lane's history, so the chunk
-            // that would step over it ends on it: an image captured there is only loadable if it sits
-            // exactly on that token. One extra short chunk per request is the price.
-            if (retention(lane).reuse_boundary_target > t0 &&
-                retention(lane).reuse_boundary_target < t0 + length) {
-                length = retention(lane).reuse_boundary_target - t0;
-            }
         qwen::execution::Tp2VisionChunk media_chunk;
         const qwen::execution::Tp2VisionChunk* media_ptr = nullptr;
         if (media) {
