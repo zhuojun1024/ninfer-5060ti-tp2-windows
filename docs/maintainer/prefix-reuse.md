@@ -587,10 +587,12 @@ Draft 配对、媒体身份、块/分歧钉住、offline CausalScoring、取消/
 
 ## 13. 删除清单
 
-- ring 的 grid / tail / divergence / block / prompt-end 五套子环与其索引逻辑；
-- tail 的 `min(kReuseTailCheckpointCount, flexible / 2)` 硬上限（8 张），以及"先把槽分给各子环、再拿剩余槽位反推
-  stride"的分配方式；张数改为由 §7.1 的需求反推，`stride` 固定 8192（§7 第 4 条），`host_checkpoint_stride_`
-  那条预算反推路径整体删除；
+- ring 的 grid / tail / divergence / block / prompt-end 五套子环与其索引逻辑。**2026-10-24 已完成**：分配已是池化的
+  （`reserve_image_slot`），五个子环只剩"什么时候写一张镜像"这层策略含义，不再有各自的槽配额；
+- tail 的 `min(kReuseTailCheckpointCount, flexible / 2)` 硬上限，以及"先把槽分给各子环、再拿剩余槽位反推 stride"
+  的分配方式。**2026-10-24 已完成**（`95587ab2`）：池 = 配置张数 + 每个请求可能冻结的角色张数，
+  `host_checkpoint_stride_` 就是常量 8192，`host_checkpoint_grid_slots_`/`tail_slots_`/`divergence_slots_`/
+  `block_slots_` 四个成员一并删除；tail 窗口保留自己的计数，但它是关于边界网格的陈述，不再是子环份额；
 - `valid[lane]` / `position[lane]` / `prefill_id[lane]` 这套按 lane 寻址的镜像记账，包括槽号
   `lane * per_lane + offset` 的算法（改由 §4.6 的分配器给出）。**2026-10-23 已完成**：四个元数据字段都是标量，
   写路径不再算地址（所有宿主镜像都由 `reserve_image_slot()` 给槽），`HostRing` 角色枚举、固定角色槽的
