@@ -1272,13 +1272,35 @@ expected [1703 220 15 15 15 15 …]
   stride 就是常量；tail 窗口仍有自己的计数，但它是关于边界网格的陈述（提示词末尾最后几个 chunk 端点，不超过配置窗口），
   不再是某个子环的份额。
 
-仍然开口的一件事：
+### 19.1 为什么不做 fixed-shape tiles（2026-10-24 实测结论）
 
-**fixed-shape tiles**。`kPrefillChunkMaximum = 1024` 决定了 prompt ≤ 1024 时整条提示词是单个 tile，其归约形状随总
-长度变化，所以"任意边界都可复用且逐位一致"只对网格上的边界成立。消除它需要在 `prefill_impl` 里对 padding 行做
-attention mask、GDN 不推进、KV 不写、logits 只取最后真实行。`check_image_equals_a_cold_prefix` 是这条工作的验收工具。
+复用的边界必须落在 tile 网格上，这一点 padding 改变不了：冷走查 L=1089、W=256 的最后一块是 65 行，从 1024 召回时
+的最后一块也是 65 行（宽度只取决于 L 和绝对网格起点）。所以"倍数于 W 的边界"今天已经逐位精确（§18.7 的深度表就是
+实测证据），而 padding 并不会造出新的小粒度边界——粒度由 W 决定，不由 padding 决定。它唯一能买到的性质（tile 形状
+与本次 run 的起点无关）现在已经成立。
 
-另有一条与本文无关的红：`ninfer_qwen3_5_tp2_lanes_test` 的"同一 prompt 四条 lane 必须逐 token 一致"断言失败
+真正能改变粒度的是把 W 调小，代价实测如下（双卡，24362 token 冷 prefill，每次 3 个样本）：
+
+| W | 吞吐 | 相对 1024 |
+|---|---|---|
+| 1024 | 2270 tok/s | 基线 |
+| 512 | 2061 tok/s | −9% |
+| 256 | 1752 tok/s | −23% |
+
+这 23% 曾被认为是主机发射开销，可以通过 prefill CUDA Graph 收回（图会同时让 fixed-shape tiles 变得有意义）。
+两个测量否掉了这条链：
+
+1. **不是调度串行。** `overlap_ok` 要求 `tokens % overlap == 0 && tokens / overlap >= 2`，默认 `--prefill-overlap 256`
+   使 W=256 退化成锁步。把 overlap 降到 128 让它重新进入流水线，吞吐 1728 tok/s——与锁步的 1752 没有区别；
+   overlap 64 更差（1168）。W=512 配 overlap 128 也比配 256 差（1892 vs 2061）。
+2. **没有主机空档可回收。** 24k 冷 prefill 期间 5060 Ti 平均利用率 95%（中位 98–99%），W=1024 与 W=256 一样。
+   也就是说主机最多占 5%，抓图省不出 23%。
+
+结论：小 tile 的代价是设备侧 GEMM 效率与每 tile 的 all-reduce 次数，抓图无能为力；fixed-shape tiles 的唯一正当理由
+（抓图前提）随之消失。保持 W=1024 默认；`--prefill-chunk` 是一个带实测价格的粒度旋钮，不是免费参数。
+
+如果将来要做 prefill 图，正确的触发条件不是"小 tile 慢"，而是"设备利用率明显不满"——今天不满足。
+
 （lane 1–3 互相一致，lane 0 不同；该场景 `allow_reuse = false`，不经过本文的任何路径），属于批调度/归约形状
 的独立问题，需要单独定位。
 
