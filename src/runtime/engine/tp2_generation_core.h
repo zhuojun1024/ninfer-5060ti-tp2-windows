@@ -522,6 +522,11 @@ private:
     // by what the cross-device all-reduce staging buffer carries in one payload (see the definition).
     [[nodiscard]] std::uint32_t prefill_chunk_width(const models::qwen3_5::TextConfig& config) const;
 
+    // The first prefill-grid position strictly past `frontier`. The anchors a generated answer
+    // leaves behind are written there and nowhere else, because the registration rule only accepts
+    // a state frozen where the next walk would chunk from.
+    [[nodiscard]] std::uint32_t next_generated_grid(std::uint32_t frontier) const;
+
     // The context ceiling a request may be admitted against on a multi-lane route. The pool is
     // shared rather than partitioned, so this is a policy bound - the whole pool by default, or the
     // `--lane-context` ceiling when one is configured (S2) - clamped to the pool minus the route's

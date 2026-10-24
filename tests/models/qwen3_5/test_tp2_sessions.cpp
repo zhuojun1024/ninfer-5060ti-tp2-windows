@@ -678,14 +678,13 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     if (burst.generated_token_ids.empty()) {
         return fail(label, "the scenario's long turn generated nothing to reuse");
     }
-    // The long turn's prefill writes rotation images only inside its tail window, and its own end
-    // goes into the role slot the ring scan does not offer, so the deepest boundary this
-    // conversation can stand on is the grid point inside that window - not the grid point behind
-    // the frontier the answer reached. The number this used to expect was a slot the scan had never
-    // been able to trust: it carried the right position and the right prefix hash, but its bytes
-    // came from another prefill (see prefix-reuse.md 18.7), so it passed while the peer restored a
-    // state that was never the prompt's.
-    const std::uint32_t burst_frontier = grid_floor(burst_prompt_end);
+    // The answer this turn generated leaves an anchor on every prefill-grid multiple it crossed, so
+    // the deepest boundary the lineage holds is the grid point behind the answer's own end - not
+    // the grid point behind the prompt it started from. Both are boundaries the scan can trust: the
+    // write happens exactly on the multiple, and its stamp is taken from the same history the next
+    // turn compares against.
+    const std::uint32_t burst_frontier =
+        grid_floor(burst_prompt_end + static_cast<std::uint32_t>(burst.generated_token_ids.size()));
     const ninfer::GenerationResult burst_continued =
         run_budget(engine, burst_history, kContinueBudget);
     if (burst_continued.reused_prompt_tokens != burst_frontier) {

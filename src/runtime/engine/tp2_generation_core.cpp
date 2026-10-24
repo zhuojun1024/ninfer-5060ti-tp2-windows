@@ -263,22 +263,25 @@ constexpr std::uint32_t kReuseTailWindow = 8192;
 // ring with them (each prefill leaves up to one per chunk) and evicts the position grid, which is
 // exactly the coverage a divergence deep inside the history needs.
 constexpr std::uint32_t kReuseTailCheckpointCount = 8;
-// Spacing of the anchors written while an answer is generated. The position grid only fires on
-// absolute stride multiples, so an answer that never crosses one leaves the prompt end as the only
-// boundary behind it: a client that re-renders that answer then re-prefills the whole thing (an
-// observed 20,319-token answer crossed no grid point and fell back 22,989 tokens). One anchor per
-// this many committed tokens, written into the tail ring the prefill already reserves, bounds that
-// fallback to a few thousand tokens without spending a slot. The ring's tail count widens the
-// coverage: seven slots cover 57K generated tokens before the oldest anchor rotates out.
-constexpr std::uint32_t kReuseGeneratedTailStride = 8192;
+// The anchors written while an answer is generated sit on the prefill's chunk grid, one every chunk
+// width, and only where a round lands exactly on a grid multiple. Both halves are the registration
+// rule (`offer` refuses a position that is not a multiple of the width): a state can only be frozen
+// where the frontier actually stands, so an anchor written when a round steps over a multiple would
+// be dropped the next time the conversation is scanned. Spacing them by the width bounds the
+// fallback behind an answer to one chunk; the spacing used to be a fixed 8,192 tokens, which for
+// this workload meant no anchor existed behind any answer shorter than that (74 of 75 answers in
+// one measured agent session), so the whole answer was re-prefilled on the following turn. Each
+// anchor now costs a slot from the shared pool and a 146.8 MiB host copy: at 1,024 tokens of
+// generation per copy and ~100 tok/s that is ~15 ms per ten seconds, or 0.15% of decode wall time.
 // Host ring slots reserved for the divergence anchor: the position where the last prefill's prompt
-// stopped matching the lineage it inherited. A new session - and a context compression - shares only
-// the client's stable system prompt and tool definitions with the conversation before it, so its
-// divergence lands well inside the previous prompt. Neither other group reaches there: the position
-// grid's first checkpoint sits a whole stride in, and a small ring widens that stride to tens of
-// thousands of tokens; the tail anchors sit at the opposite end. One slot is enough because a client
-// renders its stable prefix once, and because the ring prunes on a single lineage: a checkpoint past
-// the newest shared prefix is dead for good, so a second slot could never hold a rival prefix.
+// stopped matching the lineage it inherited. A new session - and a context compression - shares
+// only the client's stable system prompt and tool definitions with the conversation before it, so
+// its divergence lands well inside the previous prompt. Neither other group reaches there: the
+// position grid's first checkpoint sits a whole stride in, and a small ring widens that stride to
+// tens of thousands of tokens; the tail anchors sit at the opposite end. One slot is enough because
+// a client renders its stable prefix once, and because the ring prunes on a single lineage: a
+// checkpoint past the newest shared prefix is dead for good, so a second slot could never hold a
+// rival prefix.
 constexpr std::uint32_t kReuseDivergenceCheckpointCount = 1;
 // Slots for the stable block's own anchor: the boundary the prompt itself names as the end of its
 // leading instruction block. It needs a slot of its own because the observed divergence owns the one
@@ -2079,6 +2082,12 @@ std::uint32_t TP2GenerationCore::prefill_chunk_width(const qwen::TextConfig& con
         std::min<std::uint64_t>(width, std::max<std::size_t>(fits, 64U)));
 }
 
+std::uint32_t TP2GenerationCore::next_generated_grid(std::uint32_t frontier) const {
+    const std::uint32_t grid = prefill_chunk_width(shard_a_.model->config().text);
+    if (grid == 0) { return 0; }
+    return (frontier / grid + 1U) * grid;
+}
+
 std::optional<qwen::execution::DFlashFeatureSink>
 TP2GenerationCore::make_dflash_prefill_sink(Shard& shard, std::int32_t lane) {
     if (shard.dflash_round == nullptr) { return std::nullopt; }
@@ -3024,7 +3033,7 @@ void TP2GenerationCore::publish_lane_prefill(
     lane_state.cached_media.assign(media.begin(), media.end());
     // The answer this prefill starts is anchored from here on: everything the walk just did is
     // covered by its grid and tail checkpoints, so the span these anchors fill is the generated one.
-    lane_state.next_generated_checkpoint = prompt_tokens + kReuseGeneratedTailStride;
+    lane_state.next_generated_checkpoint = next_generated_grid(prompt_tokens);
     lane_state.cached_boundaries.fill(0);
     // This prefill wrote the pages end to end, so every host image at or below the prompt is a
     // state whose KV the lane holds.
@@ -5003,6 +5012,21 @@ void TP2GenerationCore::execute_spec_batch(
             }
             const std::uint32_t remaining = request.budget.remaining();
             if (step.size() > remaining) { step.resize(remaining); }
+            // Cut the window so the frontier lands exactly on the prefill grid. The anchors a
+            // generated answer leaves behind can only be written where a round stops, and only on a
+            // grid multiple do they survive the scan's registration rule; a speculative round
+            // committing several tokens would step over most multiples and leave the answer with no
+            // anchor at all, which is what put the next turn back at the prompt end. The tokens cut
+            // here are drafted again next round, so the committed stream is unchanged - acceptance
+            // is a prefix decision, not a schedule - and the output policy and the client only ever
+            // see the truncated window.
+            if (const std::uint32_t grid = prefill_chunk_width(shard_a_.model->config().text);
+                grid != 0) {
+                const std::uint32_t target = next_generated_grid(lane.position);
+                if (target > lane.position && target - lane.position < step.size()) {
+                    step.resize(target - lane.position);
+                }
+            }
             const OutputDecision decision =
                 request.output.preview_model(step, remaining, request.budget.limit_reason());
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
@@ -5041,32 +5065,39 @@ void TP2GenerationCore::execute_spec_batch(
                 // The next round appends exactly the columns this round committed.
                 retention(lane.slot).dflash_context_frontier = base;
             }
-            // Anchors inside the answer. The position grid only fires on absolute stride multiples,
-            // so an answer that never crosses one leaves the prompt end as the only boundary behind
-            // it and a client that re-renders that answer re-prefills all of it. The tail ring
-            // already holds the prefill's last chunk ends, so these anchors cost no extra slot; the
-            // draft half has to reach the frontier the anchor names, exactly as the grid write in
-            // the serial walk makes it, or a restore refuses the checkpoint.
-            if (!decision.finished()) {
-                const std::uint32_t frontier = lane.position - 1U;
+            // Anchors inside the answer, one per prefill-chunk of generated tokens and only where a
+            // round lands exactly on a grid multiple: the scan only offers a position the next walk
+            // would chunk from, so a write anywhere else is dead on arrival, and a state can only
+            // be frozen where the frontier actually stands. The window above was cut so the round
+            // lands on the multiple. The round that finishes the answer is included: when it
+            // stopped on a multiple that multiple is the deepest boundary behind the answer, while
+            // the prompt-end role image and the live state name the frontier - a different position
+            // unless the answer happened to end on the grid.
+            {
+                // The lane's position counts the tokens its state covers, the same number the final
+                // publish names, so that is the position an anchor can be labelled with.
+                const std::uint32_t frontier = lane.position;
                 std::uint32_t& next          = retention(lane.slot).next_generated_checkpoint;
                 if (next != 0 && frontier >= next) {
-                    const std::uint32_t draft_frontier =
-                        retention(lane.slot).dflash_context_frontier;
-                    if (dflash2_enabled_ && frontier > draft_frontier) {
-                        // Hand the pending window to the draft ring for this lane alone, then keep
-                        // the frontier it now reaches: the round-level append below only carries the
-                        // lanes that finished, and it also resets every other lane to `base`.
-                        const std::int32_t flush_slot  = static_cast<std::int32_t>(lane.slot);
-                        const std::int32_t flush_start = static_cast<std::int32_t>(draft_frontier);
-                        const std::int32_t flush_end   = static_cast<std::int32_t>(frontier);
-                        round->append_pending_batch(dflash_execution, &flush_slot, &flush_start,
-                                                    &flush_end, 1);
-                        retention(lane.slot).dflash_context_frontier = frontier;
+                    if (frontier == next) {
+                        const std::uint32_t draft_frontier =
+                            retention(lane.slot).dflash_context_frontier;
+                        if (dflash2_enabled_ && frontier > draft_frontier) {
+                            // Hand the pending window to the draft ring for this lane alone, then
+                            // keep the frontier it now reaches: the round-level append below only
+                            // carries the lanes that finished, and it also resets every other lane
+                            // to `base`.
+                            const std::int32_t flush_slot = static_cast<std::int32_t>(lane.slot);
+                            const std::int32_t flush_start =
+                                static_cast<std::int32_t>(draft_frontier);
+                            const std::int32_t flush_end = static_cast<std::int32_t>(frontier);
+                            round->append_pending_batch(dflash_execution, &flush_slot, &flush_start,
+                                                        &flush_end, 1);
+                            retention(lane.slot).dflash_context_frontier = frontier;
+                        }
+                        snapshot_host_pair(frontier, lane.slot);
                     }
-                    snapshot_host_pair(frontier, lane.slot);
-
-                    next = frontier + kReuseGeneratedTailStride;
+                    next = next_generated_grid(frontier);
                 }
             }
         }
@@ -6867,9 +6898,10 @@ void TP2GenerationCore::session_publish(
     lane_state.live_state_valid     = true;
 }
 
-GenerationResult TP2GenerationCore::execute(Request& request, OutputSink* sink,
-                                            const CancellationView& cancellation) {
-    // The live-frontier shortcut is only sound while the device GDN state sits exactly where the
+GenerationResult TP2GenerationCore::execute(
+    Request& request, OutputSink* sink,
+    const CancellationView& cancellation) { // The live-frontier shortcut is only sound while the
+                                            // device GDN state sits exactly where the
     // catalog says it does. A walk that throws before it publishes leaves the state somewhere the
     // catalog cannot name, so the guard retires both the claim and the resident entry before the next
     // request reads them. A walk that already published its terminal frontier named exactly where the
@@ -7295,7 +7327,7 @@ std::unique_ptr<qwen::execution::VisionPrefillSession> TP2GenerationCore::open_v
 
 GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* sink,
                                                  const CancellationView& cancellation) {
-    const bool streaming = request.consumer_mode == OutputConsumerMode::Streaming;
+    const bool streaming       = request.consumer_mode == OutputConsumerMode::Streaming;
     auto& data = qwen::PreparedPromptAccess::mutable_view(request.prompt);
     const auto& token_ids = data.token_ids;
     const std::uint32_t lane = static_cast<std::uint32_t>(active_lane_);
@@ -7972,7 +8004,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     lane_state.cached_prompt_tokens.assign(token_ids.begin(), token_ids.end());
     lane_state.cached_media.assign(prompt_media.begin(), prompt_media.end());
     // The generated span is anchored from here on: the prefill's own boundaries stop at this end.
-    lane_state.next_generated_checkpoint = prompt_tokens + kReuseGeneratedTailStride;
+    lane_state.next_generated_checkpoint = next_generated_grid(prompt_tokens);
     for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
         lane_state.cached_boundaries[slot] = snapshot_at[slot];
     }
@@ -8486,6 +8518,23 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // output policy only ever commits a prefix of what it is shown.
         const std::uint32_t remaining = request.budget.remaining();
         if (step.size() > remaining) { step.resize(remaining); }
+        // Cut the window so the round stops exactly on the prefill grid. The anchors behind an
+        // answer can only be written where the frontier stands, and only a grid multiple survives
+        // the scan's registration rule; a speculative round here commits several tokens at a time
+        // and steps over most multiples, which left every answer without an anchor and put the
+        // following turn back at the prompt end. The tokens cut here are drafted again next round,
+        // so the committed stream is unchanged - acceptance is a prefix decision, not a schedule.
+        // The walk names its frontier one short of the generated count (the last sampled token is
+        // not forwarded), so the position to land on is computed from that name, not from the
+        // count.
+        if (const std::uint32_t grid = prefill_chunk_width(shard_a_.model->config().text);
+            grid != 0 && !request.generated.empty()) {
+            const std::uint32_t label =
+                prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;
+            const std::uint32_t target = next_generated_grid(label);
+            const std::uint32_t needed = target - label;
+            if (needed < step.size()) { step.resize(needed); }
+        }
         const OutputDecision decision =
             request.output.preview_model(step, remaining, request.budget.limit_reason());
         if (decision.accepted_tokens == 0 || decision.accepted_tokens > step.size()) {
@@ -8589,21 +8638,23 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         // Decode advances the frontier, and a later turn that re-renders the answer it was handed
         // stops matching inside this generated span. Prefill leaves no boundary here, so without
         // these writes the deepest checkpoint behind a replayed answer sits at the prompt end and
-        // the whole answer is re-prefilled. Write the position grid the prefill writes, at the
-        // frontier this round actually committed - the same count the final publish names - so the
-        // loss a replay cannot avoid is bounded by one stride instead of by the answer. The draft
-        // image has to describe the frontier the checkpoint names, so hand it the pending window
-        // first; the final boundary is skipped because the prompt-end checkpoint and the live state
-        // both already hold it.
-        if (host_checkpoint_stride_ != 0 && !finished) {
+        // the whole answer is re-prefilled. Write at the prefill grid the scan will accept, one
+        // anchor per chunk of generated tokens, knowing the round was cut so the frontier lands on
+        // the multiple. The draft image has to describe the frontier the checkpoint names, so hand
+        // it the pending window first. The round that finishes the answer is included: when it
+        // stopped on a multiple that multiple is the deepest boundary behind the answer, and the
+        // prompt-end role image and the live state name the frontier, a different position unless
+        // the answer ended on the grid.
+        {
             const std::uint32_t committed_frontier =
                 prompt_tokens + static_cast<std::uint32_t>(request.generated.size()) - 1U;
-            if (committed_frontier >= next_host_checkpoint) {
-                flush_dflash_context(committed_frontier);
-                snapshot_host_pair(committed_frontier, lane);
-
-                next_host_checkpoint =
-                    (committed_frontier / host_checkpoint_stride_ + 1U) * host_checkpoint_stride_;
+            std::uint32_t& next = retention(lane).next_generated_checkpoint;
+            if (next != 0 && committed_frontier >= next) {
+                if (committed_frontier == next) {
+                    flush_dflash_context(committed_frontier);
+                    snapshot_host_pair(committed_frontier, lane);
+                }
+                next = next_generated_grid(committed_frontier);
             }
         }
     }
@@ -8628,18 +8679,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
         session_publish(history, frontier, data.context_cache, prompt_media, lane);
     }
     // Only now are the checkpoints decode wrote usable, on the same terms as the prefill's: their
-    // state is one this walk committed and their KV prefix is one it wrote. A walk that threw
-    // before this point leaves them invalid, so a torn round can never be recalled.
-    {
-        Shard* const shards[2] = {&shard_a_, &shard_b_};
-        for (Shard* shard : shards) {
-            for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.prefill_id == lane_state.host_checkpoint_live_id) {
-                    checkpoint.valid = true;
-                }
-            }
-        }
-    }
+    // state is one this walk committed and their KV prefix is one it wrote. Stamping is part of
+    // becoming usable - the scan refuses an image that cannot prove which prefix it froze - and the
+    // prefill-time publish ran before any of these positions existed, so this pass is where the
+    // answer's own anchors acquire their identity. A walk that threw before this point leaves them
+    // invalid, so a torn round can never be recalled.
+    publish_lane_checkpoints(lane, token_ids, request.generated);
     // The catalog now names the frontier the device stopped at, the ring holds this walk's own
     // checkpoints and the live shortcut is honest, so record that and hand a recorded transport
     // failure back to the caller: the request failed, the reusable prefix did not.
