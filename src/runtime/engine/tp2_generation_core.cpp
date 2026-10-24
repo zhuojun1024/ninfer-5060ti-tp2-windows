@@ -2665,6 +2665,10 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
                 }
             }
         }
+        // Retiring the description is not retiring the slot: an image the ring has just cleared but
+        // the ledger still holds is pressure with nothing behind it, and enough of those make the
+        // pool report itself exhausted while holding no usable image at all.
+        if (reuse_ledger_ != nullptr) { reuse_ledger_->retract_past(key, shared_prefix); }
         // Every image this lane can reach is registered in the ledger, which then makes the one
         // decision. Registration replaces the old "take the deepest" scan; the order below is the
         // priority that scan used, so an equal position still resolves to the same source.
@@ -7522,6 +7526,12 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
                     checkpoint.valid = false;
                 }
             }
+        }
+        // Retiring the description is not retiring the slot: a slot the ring has cleared and the
+        // ledger still holds is pressure with nothing behind it, and enough of those make the pool
+        // report itself exhausted while holding no usable image at all.
+        if (reuse_ledger_ != nullptr) {
+            reuse_ledger_->retract_past(conversation_key(lane), shared_prefix);
         }
         // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
         // and KV beside it are this prompt's own prefix - which the shared prefix above proves -

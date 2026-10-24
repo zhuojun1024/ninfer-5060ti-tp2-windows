@@ -143,6 +143,12 @@ public:
     ConversationLog& conversation(std::uint64_t session);
     // Drops a conversation and releases every slot it owned.
     void forget(std::uint64_t session);
+    // Retracts the anchors of one conversation that sit past `position`, with their slots. A prompt
+    // that stops agreeing with a lineage makes every deeper image of it unreachable forever, and
+    // the ring retires those images - but retiring the description is not the same as giving the
+    // slot back. A slot the ring has cleared and the ledger still holds is pressure with nothing
+    // behind it: the pool reports itself exhausted while holding no usable image at all.
+    void retract_past(std::uint64_t session, std::uint32_t position);
     [[nodiscard]] std::size_t conversation_count() const noexcept { return conversations_.size(); }
 
     struct AnchorRequest {

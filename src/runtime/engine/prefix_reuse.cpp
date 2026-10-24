@@ -90,6 +90,23 @@ void ReuseLedger::forget(std::uint64_t session) {
     conversations_.erase(found);
 }
 
+void ReuseLedger::retract_past(std::uint64_t session, std::uint32_t position) {
+    const auto found = conversations_.find(session);
+    if (found == conversations_.end()) { return; }
+    std::vector<std::uint32_t> stale;
+    for (const Anchor& anchor : found->second.anchors.all()) {
+        if (anchor.position > position) { stale.push_back(anchor.position); }
+    }
+    for (const std::uint32_t at : stale) {
+        const std::optional<Anchor> erased = found->second.anchors.erase_at(at);
+        if (erased == std::nullopt || erased->slot < 0) { continue; }
+        const std::size_t index = static_cast<std::size_t>(erased->slot);
+        if (index >= holders_.size()) { continue; }
+        drop_hold(index, session);
+        if (holders_[index].empty()) { free_slot(index); }
+    }
+}
+
 void ReuseLedger::hold_slot(std::size_t slot, std::uint64_t session) {
     std::vector<std::uint64_t>& holders = holders_[slot];
     if (std::find(holders.begin(), holders.end(), session) == holders.end()) {
