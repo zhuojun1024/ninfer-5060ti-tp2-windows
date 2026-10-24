@@ -764,8 +764,13 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // Evicting the conversation that recall just served puts the anchor its walk froze on X's slabs
     // in front of the next conversation of the family.
     (void)run(engine, family_aside2);
-    const std::uint32_t family_anchor =
-        grid_floor(static_cast<std::uint32_t>(family_block.size()) - kDivergenceMargin);
+    // A bare token prompt names no message boundary, so the frontend reports no leading-instruction
+    // frontier and the walk freezes no block image for X: the entry can only carry its own history,
+    // and this conversation shares none of it. Zero is the honest answer here, and it is what pins
+    // that an invalidated ring image cannot be handed out in place of one. The block itself is
+    // exercised where a client really produces one, through the chat frontend: see
+    // check_shared_block_recall.
+    constexpr std::uint32_t family_anchor          = 0;
     const ninfer::GenerationResult family_w2_first = run(engine, family_w2);
     if (family_w2_first.reused_prompt_tokens != family_anchor) {
         return fail(label,
@@ -1208,6 +1213,131 @@ int check_image_equals_a_cold_prefix(const char* artifact, int device_a, int dev
     return 0;
 }
 
+// A stable block that outlives the conversation that wrote it, in the shape a client really sends:
+// every request of the family opens with the same system message, and nothing else about them
+// agrees. The position where that block ends is the frontend's leading-instruction frontier, which
+// is what the walk freezes a state image at and what the catalog then carries - the path a raw
+// token prompt cannot reach, because a bare token list names no message boundary.
+//
+// X writes the block, an unrelated probe and an aside take the pools away from it, and then two new
+// conversations open with the same block. Both are recalled on the block, and both have to produce
+// the cold walk's own answer: standing on a boundary the conversation did not walk is the failure
+// this whole file exists to keep out.
+int check_shared_block_recall(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("shared block (") + route_name(route) + ")";
+
+    auto block_text = [] {
+        std::string text;
+        for (int line = 0; line < 40; ++line) {
+            text += "Ledger rule " + std::to_string(line) +
+                    ": every entry is dated, numbered, and cross-referenced to the shelf it came "
+                    "from; an entry without a shelf is returned to the clerk who wrote it. ";
+        }
+        return text;
+    };
+    auto system = [](const std::string& text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::System;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto ask = [](const std::string& text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        message.parts.push_back(std::move(part));
+        return message;
+    };
+    auto prepare_for = [](ninfer::Engine& engine, std::vector<ninfer::ChatMessage> messages) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = false;
+        input.messages                = std::move(messages);
+        return engine.prepare(std::move(input));
+    };
+    ninfer::RequestOptions request            = greedy_request();
+    request.execution.requested_output_tokens = 8;
+
+    const std::string block                          = block_text();
+    const std::vector<ninfer::ChatMessage> opening   = {system(block), ask("Open a shelf for me.")};
+    std::vector<ninfer::ChatMessage> probe_history   = {system("Answer in one word."),
+                                                        ask("What is the weather in Reykjavik?")};
+    std::vector<ninfer::ChatMessage> aside_history   = {system("Count silently."),
+                                                        ask("Count to five.")};
+    std::vector<ninfer::ChatMessage> first_of_family = {
+        system(block), ask("Open a shelf for the second archive.")};
+    std::vector<ninfer::ChatMessage> second_of_family = {
+        system(block), ask("Open a shelf for the third archive.")};
+
+    // The cold answers first, in their own engine: the pair cannot hold two models at once, and the
+    // comparison has to be against a walk that never saw this block.
+    std::vector<TokenId> cold_first;
+    std::vector<TokenId> cold_second;
+    {
+        ninfer::Engine oracle(engine_options(artifact, device_a, device_b, false, route));
+        cold_first =
+            oracle.generate(prepare_for(oracle, first_of_family), request).generated_token_ids;
+        (void)oracle.generate(prepare_for(oracle, aside_history), request);
+        cold_second =
+            oracle.generate(prepare_for(oracle, second_of_family), request).generated_token_ids;
+    }
+
+    ninfer::Engine engine(engine_options(artifact, device_a, device_b, true, route));
+    const ninfer::GenerationResult opening_turn =
+        engine.generate(prepare_for(engine, opening), request);
+    if (opening_turn.reused_prompt_tokens != 0) {
+        return fail(label, "the conversation that carries the block reused " +
+                               std::to_string(opening_turn.reused_prompt_tokens) +
+                               " prompt tokens");
+    }
+    // Two unrelated requests: the first pushes the block's conversation into its host slabs, the
+    // second proves the block had to survive as a stored boundary rather than as a resident
+    // lineage.
+    (void)engine.generate(prepare_for(engine, probe_history), request);
+    (void)engine.generate(prepare_for(engine, aside_history), request);
+
+    const ninfer::GenerationResult first_reuse =
+        engine.generate(prepare_for(engine, first_of_family), request);
+    if (first_reuse.reused_prompt_tokens == 0) {
+        return fail(label, "a new conversation opening with the stored block re-prefilled it");
+    }
+    if (first_reuse.reused_prompt_tokens % kChunkWidth != 0) {
+        return fail(label, "the first conversation of the family reused " +
+                               std::to_string(first_reuse.reused_prompt_tokens) +
+                               " prompt tokens, which is not on the walk's chunk grid");
+    }
+    if (first_reuse.generated_token_ids != cold_first) {
+        return fail(label,
+                    "a conversation recalled on the shared block diverged from the oracle: got " +
+                        tokens_text(first_reuse.generated_token_ids) + " expected " +
+                        tokens_text(cold_first));
+    }
+    const ninfer::GenerationResult second_reuse =
+        engine.generate(prepare_for(engine, second_of_family), request);
+    if (second_reuse.reused_prompt_tokens < first_reuse.reused_prompt_tokens) {
+        return fail(label, "the second conversation of the family reused " +
+                               std::to_string(second_reuse.reused_prompt_tokens) +
+                               " prompt tokens, fewer than the " +
+                               std::to_string(first_reuse.reused_prompt_tokens) +
+                               " the first one found");
+    }
+    if (second_reuse.generated_token_ids != cold_second) {
+        return fail(
+            label,
+            "a second conversation recalled on the shared block diverged from the oracle: got " +
+                tokens_text(second_reuse.generated_token_ids) + " expected " +
+                tokens_text(cold_second));
+    }
+    std::cout << "TP-2 shared block (" << label << ") passed: two new conversations reused "
+              << first_reuse.reused_prompt_tokens << " and " << second_reuse.reused_prompt_tokens
+              << " tokens of the stored block and matched the cold walk\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1272,6 +1402,11 @@ int main() {
             // `NINFER_IMAGE_BLOCK` sweeps the depth by hand; the gate runs the default one.
             if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
                                                                     devices.second, route);
+                status != 0) {
+                return status;
+            }
+            if (const int status =
+                    check_shared_block_recall(artifact, devices.first, devices.second, route);
                 status != 0) {
                 return status;
             }
