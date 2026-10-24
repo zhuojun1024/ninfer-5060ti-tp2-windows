@@ -1223,7 +1223,21 @@ attention 对 padding 行 mask、**GDN 递推不推进 padding 行**、**KV 不�
 实（12 处成对调用全部改用）。修好之后三个深度都复现冷走查，`switch` 的计数与 oracle 比较也一起通过；`burst` 那条
 长期"通过"的 512 复用其实踩在这个坏槽上，现在改为落回 prefill 真正写下的 256。
 
-**五、`switch` 的输出分岔不是边界选择问题。** 计数修好后该场景暴露
+**五、池饥饿的两条独立原因（`ad59870e`）。** 一个 1089 token 的提示词实测复用 0，追下去是两件事叠在一起：
+
+1. **锚点规划按位置而不是按身份跳过**：`block_anchor`/`anchor_divergence` 的守卫是
+   `!has_valid_host_checkpoint_at(position)`——只要该位置上有**任何**有效镜像就不写了。而 store 与
+   `capture_lane_anchor_frozen` 都是按"写它的那次 prefill"去找这个锚点，所以别的对话在同一位置留下的镜像
+   并不是本次 prefill 的状态，跳过写入等于让 entry 拿不到块边界。现在规划出来的锚点照写。
+2. **作废的镜像不还槽**：扫描把共享前缀之后的镜像标成 `valid = false`，但 ledger 仍占着那些槽；预留失败时也不
+   向环核对到底哪些槽还有内容。于是 11 个槽全部 `used`、`valid` 为 0，池子报"满"却一张可用镜像都没有。现在
+   `reserve_image_slot` 失败前会与环核对一次，把镜像已消失的槽收回来（`force_release`），与
+   `retract_past` 一起保证"作废即归还"。
+
+修完的两侧证据：家族的分歧锚点回到 512，named-block 的 1089 token 提示词复用 1024，新增的 shared block 检查
+复用 1536 且与冷走查逐 token 一致；plain / mtp / dflash2 三条路线全绿。
+
+**六、`switch` 的输出分岔不是边界选择问题。** 根因已由 §18.7 第四条的镜像槽位修复解决（`158cfb43`）——此处保留当时的判据。计数修好后该场景曾暴露
 
 ```
 got      [1703 220 16 15 15 …]
