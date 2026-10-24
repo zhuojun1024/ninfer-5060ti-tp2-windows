@@ -518,7 +518,7 @@ and the other two joined mid-flight at `admit slot=2/3`.
 | P1 | Add queue time to the TTFT accounting | Measurement | Multi-lane latency data becomes usable | Low | **Implemented**: `ttft`/`total` start from core acceptance, the same accounting as `| queue`. §8.8 |
 | P2 | Shrink the output budget dynamically by the remaining amount / page reclamation | VRAM/concurrency | Measured 64 pages = 66 MiB/card idle occupancy | Medium | **Analyzed, not changed**: breaks the all-or-nothing reservation invariant and would introduce mid-flight growth deadlock. §8.6 |
 | P2 | Fix the 262,144/C=1 guidance in docs/serving.md | Documentation | Avoids misleading deployments | Low | **Implemented**: and filled in the 1/2/3/4/6/7 descriptions. §8.9 |
-| P2 | Switch the speculative batch chain to a per-lane envelope (after confirming the acceptance attribution) | Throughput | MTP C≥2 per-lane acceptance rate | Medium | **Implemented (numerical consistency)**: each column in-batch is bit-identical to standalone decode (new parity regression test); the acceptance-rate gain did not reproduce, plain decode is neutral. §8.7 |
+| P2 | Switch the speculative batch chain to a per-lane envelope (after confirming the acceptance attribution) | Throughput | MTP C≥2 per-lane acceptance rate | Medium | **Implemented (numerical consistency, op-level)**: the causal attention op returns each column bit-identically to the same column run alone (new parity test); the acceptance-rate gain did not reproduce and plain decode is neutral. A *whole* decode round across different batch shapes still differs at near ties - see §8.7's scope note. §8.7 |
 | P3 | Batched prefill (needs a new ragged large-T multi-sequence kernel + a larger workspace) | TTFT balance | Only balances lane completion time; aggregate throughput ceiling 1.34× | Very high | **Measurement confirms not doing it**: with attention batch>1 each lane's width ≤ 16 and GDN must record+fold; the measured batch window W=16/B=4 = 1.24 ms/lane-token vs single-lane 1024-chunk 0.587 ⇒ **2.1× slower** (breaking even needs W≈300). §9.4 |
 | P3 | Make the host checkpoint ring pageable / reduce slots | Host memory | Saves GiB-level pinned host memory | Low-medium | **Implemented**: ring slots changed to pageable, saving 5.29 GiB of page-locked memory across two cards; under the same harness the recall request is +10 ms (within noise). §9.5 |
 | — | Move card 2 to a CPU-attached Gen5 x8 slot | Hardware | prefill ceiling + decode AR | Hardware swap | Not done |
@@ -677,6 +677,18 @@ differing from standalone decoding of the same column.
 A new regression test `run_batch_single_parity_case` (tests/ops/softmax_attention/causal_cache.cpp,
 batch=4 / width=4 / context=4100 / EXACT envelope) pins down "in-batch lane == run alone" bit-for-bit equality:
 new ops PASS (`nvfp4 mae=0.00536884`, `k8v4 mae=0.0053744`, no regression against the tolerance oracle), old ops FAIL.
+
+**Scope of that parity, established 2026-10-24.** The regression test pins the *op*: within one batched
+call, a column is bit-identical to what the same column computes alone at that batch shape. It does not
+pin a whole decode round across *different* batch shapes, and the engine does not promise that. Four
+identical requests submitted together never share a shape in the first place: admission is serial and
+`pump_decode_round` runs between one lane's prefill chunks, so the round grows 1 → 2 → 3 → 4 as the
+lanes join (observable with `NINFER_TP2_LANE_TRACE=1`, which prints `[tp2-lane] round columns=… slots=…`).
+The first four samples agree, then a near tie flips, because the remaining shape-dependent kernels are
+the ones whose tiling follows the column count. `test_tp2_lanes.cpp` used to assert bitwise equality
+across those shapes; it now asserts the first token, which the common prefill shape does guarantee, and
+leaves the logit-level duplicate control in `test_tp2_forward.cpp` to cover the case that is observable.
+
 
 **But the acceptance rate showed no reproducible gain** (same harness, same-generation A/B, the only difference being the 6 files under src/ops):
 
