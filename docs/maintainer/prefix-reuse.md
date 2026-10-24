@@ -1,10 +1,12 @@
 # TP-2 前缀复用层重设计
 
-状态：**记账与决策层已实现**（阶段 0–2），执行层改造与删除清单未开工。已落地部分：`runtime/engine/prefix_reuse.h`
-的 `ConversationLog`/`Anchor`/`ReuseLedger`（阶段 1，提交 `123a93b6`）、`decide()` 接管 core 的复用决策
-（提交 `96f017ee`，行为中性，与出厂 v0.1.2 在同一捕获上逐位一致）、lane 局部边界图与 `RecallState::Boundary`
-（提交 `fd9d6ded`）。§14.1 的六项决策保持不变；§15、§16 给出文件划分、纯函数边界与测试处置。本文只覆盖 prefix reuse 的
-**记账与锚点层**；prefill 执行、Program、图捕获、KV page 物理合同和协议层不在范围内。
+状态：**阶段 0–2 已实现；执行层已改接到 ledger，§13 的删除清单大部分已落地**（未删项与理由见 §13 各条，剩余项见 §19）。
+已落地部分：`runtime/engine/prefix_reuse.h` 的 `ConversationLog`/`Anchor`/`ReuseLedger`（阶段 1，提交 `123a93b6`）、
+`decide()` 接管 core 的复用决策（提交 `96f017ee`，行为中性，与出厂 v0.1.2 在同一捕获上逐位一致）、lane 局部
+边界图与 `RecallState::Boundary`（提交 `fd9d6ded`）；此后执行层（两份扫描、walk 的取点、宿主镜像池、session
+catalog 的 store/recall）都改为向 ledger 取槽与取决策，`§18.7` 记录了这一路的四个缺陷与它们的修复。§14.1 的六项
+决策保持不变；§15、§16 给出文件划分、纯函数边界与测试处置。本文只覆盖 prefix reuse 的**记账与锚点层**；
+prefill 执行、Program、图捕获、KV page 物理合同和协议层不在范围内。
 
 实测证据与夹具脚本放在工作区 `_temp/`（`20261022-1515_phase0.ps1` 及捕获目录），属于本地复现材料、不入库；
 文中引用的行号以提交 `fd9d6ded` 为准。最终的归属仍是
@@ -1251,5 +1253,24 @@ expected [1703 220 15 15 15 15 …]
 上面第四条把这个分岔变成了可单点判定的问题：既然 512 那块在"序列对齐"的实验里是精确的，而 256 / 1024 不是，
 那么 §15 那条"缓存不改变答案"的契约是否成立就不是一句话能定的——它取决于镜像路径的这个缺陷。**先修缺陷，
 再谈契约**：如果修好之后所有深度都精确，契约成立；如果只有部分深度精确，再按 fixed-shape tiles 或收窄承诺处理。
+
+**结论**：缺陷是槽位索引（见本条前文），修好之后三个深度都精确，`switch`、`family`、named-block 全部与冷走查一致。
+
+## 19. 剩余项（2026-10-24）
+
+实现与验证完成之后，仍然开口的三件事，按优先级：
+
+1. **fixed-shape tiles**。`kPrefillChunkMaximum = 1024` 决定了 prompt ≤ 1024 时整条提示词是单个 tile，其归约形状随总
+   长度变化，所以"任意边界都可复用且逐位一致"只对网格上的边界成立。消除它需要在 `prefill_impl` 里对 padding 行做
+   attention mask、GDN 不推进、KV 不写、logits 只取最后真实行。`check_image_equals_a_cold_prefix` 是这条工作的验收工具。
+2. **§13 的容量推导仍在沿用旧的按角色配额**：`host_checkpoint_divergence_slots_`/`block_slots_`/`tail_slots_`/
+   `grid_slots_` 仍是槽数与 stride 的来源（`host_checkpoint_stride_` 由"每张镜像覆盖多少 token"反推）。§7.1 的目标是
+   stride 固定、张数由需求反推，这里还没改；改它需要先确定池容量与 stride 的显式规则。
+3. **两份扫描的重复**：批量路径的 `scan_lane_reuse` 与 walk 自己的取点循环是两段平行实现（§13 最后一条）。本轮
+   两次修复都必须在两处同时改，这是它们迟早会分叉的证据。收敛成一份是明确的重构项。
+
+另有一条与本文无关的红：`ninfer_qwen3_5_tp2_lanes_test` 的"同一 prompt 四条 lane 必须逐 token 一致"断言失败
+（lane 1–3 互相一致，lane 0 不同；该场景 `allow_reuse = false`，不经过本文的任何路径），属于批调度/归约形状
+的独立问题，需要单独定位。
 
 ---
