@@ -473,24 +473,20 @@ TP2GenerationCore::TP2GenerationCore(const EngineOptions& options, int device_a,
         // whatever the lane count. The batch executors recall into their own lane (Stage 1d), so
         // the ring is live at every lane count.
         if (host_slots != 0) {
-            host_checkpoint_divergence_slots_ = kReuseDivergenceCheckpointCount;
-            host_checkpoint_block_slots_      = kReuseBlockCheckpointCount;
-            const std::uint32_t total = host_slots + host_checkpoint_divergence_slots_ +
-                                        host_checkpoint_block_slots_;
-            host_checkpoint_slots_per_lane_ = std::max(1U, total / lanes_);
-            const std::uint32_t per_lane = host_checkpoint_slots_per_lane_;
-            const std::uint32_t fixed =
-                host_checkpoint_divergence_slots_ + host_checkpoint_block_slots_;
-            const std::uint32_t flexible = per_lane > fixed ? per_lane - fixed : 0U;
-            host_checkpoint_tail_slots_ =
-                std::max(1U, std::min(kReuseTailCheckpointCount, flexible / 2U));
-            const std::uint32_t used = fixed + host_checkpoint_tail_slots_;
-            host_checkpoint_grid_slots_ = per_lane > used ? per_lane - used : 1U;
-            const std::uint32_t per_slot =
-                (options_.max_context + host_checkpoint_grid_slots_ - 1U) /
-                host_checkpoint_grid_slots_;
-            const std::uint32_t rounded  = (per_slot + 127U) / 128U * 128U;
-            host_checkpoint_stride_      = std::max(kReuseCheckpointStride, rounded);
+            // One pool, sized by the images the configuration asks for. The role counts that used
+            // to be reserved ahead of time (grid, tail, divergence, block) allocated nothing the
+            // pool could not hand out itself - they only shaped when an image is written - and
+            // reserving them made the stride a function of the slot count, which is backwards: the
+            // stride is the resolution the reuse layer promises, so it is fixed and the number of
+            // images follows from the context that is served.
+            //
+            // A request may freeze one image of each role beyond its grid points, and a role image
+            // that cannot find a slot is a boundary the configuration promised and lost, so the
+            // pool carries that much on top of the configured images.
+            const std::uint32_t role_slots =
+                kReuseDivergenceCheckpointCount + kReuseBlockCheckpointCount;
+            host_checkpoint_slots_per_lane_ = std::max(1U, (host_slots + role_slots) / lanes_);
+            host_checkpoint_stride_         = kReuseCheckpointStride;
             // The decision layer owns the positions and allocates the slots; the ring below owns
             // the images. The rotation pool spans the per-lane slices, and the prompt-end images
             // get their own tail of the ring: reserving one of those is a role, not an address, so
@@ -3428,8 +3424,7 @@ void TP2GenerationCore::execute_plain_batch(
     // the tail sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one
     // chunk of the prompt end.
     const std::uint32_t tail_span =
-        std::min<std::uint32_t>(kReuseTailWindow,
-                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
+        std::min<std::uint32_t>(kReuseTailWindow, prefill_chunk * kReuseTailCheckpointCount);
 
     Tp2RoundTiming& timing = tp2_timing();
     timing.init();
@@ -4279,8 +4274,7 @@ void TP2GenerationCore::execute_spec_batch(
     // the tail sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one
     // chunk of the prompt end.
     const std::uint32_t tail_span =
-        std::min<std::uint32_t>(kReuseTailWindow,
-                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
+        std::min<std::uint32_t>(kReuseTailWindow, prefill_chunk * kReuseTailCheckpointCount);
     // DFlash2 and MTP each propose their own draft count, so one verify window is a column wider.
     // Both rounds are batched (P2.1b); only the live route's count is non-zero.
     const std::int32_t width =
@@ -5064,7 +5058,7 @@ void TP2GenerationCore::execute_spec_batch(
             // already holds the prefill's last chunk ends, so these anchors cost no extra slot; the
             // draft half has to reach the frontier the anchor names, exactly as the grid write in
             // the serial walk makes it, or a restore refuses the checkpoint.
-            if (host_checkpoint_tail_slots_ != 0 && !decision.finished()) {
+            if (!decision.finished()) {
                 const std::uint32_t frontier = lane.position - 1U;
                 std::uint32_t& next          = retention(lane.slot).next_generated_checkpoint;
                 if (next != 0 && frontier >= next) {
@@ -7784,8 +7778,7 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // sub-ring, so a narrow chunk cannot flood the ring with anchors that all sit within one chunk of
     // the prompt end.
     const std::uint32_t tail_span =
-        std::min<std::uint32_t>(kReuseTailWindow,
-                                prefill_chunk * std::max(1U, host_checkpoint_tail_slots_));
+        std::min<std::uint32_t>(kReuseTailWindow, prefill_chunk * kReuseTailCheckpointCount);
     std::array<std::uint32_t, kReuseSnapshotCount> snapshot_at{};
     snapshot_at[0] = prompt_tokens;
     // Rewind snapshots sit on the walk's own chunk boundaries, which are fixed by `reuse`,

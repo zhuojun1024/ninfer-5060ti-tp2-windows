@@ -1166,26 +1166,16 @@ private:
     // Host checkpoint ring: the token stride between checkpoints (0 disables the ring, which is
     // what a zero host state-image budget selects), and the next id to hand out. Which checkpoints
     // are usable is decided per request by Shard::HostCheckpoint::valid, not by the id.
-    // Decode width this core was provisioned for (tp2-plan-concurrency.md P1.2).
-    std::uint32_t lanes_                      = 1;
-    std::uint32_t host_checkpoint_stride_     = 0;
-    std::uint32_t host_checkpoint_tail_slots_ = 0;
-    // Grid slots in one lane's slice of the ring (the whole ring at lanes=1).
-    std::uint32_t host_checkpoint_grid_slots_ = 0;
+    std::uint32_t lanes_                  = 1;
+    std::uint32_t host_checkpoint_stride_ = 0;
     // Each lane owns this many ring slots, and a slot holds one compact single-lane state image, so
     // the pinned footprint is the lanes=1 budget whatever the lane count
-    // (tp2-plan-concurrency.md 12.6).
+    // (tp2-plan-concurrency.md 12.6). One pool: a boundary of any role takes a slot in it, and the
+    // role counts the ring used to reserve only ever shaped when an image is written.
     std::uint32_t host_checkpoint_slots_per_lane_ = 0;
-    std::uint64_t host_checkpoint_next_id_    = 1;
+    std::uint64_t host_checkpoint_next_id_        = 1;
     // Host-ring writes of the request being served, reported by the NINFER_TP2_TIMING trace.
-    std::uint64_t prefill_host_writes_        = 0;
-    // Slots appended to the end of every shard's ring for the divergence anchor, the stable block's
-    // own anchor and one prompt-end image per lane. They sit outside the configured
-    // --host-state-images budget: the anchors answer a different question than the position grid, and
-    // carving them out of the grid would coarsen the stride that covers the whole context. They cost
-    // pinned host memory only.
-    std::uint32_t host_checkpoint_divergence_slots_ = 0;
-    std::uint32_t host_checkpoint_block_slots_      = 0;
+    std::uint64_t prefill_host_writes_ = 0;
     // Prefix-reuse bookkeeping: the positions this core can restart from, and the one place that
     // decides between them. The images themselves still live in the host ring; the ledger tracks
     // their positions and slots, so the decision has a single authority (prefix_reuse.h). Null when
