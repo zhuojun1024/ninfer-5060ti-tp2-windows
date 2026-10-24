@@ -1258,19 +1258,29 @@ expected [1703 220 15 15 15 15 …]
 
 ## 19. 剩余项（2026-10-24）
 
-实现与验证完成之后，仍然开口的三件事，按优先级：
+**已完成的两项清理（2026-10-24）**：
 
-1. **fixed-shape tiles**。`kPrefillChunkMaximum = 1024` 决定了 prompt ≤ 1024 时整条提示词是单个 tile，其归约形状随总
-   长度变化，所以"任意边界都可复用且逐位一致"只对网格上的边界成立。消除它需要在 `prefill_impl` 里对 padding 行做
-   attention mask、GDN 不推进、KV 不写、logits 只取最后真实行。`check_image_equals_a_cold_prefix` 是这条工作的验收工具。
-2. **§13 的容量推导仍在沿用旧的按角色配额**：`host_checkpoint_divergence_slots_`/`block_slots_`/`tail_slots_`/
-   `grid_slots_` 仍是槽数与 stride 的来源（`host_checkpoint_stride_` 由"每张镜像覆盖多少 token"反推）。§7.1 的目标是
-   stride 固定、张数由需求反推，这里还没改；改它需要先确定池容量与 stride 的显式规则。
-3. **两份扫描的重复**：批量路径的 `scan_lane_reuse` 与 walk 自己的取点循环是两段平行实现（§13 最后一条）。本轮
-   两次修复都必须在两处同时改，这是它们迟早会分叉的证据。收敛成一份是明确的重构项。
+- **两份扫描合一**（`0ec844d5`）。批量路径的 `scan_lane_reuse` 与 walk 的内联取点是同一问题的两份实现，且已经分叉
+  （指纹比的是不同的谱系，规则只改了一边）。walk 现在用自己 lane 的历史调用同一份扫描，注册可达锚点、ledger 决策、
+  报告来源是同一段代码。合并暴露了两处隐性耦合：扫描曾顺带写 `reuse_boundary_target`（批量路径用它做一次额外的分块
+  切割，walk 的分块循环也读它，于是共享扫描会改变 walk 的 chunk 形状，破坏与冷走查的逐位一致）；以及"清空锚点表"不能
+  同时释放它命名的槽（环里镜像还在、紧接着的注册会重新持有，而一次失败走查留下的镜像正是下一轮要站立的地方——释放它
+  会把 256 的复用变成 0）。前者归位到批量调用方，后者保持"只换表、不换所有权"。
+- **固定 stride 与单一池**（`95587ab2`）。宿主环原本按旧子环的方式给自己配额：先给分歧锚点、块锚点和 tail 各留一份，
+  再拿剩下的槽反推 grid 张数，最后由张数反推 stride。它喂的分配器是池化的，配额什么也没买到，而且依赖方向反了——
+  stride 是复用层承诺的分辨率，应当固定，张数才该由服务上下文反推。现在池 = 配置张数 + 每个请求可能冻结的角色张数，
+  stride 就是常量；tail 窗口仍有自己的计数，但它是关于边界网格的陈述（提示词末尾最后几个 chunk 端点，不超过配置窗口），
+  不再是某个子环的份额。
+
+仍然开口的一件事：
+
+**fixed-shape tiles**。`kPrefillChunkMaximum = 1024` 决定了 prompt ≤ 1024 时整条提示词是单个 tile，其归约形状随总
+长度变化，所以"任意边界都可复用且逐位一致"只对网格上的边界成立。消除它需要在 `prefill_impl` 里对 padding 行做
+attention mask、GDN 不推进、KV 不写、logits 只取最后真实行。`check_image_equals_a_cold_prefix` 是这条工作的验收工具。
 
 另有一条与本文无关的红：`ninfer_qwen3_5_tp2_lanes_test` 的"同一 prompt 四条 lane 必须逐 token 一致"断言失败
 （lane 1–3 互相一致，lane 0 不同；该场景 `allow_reuse = false`，不经过本文的任何路径），属于批调度/归约形状
 的独立问题，需要单独定位。
 
+---
 ---
