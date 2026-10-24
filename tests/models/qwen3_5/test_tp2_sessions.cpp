@@ -764,13 +764,12 @@ int run_scenario(const char* artifact, int device_a, int device_b, Route route) 
     // Evicting the conversation that recall just served puts the anchor its walk froze on X's slabs
     // in front of the next conversation of the family.
     (void)run(engine, family_aside2);
-    // A bare token prompt names no message boundary, so the frontend reports no leading-instruction
-    // frontier and the walk freezes no block image for X: the entry can only carry its own history,
-    // and this conversation shares none of it. Zero is the honest answer here, and it is what pins
-    // that an invalidated ring image cannot be handed out in place of one. The block itself is
-    // exercised where a client really produces one, through the chat frontend: see
-    // check_shared_block_recall.
-    constexpr std::uint32_t family_anchor          = 0;
+    // The anchor the first conversation of the family froze where the block ends, kept with its
+    // entry's slabs. It sits a margin behind the block and on the walk's chunk grid, which is why
+    // the block is sized for that (528 - 16 = 512): the ring only hands out boundaries a
+    // from-scratch walk of the same prompt would cut.
+    const std::uint32_t family_anchor =
+        grid_floor(static_cast<std::uint32_t>(family_block.size()) - kDivergenceMargin);
     const ninfer::GenerationResult family_w2_first = run(engine, family_w2);
     if (family_w2_first.reused_prompt_tokens != family_anchor) {
         return fail(label,

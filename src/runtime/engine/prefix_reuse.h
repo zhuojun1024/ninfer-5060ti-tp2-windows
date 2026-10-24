@@ -149,6 +149,11 @@ public:
     // slot back. A slot the ring has cleared and the ledger still holds is pressure with nothing
     // behind it: the pool reports itself exhausted while holding no usable image at all.
     void retract_past(std::uint64_t session, std::uint32_t position);
+    // Takes a slot back whatever names it, for a caller that knows the image it holds is gone. The
+    // ring is the authority on whether a slot's bytes are still worth anything: once it has retired
+    // an image, an anchor that still names that slot keeps a dead byte range out of circulation,
+    // and enough of them starve the pool while every image in it is unusable.
+    void force_release(std::int32_t slot);
     [[nodiscard]] std::size_t conversation_count() const noexcept { return conversations_.size(); }
 
     struct AnchorRequest {

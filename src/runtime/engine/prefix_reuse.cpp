@@ -107,6 +107,16 @@ void ReuseLedger::retract_past(std::uint64_t session, std::uint32_t position) {
     }
 }
 
+void ReuseLedger::force_release(std::int32_t slot) {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= used_slots_.size()) { return; }
+    const std::size_t index = static_cast<std::size_t>(slot);
+    // A role slot is the caller's, not the pool's: it is handed out by index and never rotated, so
+    // taking it back here would hand the same role to two writers.
+    if (index >= budget_.capacity) { return; }
+    if (!used_slots_[index]) { return; }
+    free_slot(index);
+}
+
 void ReuseLedger::hold_slot(std::size_t slot, std::uint64_t session) {
     std::vector<std::uint64_t>& holders = holders_[slot];
     if (std::find(holders.begin(), holders.end(), session) == holders.end()) {

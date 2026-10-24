@@ -2812,34 +2812,28 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
     std::uint32_t block_frontier) {
     RetentionState& lane_state = retention(lane);
     LaneAnchors anchors;
-    // A checkpoint that already sits on a boundary stays untouched, which is what keeps a reused
-    // A checkpoint that already sits on a boundary stays untouched, which is what keeps a reused
-    // stable prefix free of work: the state the anchor would freeze is one the ring already holds.
-    const auto has_valid_host_checkpoint_at = [lane](const Shard& shard, std::uint32_t position) {
-        for (const auto& checkpoint : shard.host_checkpoints) {
-            if (checkpoint.valid && checkpoint.writer == static_cast<std::int32_t>(lane) &&
-                checkpoint.position == position) {
-                return true;
-            }
-        }
-        return false;
-    };
-    // Divergence anchor. shared_prefix is where this prompt stopped matching the lineage it
-    // inherited, and the next new session - or the next context compression - renders the same stable
-    // block and diverges in the same place, so it is the one position a later request is already
-    // known to want. Freezing the state there lets that request restart on the boundary instead of at
-    // the grid point behind it. The anchor sits kReuseDivergenceMargin tokens *before* the observed
-    // divergence rather than on it: the next pair can report a shared prefix a token or two shorter,
-    // and an anchor on the exact index would be pruned before it could ever be used. Only a frontier
-    // strictly inside this prefill is worth freezing: at or below reuse the prefill's own starting
-    // state is already checkpointed, and at the prompt end the device snapshot holds it.
+    // A checkpoint that already sits on a boundary used to suppress the anchor: the state the
+    // anchor would freeze was one the ring already held. That is only true when the image at that
+    // position describes *this* prefix. The store and the frozen capture both look the anchor up by
+    // the prefill that wrote it, so an image another conversation left at the same position is not
+    // that state - it is a different history that happens to end there - and suppressing the write
+    // left this conversation's entry with no block boundary at all. Divergence anchor.
+    // shared_prefix is where this prompt stopped matching the lineage it inherited, and the next
+    // new session - or the next context compression - renders the same stable block and diverges in
+    // the same place, so it is the one position a later request is already known to want. Freezing
+    // the state there lets that request restart on the boundary instead of at the grid point behind
+    // it. The anchor sits kReuseDivergenceMargin tokens *before* the observed divergence rather
+    // than on it: the next pair can report a shared prefix a token or two shorter, and an anchor on
+    // the exact index would be pruned before it could ever be used. Only a frontier strictly inside
+    // this prefill is worth freezing: at or below reuse the prefill's own starting state is already
+    // checkpointed, and at the prompt end the device snapshot holds it.
     //
     // The anchor does not always belong to the conversation the prefill was recalled from. A prompt
     // that only opens with a stable block is served by the shallowest image still reachable, while
-    // the entry whose history actually carries that block can share far more with it - and it offers
-    // no recall at all, because every boundary it holds sits past the shared prefix. The block's end
-    // still has to be frozen on it: that entry is the one the next conversation of the family is
-    // recalled from, and a ring slot does not survive the evictions a session slab does.
+    // the entry whose history actually carries that block can share far more with it - and it
+    // offers no recall at all, because every boundary it holds sits past the shared prefix. The
+    // block's end still has to be frozen on it: that entry is the one the next conversation of the
+    // family is recalled from, and a ring slot does not survive the evictions a session slab does.
     std::uint32_t anchor_prefix = shared_prefix;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         const SessionEntry& entry = sessions_[index];
@@ -2877,9 +2871,7 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
     }
     anchors.anchor_session    = lane_state.anchor_session;
     anchors.anchor_divergence = host_checkpoint_stride_ != 0 && anchors.anchor_position > reuse &&
-                                anchors.anchor_position < prompt_tokens &&
-                                !has_valid_host_checkpoint_at(shard_a_, anchors.anchor_position) &&
-                                !has_valid_host_checkpoint_at(shard_b_, anchors.anchor_position);
+                                anchors.anchor_position < prompt_tokens;
     // Block anchor. The prompt names where its own leading instruction block ends, and the prefill
     // that walks it is the only one that can freeze the state there: the block is what every
     // conversation of the same agent re-renders, but the first conversation that shares it is the one
@@ -2899,9 +2891,7 @@ TP2GenerationCore::LaneAnchors TP2GenerationCore::plan_lane_anchors(
         anchors.block_position = reuse + ((anchors.block_position - reuse) / prefill_chunk) * prefill_chunk;
     }
     anchors.block_anchor = host_checkpoint_stride_ != 0 && anchors.block_position > reuse &&
-                           anchors.block_position < prompt_tokens &&
-                           !has_valid_host_checkpoint_at(shard_a_, anchors.block_position) &&
-                           !has_valid_host_checkpoint_at(shard_b_, anchors.block_position);
+                           anchors.block_position < prompt_tokens;
     return anchors;
 }
 
@@ -7234,8 +7224,24 @@ void TP2GenerationCore::snapshot_host_pair(std::uint32_t frontier, std::uint32_t
     // halves different indices, and the peer then restored whatever its ring happened to hold
     // there. Every image in the pool is held by an anchor that refused eviction: the capture is
     // skipped, and the caller already tolerates a boundary without a checkpoint.
-    const std::int32_t reserved = prompt_end ? reuse_ledger_->reserve_prompt_end_slot(lane)
-                                             : reuse_ledger_->reserve_image_slot();
+    std::int32_t reserved = prompt_end ? reuse_ledger_->reserve_prompt_end_slot(lane)
+                                       : reuse_ledger_->reserve_image_slot();
+    if (reserved == kNoSlot && !prompt_end) {
+        // Every slot is named by an anchor that refused eviction. Some of those anchors name images
+        // the ring has already retired - a scan clears a description but cannot free the slot the
+        // ledger handed out - and a slot whose image is gone is worth nothing to anyone. Reconcile
+        // once against the ring and try again: the alternative is a pool that reports itself full
+        // while holding no usable image at all, which is what starves a long-lived engine.
+        bool reclaimed = false;
+        for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
+            if (shard_a_.host_checkpoints[index].valid) { continue; }
+            const std::int32_t slot = static_cast<std::int32_t>(index);
+            if (!reuse_ledger_->holds_slot(slot)) { continue; }
+            reuse_ledger_->force_release(slot);
+            reclaimed = true;
+        }
+        if (reclaimed) { reserved = reuse_ledger_->reserve_image_slot(); }
+    }
     if (reserved == kNoSlot) {
         if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
             std::fprintf(stderr, "[tp2-cp] skip lane=%u pos=%u pool exhausted\n", lane, frontier);
