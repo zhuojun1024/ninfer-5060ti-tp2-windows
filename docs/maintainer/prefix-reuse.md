@@ -454,6 +454,11 @@ register(log, history_prefix, anchors):
 同时排除的假设（探针实测）：ring 不写入、publish 不发布、扫描失效循环清空、`session_invalidate_active`、状态随请求重建、
 FP8 AllReduce（`NINFER_TP2_AR_CODEC=bf16` 后所有复用数字一位不差，只有模型输出长度变化）。
 
+> **本段已被取代（2026-10-24，§19.2）**：下面描述的按 lane 边界图与 `RecallState::Boundary` 已删除。它的捕获点不在
+> prefill 的 tile 网格上，经由它的召回会切出与冷走查不同的 chunk；引入它的提交自述"恢复在 logits 精度内等价、并非逐位
+> 相同"，换来的是 21K 提示词上 137 个 token。分歧锚点（`anchor_divergence`，网格定位、由 ledger 决策）覆盖同一需求。
+> 本段保留作为当时的判断记录。
+
 **第 2 步：已实现（与本段原计划的差异在此对齐）**。原计划把镜像放在 `SessionEntry` 上（按会话），实施后改为**按 lane**。
 
 问题本身没变：prompt 在 10,240（共享块）与 11,228（上一轮 prompt 末）之间仍有一段与历史一致，而那里没有状态镜像，
