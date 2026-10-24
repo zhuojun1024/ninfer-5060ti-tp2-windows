@@ -966,10 +966,21 @@ private:
         // Why the scan ended where it did, carried out of it so the plan summary can report the
         // decision the ledger made rather than re-deriving it from the chosen position.
         ReuseReason reuse_reason = ReuseReason::NoAnchorAtOrBefore;
+        // Host images whose stamp does not describe this prompt's prefix. Reported so a fingerprint
+        // that starts refusing everything is visible in the trace rather than only as a smaller
+        // reuse number.
+        std::size_t refused_fingerprint = 0;
     };
+
     // Scans this lane's own lineage for the deepest boundary at or before the shared prefix, tags
     // the checkpoints the coming prefill will write, and records the source in the lane's retention
-    // state. Everything it reads is per lane, so two lanes in one batch never see each other's state.
+    // state. Everything it reads is per lane, so two lanes in one batch never see each other's
+    // state.
+    //
+    // One scan, two callers: the batched prefill and the walk both ask this question, and a rule
+    // added to one copy was a rule the other did not have. That is how a boundary the walk would
+    // never stand on reached the batched route first, and why both fixes so far had to be written
+    // twice.
     [[nodiscard]] LaneReuse scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> token_ids,
                                             std::span<const MediaSpan> media,
                                             std::uint32_t prompt_tokens, std::size_t replay_split,

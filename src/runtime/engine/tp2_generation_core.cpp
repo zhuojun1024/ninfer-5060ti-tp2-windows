@@ -2647,12 +2647,7 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         // what tells them apart, and a boundary that would keep KV from another picture is not this
         // prompt's to reuse.
         shared_prefix = media_prefix_cap(lane_state.cached_media, media, shared_prefix);
-        // The position this prompt stops agreeing with what the lane held. The prefill freezes the
-        // state there so the next request restarts from it instead of from the shared block boundary,
-        // which is 350 tokens earlier on every turn.
-        lane_state.reuse_boundary_target   = static_cast<std::uint32_t>(shared_prefix);
-        lane_state.reuse_boundary_captured = false;
-        const std::uint64_t key            = conversation_key(lane);
+        const std::uint64_t key = conversation_key(lane);
         // A checkpoint is only this prompt's while the lineage agrees on the tokens before it, so a
         // checkpoint past the shared prefix can never become usable again. Only this conversation's
         // images are retracted: another conversation's image at the same position belongs to its
@@ -2672,6 +2667,10 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         // Every image this lane can reach is registered in the ledger, which then makes the one
         // decision. Registration replaces the old "take the deepest" scan; the order below is the
         // priority that scan used, so an equal position still resolves to the same source.
+        // The table is replaced, not the ownership: a slot this conversation already holds stays
+        // held, because the ring still carries its image and the registration below claims it
+        // again. Dropping the holds here would retire images this very prefill just wrote - the
+        // ones a failed walk leaves behind are exactly what the next turn has to stand on.
         ConversationLog& conversation = reuse_ledger_->conversation(key);
         conversation.anchors.clear();
         // Only the part this prompt agrees with is comparable, and the media identity already
@@ -2766,6 +2765,8 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
             }
         }
     }
+    result.shared_prefix       = static_cast<std::uint32_t>(shared_prefix);
+    result.refused_fingerprint = refused_fingerprint;
     if (trace) {
         std::size_t valid_checkpoints = 0;
         for (const auto& checkpoint : shard_a_.host_checkpoints) {
@@ -3857,6 +3858,17 @@ void TP2GenerationCore::execute_plain_batch(
         const LaneReuse lane_reuse =
             scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens,
                             adoption.divergence, adoption.adopted, reuse_trace);
+        // The position this prompt stops agreeing with the lane history. The batched prefill cuts
+        // the chunk that would step over it so the state it freezes sits on an exact token
+        // boundary. It belongs to this route rather than to the scan: the serial walk plans the
+        // same boundary as a grid anchor, and a scan that wrote it for both would cut the walk
+        // chunks at a position its from-scratch oracle never cuts.
+        if (const RetentionState& scanned = retention(lane_id);
+            scanned.cached_state_valid && !scanned.cached_prompt_tokens.empty()) {
+            RetentionState& writable         = retention(lane_id);
+            writable.reuse_boundary_target   = lane_reuse.shared_prefix;
+            writable.reuse_boundary_captured = false;
+        }
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -5219,6 +5231,17 @@ void TP2GenerationCore::execute_spec_batch(
         const LaneReuse lane_reuse =
             scan_lane_reuse(lane_id, token_ids, prompt_media, lane.prompt_tokens,
                             adoption.divergence, adoption.adopted, reuse_trace);
+        // The position this prompt stops agreeing with the lane history. The batched prefill cuts
+        // the chunk that would step over it so the state it freezes sits on an exact token
+        // boundary. It belongs to this route rather than to the scan: the serial walk plans the
+        // same boundary as a grid anchor, and a scan that wrote it for both would cut the walk
+        // chunks at a position its from-scratch oracle never cuts.
+        if (const RetentionState& scanned = retention(lane_id);
+            scanned.cached_state_valid && !scanned.cached_prompt_tokens.empty()) {
+            RetentionState& writable         = retention(lane_id);
+            writable.reuse_boundary_target   = lane_reuse.shared_prefix;
+            writable.reuse_boundary_captured = false;
+        }
         const std::uint32_t reuse          = lane_reuse.tokens;
         std::uint32_t next_host_checkpoint = lane_reuse.next_host_checkpoint;
         // The two anchors the serial walk plans, on this lane's own chunk grid: the boundary a later
@@ -7494,121 +7517,17 @@ GenerationResult TP2GenerationCore::execute_walk(Request& request, OutputSink* s
     // wrote, and the state snapshots hold the matching GDN states, so a prompt that extends the
     // previous prompt can skip the shared prefix and prefill only its suffix. The single-device
     // route gets this from the context cache; TP-2 runs with that cache disabled, so the core keeps
-    // the boundaries it already owns. The deepest boundary at or before the shared prefix wins; the
-    // final prompt token is always forwarded, because its logits drive the first sample.
-    std::uint32_t reuse       = 0;
-    std::size_t reuse_slot    = 0;
-    // Host images whose stamp does not describe this prompt's prefix; they are never taken, and the
-    // count is reported so a fingerprint that starts refusing everything is visible in the trace.
-    std::size_t refused_fingerprint     = 0;
-    std::size_t shared_prefix = 0;
-
-
-
-    lane_state.reuse_source             = ReuseSource::None;
-    if (lane_state.cached_state_valid && !lane_state.cached_prompt_tokens.empty()) {
-        const std::size_t common = std::min(lane_state.cached_prompt_tokens.size(), token_ids.size());
-        while (shared_prefix < common &&
-               lane_state.cached_prompt_tokens[shared_prefix] == token_ids[shared_prefix]) {
-            ++shared_prefix;
-        }
-        // Token ids cannot see media: every image merges to the same placeholder ids, so two prompts
-        // showing different pictures compare equal above. Cap the boundary at the first media item
-        // whose identity differs, or the reuse would keep KV written for another picture.
-        shared_prefix = media_prefix_cap(lane_state.cached_media, prompt_media, shared_prefix);
-        // A host checkpoint is a state plus the KV before it, and both are only this prompt's while
-        // the lineage agrees on the tokens before it: the state was taken over the tokens of the
-        // prompt that wrote it, and every prefill since kept the KV consistent only up to the prefix
-        // it reused. The shared prefix of the last pair is therefore the bound for every older
-        // frontier, and a checkpoint past it can never become usable again - a later prompt would
-        // have to match a token this one already diverged from. Prune on that bound, then take the
-        // deepest survivor. Older checkpoints matter: a prefill that only walked the last few tokens
-        // of a fully reused prompt leaves no checkpoint of its own.
-        Shard* const shards[2] = {&shard_a_, &shard_b_};
-        for (Shard* shard : shards) {
-            for (auto& checkpoint : shard->host_checkpoints) {
-                if (checkpoint.writer == static_cast<std::int32_t>(lane) &&
-                    checkpoint.position > shared_prefix) {
-                    checkpoint.valid = false;
-                }
-            }
-        }
-        // Retiring the description is not retiring the slot: a slot the ring has cleared and the
-        // ledger still holds is pressure with nothing behind it, and enough of those make the pool
-        // report itself exhausted while holding no usable image at all.
-        if (reuse_ledger_ != nullptr) {
-            reuse_ledger_->retract_past(conversation_key(lane), shared_prefix);
-        }
-        // Every boundary the lineage can offer, deepest wins. Any of them is usable while the state
-        // and KV beside it are this prompt's own prefix - which the shared prefix above proves -
-        // and a boundary inside a prefill chunk is no exception: the suffix this walk chunks from
-        // it rounds differently from a from-scratch walk, so the two can part at an exact logit
-        // tie. That is the tolerance a bounded recall has always had, and why a recall owes a
-        // from-scratch walk its boundary crossing rather than its whole trajectory. Rounding down
-        // to the prefill grid instead would re-prefill up to a whole chunk on every turn of a
-        // conversation that continues in place - the common agent case. Decode writes the position
-        // grid too (see the decode loop), so a boundary now exists inside the answer this lineage
-        // generated as well; what no boundary inside it can offer is a restart *after* a replay
-        // that does not describe this turn.
-        //
-        // The masked draft stays live on such a boundary as well. Its ring belongs to the walk that
-        // froze it, so it proposes the block that walk would have proposed; the draft only
-        // proposes, and the target verify licenses every emitted token either way. A boundary is
-        // only this walk's own state where the walk's chunk grid puts it.
-        const std::uint32_t chunk_width = prefill_chunk_width(shard_a_.model->config().text);
-        const auto take = [&](std::uint32_t position, std::size_t slot, ReuseSource source) {
-            if (position == 0 || position > shared_prefix || position >= prompt_tokens ||
-                position <= reuse) {
-                return;
-            }
-            // A host image is only usable where the lane's pages hold its prefix: a recall that
-            // restored a shallower boundary leaves nothing under a deeper image.
-            if (source == ReuseSource::HostCheckpoint && position > lane_state.device_kv_limit) {
-                return;
-            }
-            if (position % chunk_width != 0) { return; }
-            reuse         = position;
-            reuse_slot    = slot;
-            lane_state.reuse_source = source;
-        };
-        // The live GDN state is the deepest boundary a continued conversation can offer: it sits
-        // exactly at the resident entry's frontier, and the device KV holds the whole history before
-        // it. Reusing it copies nothing at all - but only a prompt that extends it has a column to
-        // forward, and the final prompt token must still be forwarded to produce the logits that
-        // drive the first sample.
-        if (lane_state.live_state_valid && lane_state.active_session != kNoSession) {
-            take(sessions_[lane_state.active_session].frontier, 0, ReuseSource::LiveState);
-        }
-        for (std::size_t slot = 0; slot < kReuseSnapshotCount; ++slot) {
-            // A slot the host ring serves has no device plane; the same boundary is offered below
-            // through its checkpoint instead.
-            if (shard_a_.state_snapshots[slot].data == nullptr) { continue; }
-            take(lane_state.cached_boundaries[slot], slot, ReuseSource::DeviceSnapshot);
-        }
-        const std::span<const TokenId> lineage(lane_state.cached_prompt_tokens.data(),
-                                               lane_state.cached_prompt_tokens.size());
-        for (std::size_t index = 0; index < shard_a_.host_checkpoints.size(); ++index) {
-            auto& checkpoint = const_cast<Shard::HostCheckpoint&>(shard_a_.host_checkpoints[index]);
-            if (!checkpoint.valid || checkpoint.prompt_end) { continue; }
-            // The ledger owns the pool, the ring only owns the bytes: a slot it released names a
-            // buffer that no longer holds this image.
-            if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(index))) {
-                checkpoint.valid = false;
-                continue;
-            }
-            // Any lane's image, but only this conversation's: the KV under a boundary was written
-            // by the prefill that froze it, and a from-scratch walk of the same tokens chunks
-            // differently. The stamp then has to describe *this* prefix as well - a slot can hold
-            // another conversation's image at the same position, and an image that was never
-            // stamped proves nothing.
-            if (checkpoint.history_hash == 0 ||
-                checkpoint.history_hash != prefix_fingerprint(lineage, checkpoint.position)) {
-                ++refused_fingerprint;
-                continue;
-            }
-            take(checkpoint.position, index, ReuseSource::HostCheckpoint);
-        }
-    }
+    // the boundaries it already owns.
+    //
+    // The scan belongs to the batched route, and the walk calls it with its own lane history: one
+    // implementation of one rule, so a boundary the walk refuses is refused by the batch as well.
+    const LaneReuse reuse_scan =
+        scan_lane_reuse(lane, token_ids, prompt_media, prompt_tokens,
+                        static_cast<std::size_t>(adoption.divergence), adoption.adopted, false);
+    const std::uint32_t reuse             = reuse_scan.tokens;
+    const std::size_t reuse_slot          = reuse_scan.slot;
+    const std::size_t refused_fingerprint = reuse_scan.refused_fingerprint;
+    const std::size_t shared_prefix       = reuse_scan.shared_prefix;
     if (prefill_trace) { scan_done = Clock::now(); }
     if (reuse_trace) {
         std::size_t valid_checkpoints = 0;
