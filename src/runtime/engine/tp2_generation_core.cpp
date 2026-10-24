@@ -3634,6 +3634,18 @@ void TP2GenerationCore::execute_plain_batch(
         }
         position_arena(ws_a, shard_a_.round_base, shard_a_.round_base);
         position_arena(ws_b, shard_b_.round_base, shard_b_.round_base);
+        // Which lanes share this round, and at what positions. The column count is part of a
+        // decode's numerical path, so two requests that arrive together can legitimately decode
+        // differently from one that arrived a round earlier - reporting the composition is what
+        // makes that visible instead of looking like a lane mixing another lane's columns.
+        if (lane_trace_enabled()) {
+            std::fprintf(stderr, "[tp2-lane] round columns=%d slots=", columns);
+            for (std::size_t column = 0; column < active.size(); ++column) {
+                std::fprintf(stderr, "%s%zu@%u", column == 0 ? "" : ",", active[column],
+                             lanes[active[column]].position);
+            }
+            std::fprintf(stderr, "\n");
+        }
         auto scope_a = ws_a.scope();
         auto scope_b = ws_b.scope();
         shard_a_.device.bind_to_current_thread();
