@@ -29,7 +29,10 @@ inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 // maximum image/video resolution for device memory instead of rejecting oversized media.
 inline constexpr std::uint32_t kMaximumVisionItemTokens = 16'384;
 inline constexpr std::uint32_t kMinimumVisionItemTokens = 2'048;
-inline constexpr std::uint32_t kDefaultHostStateImages    = 8;
+// A state image every eight thousand tokens covers 64K of prompt plus 64K of generation, which is
+// the workload the reuse layer is sized for: docs/maintainer/prefix-reuse.md 7.1 derives the number
+// from the stride, not from a memory ceiling, and 8 images only ever covered 40K.
+inline constexpr std::uint32_t kDefaultHostStateImages    = 20;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {

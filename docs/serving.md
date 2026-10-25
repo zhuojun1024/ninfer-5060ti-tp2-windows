@@ -975,7 +975,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-images N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-images N` | Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, that ring is pageable so it spends no page-lock budget, and the core adds one slot of its own for the divergence anchor | `8` |
+| `--host-state-images N` | Host StateImage capacity; on the TP-2 route it sizes the generation core's prefix-reuse checkpoint ring instead of a context cache, that ring is pageable so it spends no page-lock budget, and the core sizes it at `lanes * ceil((N + 2) / lanes) + lanes` images: the `+2` are the divergence and stable-block images and the `+lanes` are the prompt-end images, one per lane. Size it from the context served, not from host memory (prefix-reuse.md 7.1) | `20` |
 | `--host-kv-mib N` | shared Host Main/Backend KV byte capacity in MiB; the backing is pageable, so the OS may evict it | `8192` |
 | `--host-kv-pinned` | pin the Host KV backing for faster transfers; a refused pin falls back to pageable | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |

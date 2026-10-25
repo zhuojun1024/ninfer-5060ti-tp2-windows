@@ -2701,6 +2701,14 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         std::vector<Reachable> reachable;
         const auto offer = [&](std::uint32_t position, std::uint32_t slot, ReuseSource source,
                                AnchorStorage storage) {
+            // Two bounds, and they mean different things. `shared_prefix` is the identity bound the
+            // ledger decides on: `position == prompt_tokens` is a legal hit there - the whole prompt
+            // is already processed and the request degenerates into pure decode (prefix-reuse.md
+            // 4.1) - and `decide()` does return it. `prompt_tokens` here is the *executor's* bound:
+            // this walk produces the first token's logits in its last prefill chunk, so a hit at the
+            // prompt end would leave it with nothing to sample from. Measured: removing this bound
+            // makes the scan offer exactly that hit and the walk faults right after it (§19.10), so
+            // the hit is declined until the executor can forward the last token itself.
             if (position == 0 || position > shared_prefix || position >= prompt_tokens) { return; }
             // Only a position on the walk's chunk grid is a state this walk would compute
             // identically: a chunk's rows carry the reduction shape of the chunk's own width, and
@@ -3154,6 +3162,28 @@ void TP2GenerationCore::invalidate_lane_prefill(std::uint32_t lane) {
     lane_state.cached_boundaries.fill(0);
     lane_state.device_kv_limit  = RetentionState::kNoDeviceKvLimit;
     lane_state.live_state_valid = false;
+    // The images this prefill wrote are unpublished and will never be published. Their slots are
+    // still reserved for them, and the reconcile in `snapshot_host_pair` - the only path that takes
+    // such a slot back - reads `prefill_id == the lane's live id` as "a prefill is writing this
+    // right now" and skips them. The live id is only handed out by the scan, and the scan does not
+    // run while `cached_state_valid` is false, so a prefill that failed after filling the pool would
+    // leave the whole ring unreachable until this lane completed a later request. The failure is
+    // known exactly here, so drop the tag and the reservation now.
+    if (reuse_ledger_ != nullptr && lane_state.host_checkpoint_live_id != 0) {
+        const std::uint64_t live = lane_state.host_checkpoint_live_id;
+        for (Shard* shard : {&shard_a_, &shard_b_}) {
+            for (std::size_t slot = 0; slot < shard->host_checkpoints.size(); ++slot) {
+                Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
+                if (checkpoint.prefill_id != live || checkpoint.valid) { continue; }
+                checkpoint.prefill_id   = 0;
+                checkpoint.position     = 0;
+                checkpoint.history_hash = 0;
+                // A role slot (the prompt-end image) is addressed by role, not by the pool, so the
+                // ledger never handed it to this prefill through the rotation path.
+                reuse_ledger_->force_release(static_cast<std::int32_t>(slot));
+            }
+        }
+    }
     session_invalidate_active(lane);
 }
 
@@ -5842,9 +5872,14 @@ std::uint64_t TP2GenerationCore::conversation_key(std::uint32_t lane) const {
     // A request that named a session shares one conversation with every lane that serves it, so a
     // session that comes back on another lane still finds its own images. One that named nothing
     // gets a key of its own, which keeps its images out of every other lane's scan.
-    return state.active_session != kNoSession
-               ? static_cast<std::uint64_t>(state.active_session)
-               : (0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane));
+    if (state.active_session != kNoSession && state.active_session < sessions_.size()) {
+        const SessionEntry& entry = sessions_[state.active_session];
+        // The key is the entry's own, not its index: `session_drop` erases an entry and shifts every
+        // later index, so an index key would hand this conversation the log of a dropped one - and
+        // leave the dropped one's holds in the pool forever (nothing calls `forget` for it).
+        if (entry.ledger_key != 0) { return entry.ledger_key; }
+    }
+    return 0x8000'0000'0000'0000ULL | static_cast<std::uint64_t>(lane);
 }
 
 void TP2GenerationCore::session_invalidate_active(std::uint32_t lane) {
@@ -5866,6 +5901,13 @@ void TP2GenerationCore::session_invalidate_all() {
 
 void TP2GenerationCore::session_drop(std::size_t index) {
     if (index >= sessions_.size()) { return; }
+    // The ledger keys a conversation by its own identity, so the entry that leaves takes its log -
+    // and the holds that log carries on the pool's slots - with it. Without this the slots stay
+    // reserved for images nothing can name any more, and the ring reports itself full while holding
+    // fewer usable images every time the catalog churns (prefix-reuse.md 19.11).
+    if (reuse_ledger_ != nullptr && sessions_[index].ledger_key != 0) {
+        reuse_ledger_->forget(sessions_[index].ledger_key);
+    }
     sessions_.erase(sessions_.begin() + static_cast<std::ptrdiff_t>(index));
     // Every lane's claim on a catalog entry is an index into the same vector, so each one has to be
     // told the vector shifted. Both the resident claim and the comparison anchor are adjusted: the
@@ -7113,8 +7155,9 @@ void TP2GenerationCore::session_publish(
     SessionEntry entry;
     entry.tokens.assign(history.begin(), history.end());
     entry.media.assign(media.begin(), media.end());
-    entry.frontier  = frontier;
-    entry.lru_clock = ++session_lru_clock_;
+    entry.frontier   = frontier;
+    entry.lru_clock  = ++session_lru_clock_;
+    entry.ledger_key = ++session_ledger_key_;
     bind_entry_session(entry, *published_hints);
     sessions_.push_back(std::move(entry));
     lane_state.active_session = sessions_.size() - 1;

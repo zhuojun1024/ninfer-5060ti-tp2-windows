@@ -406,6 +406,11 @@ private:
         // has to stay inside. Zero means no slab holds this entry.
         std::uint32_t host_kv_end = 0;
         std::uint64_t lru_clock   = 0;
+        // This entry's key in the reuse ledger's conversation map. The index into `sessions_` is not
+        // one: `session_drop` erases an entry and every later index shifts, so a key that was an index
+        // would hand a new conversation the log of a dropped one (and the dropped one's image holds
+        // would never be released). The key is assigned once and outlives the shift.
+        std::uint64_t ledger_key = 0;
     };
     static constexpr std::size_t kNoSession = static_cast<std::size_t>(-1);
 
@@ -1137,6 +1142,9 @@ private:
     // history while its GDN state sits at that entry's frontier (live_state_valid).
     std::vector<SessionEntry> sessions_;
     std::uint64_t session_lru_clock_ = 0;
+    // Source of `SessionEntry::ledger_key`. One is never reused, so a key cannot name a conversation
+    // that has already left the ledger.
+    std::uint64_t session_ledger_key_ = 0;
     // Entries the catalog accepts, resident ones included. Zero disables session retention, which
     // is what a zero host KV budget selects.
     std::size_t session_capacity_    = 0;

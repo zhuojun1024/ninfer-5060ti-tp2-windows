@@ -130,6 +130,16 @@ Anchor {
   淘汰。命中算白赚，没命中与今天完全一致。
 - 依据：单个共享前缀最多省下 `前缀 token / 1,687` 秒；8 个会话共享 6K token 约 28 s，2K 以下属噪音。为一个噪音级
   收益引入"钉住 + 两级淘汰"，成本正好落在 §7.1 最脆弱的预算模型上。
+
+**实现现状（2026-10-25 核对）**：本节与 §4.2/§6 描述的身份机制**没有按原样实现**，实际取代它的是 §18 的环上 FNV
+全前缀指纹——`Anchor` 没有 `ContentKey`，`decide()` 没有 `donors` 形参，`shared_index` 只存在于本节和第 210 行的
+伪代码里。因此：
+
+- 跨会话共享靠的是"另一条 lane 的镜像指纹与本 prompt 的前缀相同就能 offer"，而不是
+  `shared_index` 查表；命中率一样，实现少一层索引。
+- **指纹只覆盖 token**（两段 token 相同、媒体不同的 prompt 哈希相同），所以媒体安全落在调用方的
+  `media_prefix_cap` 上；`ConversationLog::media` 至今没有写入点。任何人要单看指纹做 offer，必须先把这条补上
+  （见 §19.11 的债条目）。
 - 升级条件（写进阶段 4）：如果 `[reuse]` 行统计出的跨会话命中率非零且重算代价可观，再把它提升为 `policy=Pinned`
   的一档独立预算。在此之前不写这段策略。
 
@@ -220,7 +230,8 @@ decide(log, incoming):
 
 **没有"候选超出 prompt"这个原因**：候选是"≤ shared 的最深锚点"，而 shared ≤ prompt 长度，所以它不可能越界——
 第一版实现里写了这个分支，单测证明它恒为假，已删除。反过来，`reuse == prompt 长度` 是**合法**的（整段已处理过，
-请求退化成纯 decode），所以不能加 `>=` 形式的保护。
+请求退化成纯 decode），所以**记账层**不能加 `>=` 形式的保护。这一条只约束 `decide()`：TP-2 的执行器目前还需要
+一个 prefill chunk 来产出第一个 token，所以它在扫描那一层会拒绝整段命中——原因、实测与后续修法见 §19.10。
 
 `shared_index` 是 §4.4 的全局 key → 锚点索引。它是**可选命中**，不参与正确性判断；因此它慢或失效只会让命中率
 下降，不会让任何请求变错。
@@ -266,7 +277,7 @@ decide(log, incoming):
   实际形状是"每个 stride 一张 + 尾部一小段稠密"），超出覆盖范围的分歧退回 `PromptEnd`（本次付全价）。日志报
   `cover=<tokens>` 与 `degraded=window_truncated`。契约永远成立，只是适用范围收缩，而且收缩是一个可直接读的数。
 - **反向方案被否决**：把间距放大到刚好铺满上下文。以 256K 提示 + 256K 生成为例：36 张时 `stride` 会变成
-  ≈15,887（9.4 s），默认 8 张时 ≈104,858（62 s）。那种配置形式上"覆盖了全部上下文"，实际把最坏代价抬高一倍到
+  ≈15,887（9.4 s），旧默认 8 张时 ≈104,858（62 s）。那种配置形式上"覆盖了全部上下文"，实际把最坏代价抬高一倍到
   十几倍，还会让延迟随内存参数漂移。
 
 ### 7.2 可见性：位置已提交即可见
@@ -686,8 +697,9 @@ context cache 的通用容量（TP-2 上它实际只管 prefix-reuse 的镜像�
   都直接写 `host_state_slots`，必须同一次改完；
 - `[mem]` 行改为**一行报总数**，不再 per-shard 打印（用户关心的是总内存）：
   `[mem] host state images 20 x 146.8 MiB = 2.9 GiB (pageable)`；
-- `docs/serving.md`：第 16-17 行的示例命令、976-977 行的参数表（顺带删掉"the core adds one slot of its own for
-  the divergence anchor"，那个 `+1` 在新模型里不存在）、`docs/maintainer/resource-scheduling-and-context-cache.md`；
+- `docs/serving.md`：第 16-17 行的示例命令、`--host-state-images` 那一行参数表（顺带删掉"the core adds one slot of its
+  own for the divergence anchor"，那个 `+1` 在新模型里不存在，改成 `lanes * ceil((N + 2) / lanes) + lanes` 的真实公式）、
+  `docs/maintainer/resource-scheduling-and-context-cache.md`；
 - `tools/win_port/serve.ps1` 目前并不传这个参数，因此不需要改；`_temp/` 下的复现脚本随任务清理，不跟改。
 
 **已执行**：代码、公共头文件、测试与当前权威文档已按上表改名；`--help` 显示 `--host-state-images N` / `--device-state-images N`。
@@ -704,7 +716,7 @@ context cache 的通用容量（TP-2 上它实际只管 prefix-reuse 的镜像�
 
 | 问题 | 决定 | 依据 |
 |---|---|---|
-| 采样间距是否随内存预算缩放 | **否**。`stride=8192` 是契约，张数反推，余额不足显式降级（§7.1） | 缩放会把最坏代价从 4.9 s 抬到 9.4 s（36 张）或 62 s（默认 8 张，256K 场景），并让 TTFT 依赖内存参数 |
+| 采样间距是否随内存预算缩放 | **否**。`stride=8192` 是契约，张数反推，余额不足显式降级（§7.1） | 缩放会把最坏代价从 4.9 s 抬到 9.4 s（36 张）或 62 s（旧默认 8 张，256K 场景），并让 TTFT 依赖内存参数 |
 | 历史段（网格）的 stride 是否也契约化 | **是**，同样固定 8192（§7 第 3/4 条） | 一个会话只该有一种采样粒度；代价是 256K+256K 需要 67 张 ≈9.6 GiB，属明确的资源决策，已接受 |
 | 是否跨会话共享锚点 | **构造上免费，不设策略**：key 即内容、KV 归锚点、不 pin、不做独立预算（§4.4） | 收益 = 前缀 token / 1,687 秒；6K 前缀 × 8 会话 ≈ 28 s，2K 以下属噪音。pin 策略的成本落在最脆弱的预算模型上 |
 | 内存参数怎么命名 | `--host-state-images` / `--device-state-images`，按"张"计；`--host-kv-mib` 保持 MiB（§13.1） | 状态镜像是定长的（146.8 MiB/张），张数才是用户能对上内存的单位；`slots` 是内部索引，不该出现在 CLI |
@@ -1660,3 +1672,57 @@ length"。
 场景故意把容量压到 6：16,640 token 的一次 prefill 要写 9 张，最后两张 16,128 / 16,384 被跳过，所以"只增长"那一步
 的复用落在 15,872）。生产档 34 槽 ≥ 一次 165k 冷 prefill 的 ~28 张（20 网格 + 8 尾部），不会触发；要彻底消除得让
 写入路径在"自己这次 prefill 已发布"的图上也能淘汰，属于后续优化，不影响本条的结论。
+
+### 19.10 「整段命中」在 TP-2 上不可执行（2026-10-25，限制已记录）
+
+§4.1 说「`reuse == prompt 长度` 是**合法**的（整段已处理过，请求退化成纯 decode），所以不能加 `>=` 形式的保护」——
+那句话约束的是 **ledger 的 `decide()`**，它确实照做了：一个 token 不差地重发同一份 prompt（或客户端把历史截断在
+某张 stride 图上，长度恰好等于该图位置）时，扫描会算出 `shared == prompt_tokens`、`decide()` 返回那个位置。
+
+**但执行层跑不了**。TP-2 的 prefill 在**最后一个 chunk 里**采样第一个输出 token，没有 chunk 就没有 logits：
+
+- 把 `offer()` 的 `position >= prompt_tokens` 去掉后实测：扫描正确给出 `reuse=16384`（prompt 也是 16384），
+  紧接着 walk 在采样处**访问越界崩溃**（`0xC0000005`），日志停在那一行 `[tp2-reuse]` 之后。
+- 所以那行守卫是**执行层的约束**，不是记账层的：它表达的是"本执行器至少需要一个 chunk 才能产出第一个 token"。
+  现在它带着这条注释留在 `scan_lane_reuse` 里。
+- 代价：重发同一份 prompt 时要重算最后一个 chunk 之下的部分——实际落到 `floor(prompt) - chunk`（回归场景
+  `full-prompt-hit`：16,384 token 的 prompt 站在 16,128）。真正修掉要给 walk 补一条"只前向最后一个 prompt token
+  取 logits"的路径（单卡路线的 zero-suffix 复用就是这么做的），涉及两条路线、DFlash2/MTP 的草稿预热，单独一件。
+
+`full-prompt-hit` 场景把当前行为钉住：扫描**拒绝**整段命中、站在下一个 chunk 边界、仍然产出 token。谁给执行器补上
+零 chunk 路径，就必须同时改这个场景和本节。
+
+### 19.11 独立审查复核：三处修正与两处保留（2026-10-25）
+
+一次对本重构（未推送区间 `884b1c7d`…`97297285`）的独立审查提了 8 条，逐条对着工作树核实后的处置：
+
+**已修**
+
+1. **会话日志用 catalog 下标做键，且从不 `forget`** —— 真实缺陷。`conversation_key()` 返回的是 `sessions_` 的
+   下标，而 `session_drop()` 只 `erase` + 平移，不通知 ledger，于是被丢弃会话的锚点仍持有它的槽（`forget()` 全仓
+   零调用点）。审查推断的"一次失败的 prefill 就把池打回零"被夸大了（下标会被复用、`live_id` 会在恢复后的下一次扫描
+   重分配，都会自愈），但泄漏本身成立。修法：`SessionEntry::ledger_key`（单调、永不复用）作为会话身份，
+   `conversation_key()` 返回它，`session_drop()` 调 `reuse_ledger_->forget(key)` —— 一条共享镜像仍活到最后一个
+   命名它的会话放手，这正是 `forget()` 自己的语义。
+2. **失败 prefill 的未发布镜像被永久当成"在途"** —— 真实缺陷，但只持续到本 lane 下一次成功的请求。`invalidate_lane_prefill()`
+   现在把这些槽的 `prefill_id` 清 0 并 `force_release()` 掉：`snapshot_host_pair` 的 reconcile 靠
+   `prefill_id == lane 的 live_id` 判断"正在写"，而 `live_id` 只由扫描分配、扫描在 `cached_state_valid == false`
+   时整块跳过——一次填满池子之后抛异常的 prefill，会把整个环挡在回收路径之外，直到该 lane 再完成一个请求。
+3. **`--host-state-images` 默认值 8 与决策 20 不一致** —— 代码、`serving.md` 与 §7.1/§13.1 三处打架。现在代码是
+   **20**，`serving.md` 那一行改写成真实公式 `lanes * ceil((N + 2) / lanes) + lanes`（顺手删掉早该删的
+   "adds one slot of its own for the divergence anchor"），§13.1 的"已删"说法也随之成立。测试用符号比较，不受影响。
+
+**写成限制而非修掉**
+
+4. **整段命中（`reuse == prompt 长度`）TP-2 执行不了** —— 见 §19.10。审查说"删掉 `>=` 守卫"，实测删掉会崩，所以守卫
+   保留并注明它是执行层约束；回归场景 `full-prompt-hit` 钉住当前行为。
+
+**保留的边界（登记，不修）**
+
+5. **跨 lane 作废仍是写方向局部**：`scan_lane_reuse` 只作废 `writer == lane && position > shared` 的镜像，所以
+   lane 0 的分叉会连带作废 lane 1 本可用的同位置镜像。§19.9 的 `abandon()` 已经把"死镜像占着槽"那一半补上
+   （另一个会话下一次扫描会归还），丢一次复用机会那一半保留：跨 lane 的一等场景是**读**（§18.4），**写**仍按作者
+   归属，否则一条 lane 的分叉会去删另一条 lane 的历史。
+6. **`ConversationLog::media` 仍是空字段**：`decide()` 只比 token，媒体安全由调用方的 `media_prefix_cap` 负责
+   （§4.1 的 key 契约没有在 ledger 内实现）。要么让 ledger 真正消费媒体身份，要么把 §4.4 的契约改写清楚——两者都
+   不是这一轮的事，但它是一条明确的债。

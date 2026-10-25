@@ -1673,6 +1673,53 @@ int check_trimmed_history(const char* artifact, int device_a, int device_b, Rout
     return 0;
 }
 
+// A client that resends a prompt the engine already processed end to end - a retry, or a history it
+// truncates exactly on one of the stride images - asks for a reuse equal to the prompt length. The
+// ledger accepts that hit (prefix-reuse.md 4.1: `reuse == prompt 长度` is legal), but the TP-2 walk
+// produces the first token's logits in its last prefill chunk, so the scan declines the hit and stands
+// one chunk below it. That is the documented limitation of §19.10; this pins it so that whoever
+// teaches the walk to forward the last token itself has to update the record with it. Offering the
+// full hit instead was measured: the walk faulted right after the scan.
+int check_full_prompt_hit(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("full prompt hit (") + route_name(route) + ")";
+    constexpr std::uint32_t kLong   = 17408;  // 68 chunks: stride images at 8192 and 16384
+    constexpr std::uint32_t kPrompt = 16384;  // 64 chunks: the image below the end, on the grid
+
+    ninfer::EngineOptions options = engine_options(artifact, device_a, device_b, false, route);
+    options.max_context = 24576;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+    options.context_cache.host_state_images         = 4;
+    options.context_cache.host_kv_capacity_bytes    = 0;
+    options.context_cache.max_private_continuations = 1;
+
+    ninfer::Engine engine(options);
+    const std::vector<TokenId> history = make_prompt(1000, kLong);
+    const ninfer::GenerationResult first = run(engine, history);
+    if (first.reused_prompt_tokens != 0) {
+        return fail(label, "the first turn reused " +
+                               std::to_string(first.reused_prompt_tokens) + " prompt tokens");
+    }
+
+    std::vector<TokenId> truncated(history.begin(), history.begin() + kPrompt);
+    const ninfer::GenerationResult second = run(engine, truncated);
+    // One chunk below the prompt end: the deepest image the walk can stand on while still having a
+    // chunk to sample from. Anything deeper means the executor grew a zero-chunk path.
+    const std::uint32_t expected = kPrompt - kChunkWidth;
+    if (second.reused_prompt_tokens != expected) {
+        return fail(label, "the whole-prompt hit was expected to be declined to " +
+                               std::to_string(expected) + " tokens, but the walk reused " +
+                               std::to_string(second.reused_prompt_tokens) + " of " +
+                               std::to_string(kPrompt));
+    }
+    if (second.generated_token_ids.empty()) {
+        return fail(label, "the request produced no token");
+    }
+    std::cout << "TP-2 full prompt hit (" << label << ") declined as documented: the walk stood at "
+              << second.reused_prompt_tokens << " of " << kPrompt
+              << " tokens and produced " << second.generated_token_ids.size() << " tokens\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1717,6 +1764,7 @@ int main() {
                                           "replayed-lanes",    "image-equality",
                                           "shared-block",      "fold",
                                           "tail-divergence",   "trimmed-history",
+                                          "full-prompt-hit",
                                           "retention"};
     if (!scenario.empty() &&
         std::find(scenarios.begin(), scenarios.end(), scenario) == scenarios.end()) {
@@ -1790,6 +1838,13 @@ int main() {
             if (wants("tail-divergence")) {
                 if (const int status = check_divergence_inside_prompt_tail(
                         artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
+            }
+            if (wants("full-prompt-hit")) {
+                if (const int status =
+                        check_full_prompt_hit(artifact, devices.first, devices.second, route);
                     status != 0) {
                     return status;
                 }
