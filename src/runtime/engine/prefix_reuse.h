@@ -193,13 +193,19 @@ public:
     // that anchor returns the slot to the budget. Reserve before the copy is enqueued, because a
     // full pool evicts here — the evicted anchor's image is the one the copy is about to overwrite.
     // kNoSlot means the pool holds nothing evictable; the caller then skips the capture.
-    // `requester` is the conversation asking for the slot: the one conversation whose only image an
-    // eviction must not take.
     [[nodiscard]] std::int32_t reserve_image_slot();
     // Reserves the slot of one lane's prompt-end image, which is a role rather than a place in the
     // rotation pool. Claimed but never owned: releasing the anchor leaves the slot for the same
     // role's next image instead of returning it to the pool.
     [[nodiscard]] std::int32_t reserve_prompt_end_slot(std::uint32_t lane);
+
+    // Gives up `session`'s hold on a rotation slot whose anchor the caller has dropped without
+    // replacing it. A scan that rebuilds a table from the images a store still covers drops the ones
+    // it no longer registers - a prompt shortened behind a client-side edit leaves the images past
+    // the divergence nameless - and a hold nobody re-registers is pressure with nothing behind it:
+    // the pool reports itself exhausted while its images are still readable. Only the rotation pool:
+    // a role slot belongs to its role, not to the conversation that last named it.
+    void abandon(std::uint64_t session, std::int32_t slot);
 
 private:
     [[nodiscard]] std::int32_t allocate_slot();
@@ -214,10 +220,10 @@ private:
     void release_slot(std::int32_t slot);
     // Frees unconditionally; only called once the holder set is empty.
     void free_slot(std::size_t slot);
-    // Evicts the farthest anchor this ledger may take: an Lru image first, and only when the pool
-    // has none left, one of the shallow images of a conversation that froze several. False when
-    // nothing is evictable, which is the pool being genuinely full of images every conversation
-    // needs.
+    // Evicts the image that buys the least coverage: an Lru anchor that already has another image of
+    // the same conversation within one stride below it is redundant at this pool's resolution, so it
+    // goes before any anchor that stands alone. False when nothing is evictable, which is the pool
+    // being genuinely full of images every conversation needs.
     bool evict_one();
 
     ReuseBudget budget_;

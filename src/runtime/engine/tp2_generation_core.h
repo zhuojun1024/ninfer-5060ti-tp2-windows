@@ -818,7 +818,11 @@ private:
     // Boundary: the lane-local image captured where the last prompt on this lane stopped agreeing
     // with the lane's history. It is the only anchor between the shared block boundary and the
     // divergence, and unlike the other three it belongs to the lane rather than to a session.
-    enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared, Boundary };
+    // Which image a recalled entry's state comes back from. 'Ring' names a slot of this lane's
+    // checkpoint ring rather than an image the entry owns: the ring is a state store of its own
+    // (§9.1), and it is the only source that holds a state below a prompt that diverges inside the
+    // tail of the history it recalls.
+    enum class RecallState : std::uint8_t { Frontier, PromptEnd, Shared, Ring };
     [[nodiscard]] static LaneStateGeometry make_lane_state_geometry(const Shard& shard);
     // Copies the GDN state this lane's device slot holds right now into the ring slot the group
     // owns, tagged with the frontier it captures. A prefill writes these at its chunk boundaries and
@@ -870,10 +874,16 @@ private:
     // hold it, in which case the entry is dropped instead: the next prefill overwrites the device
     // pools, and an entry must never claim state that no longer exists.
     bool session_store_active(std::uint32_t lane);
+    // Copies the KV an entry's host slabs hold up to 'extent' into the device pools of 'lane'.
+    // Returns the number of pages moved (0 when the entry has no slabs).
+    [[nodiscard]] std::uint32_t session_restore_kv(SessionEntry& entry, std::uint32_t extent,
+                                                   std::uint32_t lane);
     // Copies an entry's host slabs back into the device pools and makes it the resident session:
-    // the KV before 'boundary' plus the frozen GDN state 'state' names.
+    // the KV before 'kv_extent' - the extent of the slab this prompt still reproduces, which is what
+    // keeps an image the ring holds above the recalled boundary reachable - plus the frozen GDN state
+    // 'state' names, taken from the entry's own image or, for RecallState::Ring, from 'ring_slot'.
     void session_restore(SessionEntry& entry, std::uint32_t boundary, RecallState state,
-                         std::uint32_t lane);
+                         std::uint32_t lane, std::uint32_t kv_extent, std::uint32_t ring_slot);
     // Frees an entry's host slabs, drops it from the catalog, and keeps the active index valid.
     void session_drop(std::size_t index);
     // Gives entry host KV slabs of at least 'pages' pages per shard, reusing larger existing ones.

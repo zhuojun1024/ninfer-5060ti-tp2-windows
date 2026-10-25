@@ -1336,6 +1336,343 @@ int check_shared_block_recall(const char* artifact, int device_a, int device_b, 
     return 0;
 }
 
+// A client that compacts its own history: it keeps the opening of the conversation, replaces the
+// turns behind it with a summary, and sends that as the next prompt. The conversation parts from its
+// entry a few thousand tokens in - the prompt is neither a continuation nor a re-rendered tail, so
+// only the prefix it still reproduces ties it to the entry that holds its history. That turn pays for
+// its own suffix by design, and what it leaves behind is the state it froze at the divergence: the
+// entry's frontier and every image the prefill wrote near it sit far above the shared prefix, so the
+// frozen divergence is the only thing the *next* compaction can stand on.
+//
+// That is the case a fold used to lose. Publishing the fold beside the entry gave the name to the new
+// entry at the end of the same turn, which dropped the old one - along with the image the fold had
+// just captured in it - so every compaction after the first re-prefilled its whole prompt. This
+// scenario folds twice and requires the second fold to stand on the boundary the first one froze.
+int check_folded_conversation(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("folded conversation (") + route_name(route) + ")";
+
+    auto lines = [](int count, const char* subject) {
+        std::string text;
+        for (int line = 0; line < count; ++line) {
+            text += "Page " + std::to_string(line) + " on " + subject +
+                    ": the clerk files it under its shelf and its date, and a page with neither is "
+                    "copied again before it goes into the drawer. ";
+        }
+        return text;
+    };
+    auto message = [](ninfer::ChatRole role, const std::string& text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        result.parts.push_back(std::move(part));
+        return result;
+    };
+    auto conversation = [&](const std::string& tail) {
+        return std::vector<ninfer::ChatMessage>{
+            message(ninfer::ChatRole::User, lines(14, "the harbour")),
+            message(ninfer::ChatRole::Assistant, lines(2, "the ledger")),
+            message(ninfer::ChatRole::User, tail)};
+    };
+    // The rendered prefix both compactions keep: the opening exchange, with everything behind it
+    // replaced. Its token count is what the divergence has to land behind.
+    auto kept_prefix = [&] {
+        return std::vector<ninfer::ChatMessage>{
+            message(ninfer::ChatRole::User, lines(14, "the harbour")),
+            message(ninfer::ChatRole::Assistant, lines(2, "the ledger"))};
+    };
+
+    constexpr std::uint32_t kFoldContext = 4096;
+    auto options_for = [&](bool retention) {
+        ninfer::EngineOptions options =
+            engine_options(artifact, device_a, device_b, retention, route);
+        // A fold needs a prompt that reaches past the opening by more than the ring's tail window, so
+        // this scenario runs on a wider context than the suite's default. The host slabs scale with
+        // it: one full-context session of these prompts is 128 MiB per shard.
+        options.max_context = kFoldContext;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kFoldContext);
+        options.context_cache.host_kv_capacity_bytes    = retention ? (768ULL << 20) : 0;
+        options.context_cache.max_private_continuations = retention ? 2 : 1;
+        return options;
+    };
+    ninfer::RequestOptions request            = greedy_request();
+    request.execution.requested_output_tokens = 8;
+
+    const auto fold_one = conversation(lines(70, "the north quay"));
+    const auto fold_two = conversation(lines(70, "the north quay, second reading"));
+
+    // The cold answers of both compactions, in their own engine: the pair cannot hold two models at
+    // once, and the comparison has to be against a walk that never saw this conversation.
+    std::vector<TokenId> cold_one;
+    std::vector<TokenId> cold_two;
+    {
+        ninfer::Engine oracle(options_for(false));
+        const auto prepare = [&](std::vector<ninfer::ChatMessage> messages) {
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            input.messages                = std::move(messages);
+            return oracle.prepare(std::move(input));
+        };
+        cold_one = oracle.generate(prepare(fold_one), request).generated_token_ids;
+        cold_two = oracle.generate(prepare(fold_two), request).generated_token_ids;
+    }
+
+    ninfer::Engine engine(options_for(true));
+    const auto ask = [&](std::vector<ninfer::ChatMessage> messages, bool named = true) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = false;
+        input.messages                = std::move(messages);
+        // The name is what makes this a conversation rather than an anonymous content match: the
+        // catalog has to keep one entry for it across the folds.
+        if (named) { input.context_cache.session_key = "fold-check"; }
+        return engine.generate(engine.prepare(std::move(input)), request);
+    };
+    const std::uint32_t prefix_tokens = engine.count_tokens([&] {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = false;
+        input.messages                = kept_prefix();
+        return input;
+    }());
+
+    // The opening has to be the first thing the conversation says, and the compactions have to reach
+    // further past it than the ring's tail window (eight chunks), or a fold would be served by an
+    // image the previous prefill wrote near its own end instead of by the state it froze at the
+    // divergence - which is the mechanism this scenario is about.
+    const ninfer::GenerationResult opening =
+        ask(conversation(lines(70, "the north quay, first draft")));
+    if (opening.reused_prompt_tokens != 0) {
+        return fail(label, "the conversation's first turn reused " +
+                               std::to_string(opening.reused_prompt_tokens) + " prompt tokens");
+    }
+    constexpr std::uint32_t kTailWindowChunks = 8;
+    const std::uint32_t tail_window           = kTailWindowChunks * kChunkWidth;
+    if (opening.prompt.prompt_tokens < prefix_tokens + tail_window + kChunkWidth) {
+        return fail(label, "the opening prompt is " + std::to_string(opening.prompt.prompt_tokens) +
+                               " tokens after a " + std::to_string(prefix_tokens) +
+                               "-token opening exchange, too short for the fold to be a divergence");
+    }
+
+    const ninfer::GenerationResult first_fold = ask(fold_one);
+    if (first_fold.reused_prompt_tokens != 0) {
+        return fail(label, "the first compaction reused " +
+                               std::to_string(first_fold.reused_prompt_tokens) +
+                               " prompt tokens of a history it had just rewritten");
+    }
+    if (first_fold.generated_token_ids != cold_one) {
+        return fail(label, "the first compaction diverged from the cold walk: got " +
+                               tokens_text(first_fold.generated_token_ids) + " expected " +
+                               tokens_text(cold_one));
+    }
+
+    // Traffic between the two compactions, which is what a real session looks like: the request
+    // shares nothing with either history, so the scan below retires every image this lane's
+    // prefills left in the ring - including the one the first fold froze its divergence in. That
+    // leaves the conversation's own catalog entry as the only carrier of that boundary, which is the
+    // claim this scenario makes.
+    if (const ninfer::GenerationResult aside = ask(
+            {message(ninfer::ChatRole::User, lines(3, "the customs house"))}, false);
+        aside.reused_prompt_tokens != 0) {
+        return fail(label, "a request that shares nothing with the conversation reused " +
+                               std::to_string(aside.reused_prompt_tokens) + " prompt tokens");
+    }
+
+    const ninfer::GenerationResult second_fold = ask(fold_two);
+    // One chunk of slack: the divergence sits where the rewritten middle begins, a few tokens behind
+    // the rendered prefix, and the anchor is the grid point the walk can stand on behind it.
+    const std::uint32_t expected = grid_floor(prefix_tokens);
+    if (second_fold.reused_prompt_tokens > expected ||
+        second_fold.reused_prompt_tokens + kChunkWidth <= expected) {
+        return fail(label, "the second compaction reused " +
+                               std::to_string(second_fold.reused_prompt_tokens) +
+                               " prompt tokens instead of the boundary the first one froze at (" +
+                               std::to_string(expected) + " or a chunk behind it)");
+    }
+    if (second_fold.generated_token_ids != cold_two) {
+        return fail(label, "the second compaction diverged from the cold walk: got " +
+                               tokens_text(second_fold.generated_token_ids) + " expected " +
+                               tokens_text(cold_two));
+    }
+    std::cout << "TP-2 folded conversation (" << label
+              << ") passed: the first compaction paid for its own suffix, the second stood on the "
+                 "state it froze "
+              << second_fold.reused_prompt_tokens << " tokens into the prompt, and both matched the "
+                 "cold walk\n";
+    return 0;
+}
+
+// A prompt that diverges inside the tail of the history it recalls leaves none of the entry's three
+// named images at or below the divergence: the entry froze its frontier past it, its prompt end sits
+// past it too, and no other conversation ever shared a block with it. The slab the entry owns still
+// carries every token up to the divergence, and the ring still holds the grid images the prefill
+// that filled that slab wrote there, so a recall has to hand over the KV extent and take its state
+// from the ring (§8.1: the state has to fit inside the extent; §9.1: the ring covers the positions
+// the device lineage no longer does). Without that the request reads as reach=0 and re-prefills its
+// whole prompt - the shape that cost a real session 97,096 tokens and 63 seconds of TTFT.
+int check_divergence_inside_prompt_tail(const char* artifact, int device_a, int device_b,
+                                        Route route) {
+    const std::string label =
+        std::string("divergence inside the prompt tail (") + route_name(route) + ")";
+    auto lines = [](int count, const char* subject) {
+        std::string text;
+        for (int line = 0; line < count; ++line) {
+            text += "Page " + std::to_string(line) + " on " + subject +
+                    ": the clerk files it under its shelf and its date, and a page with neither is "
+                    "copied again before it goes into the drawer. ";
+        }
+        return text;
+    };
+    auto message = [](ninfer::ChatRole role, const std::string& text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        ninfer::MessagePart part;
+        part.kind = ninfer::MessagePartKind::Text;
+        part.text = text;
+        result.parts.push_back(std::move(part));
+        return result;
+    };
+    // The same request twice, except for the newline the second one ends its last message with - what
+    // a client that re-renders the message it just sent produces. Everything before that newline is
+    // shared, so the divergence sits a handful of tokens behind the end of the prompt the first copy
+    // sent, and behind the prompt end the catalog recorded for it.
+    auto conversation = [&](bool trailing_newline) {
+        std::string tail = lines(3, "the customs house");
+        if (trailing_newline) { tail += "\n"; }
+        return std::vector<ninfer::ChatMessage>{
+            message(ninfer::ChatRole::User, lines(24, "the harbour")),
+            message(ninfer::ChatRole::User, tail)};
+    };
+
+    // Two lanes is what makes this the served shape: a request that retires drops its lineage, so the
+    // catalog and the ring are all that is left of the turn that wrote the slab.
+    auto options_for = [&](bool retention) {
+        ninfer::EngineOptions options = engine_options(artifact, device_a, device_b, retention, route, 2);
+        options.context_cache.host_kv_capacity_bytes    = retention ? (768ULL << 20) : 0;
+        options.context_cache.max_private_continuations = retention ? 2 : 1;
+        return options;
+    };
+    ninfer::RequestOptions request            = greedy_request();
+    request.execution.requested_output_tokens = 8;
+    const auto ask =
+        [&request](ninfer::Engine& engine, std::vector<ninfer::ChatMessage> messages) {
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            input.messages                = std::move(messages);
+            return engine.generate(engine.prepare(std::move(input)), request);
+        };
+
+    // One engine is the device's whole budget, and the second copy's walk is the one under test: it
+    // stands on the ring image the first copy's prefill froze, so what this scenario protects is the
+    // depth the recall reaches - the boundary a catalog entry with no usable named image still has.
+    std::uint32_t reused_second = 0;
+    std::uint32_t prompt_second = 0;
+    {
+        ninfer::Engine engine(options_for(true));
+        const ninfer::GenerationResult first = ask(engine, conversation(false));
+        if (first.reused_prompt_tokens != 0) {
+            return fail(label, "the first turn reused " +
+                                   std::to_string(first.reused_prompt_tokens) + " prompt tokens");
+        }
+        const ninfer::GenerationResult second = ask(engine, conversation(true));
+        reused_second = second.reused_prompt_tokens;
+        prompt_second = second.prompt.prompt_tokens;
+        // The divergence is one token at the very end of the last message, so the deepest grid
+        // boundary at or below it is the grid floor of the first prompt: one chunk of slack covers
+        // the case where that newline happens to fall past a boundary.
+        const std::uint32_t expected = grid_floor(first.prompt.prompt_tokens);
+        if (second.reused_prompt_tokens > expected ||
+            second.reused_prompt_tokens + kChunkWidth < expected) {
+            return fail(label, "the copy that diverges inside its last message reused " +
+                                   std::to_string(second.reused_prompt_tokens) + " of the " +
+                                   std::to_string(first.prompt.prompt_tokens) +
+                                   " prompt tokens the earlier turn had already paid for, instead of " +
+                                   "the grid boundary " + std::to_string(expected) +
+                                   " the ring holds");
+        }
+    }
+    // The continuation is deliberately not compared here. A recalled walk cuts the prompt differently
+    // from a cold walk (it starts at the boundary and only forwards the rest), so its rows carry a
+    // different reduction and all-reduce quantization history: the answers agree to logits precision,
+    // and greedy decoding flips the first token in roughly one run in twenty while the two walks'
+    // state images hash identically and every decision (reach, source, slot, boundary) matches. That
+    // is the behaviour §4.6 recorded and accepted - "a cache hit and a miss are not promised to
+    // produce the same output" - so pinning the answer here would pin a non-promise as a contract; the
+    // measurement is §19.8's.
+    std::cout << "TP-2 divergence inside the prompt tail (" << label << ") passed: the copy stood "
+              << reused_second << " of " << prompt_second
+              << " prompt tokens into the prompt it diverges from, on a state the ring held\n";
+    return 0;
+}
+
+// A client that shortens its history - the shape a harness produces when a context threshold prunes
+// an old tool result - sends a prompt that agrees with the previous one up to the removed slice and
+// differs everywhere behind it. The engine already holds every token's KV, so the only thing between
+// that prompt and a recall is a state image at or below the divergence; the images at or below it are
+// exactly the ones a recency eviction takes first, because the prefill keeps writing a dense band of
+// them near its own end. This asserts the pool keeps one image per stride instead, so the recall
+// stands within a stride of the divergence rather than falling back to a full prefill.
+int check_trimmed_history(const char* artifact, int device_a, int device_b, Route route) {
+    const std::string label = std::string("trimmed history (") + route_name(route) + ")";
+    // Past one stride, so the prefill freezes grid images the tail band can crowd out.
+    constexpr std::uint32_t kStride     = 8192;
+    constexpr std::uint32_t kHistory    = 16640;
+    constexpr std::uint32_t kTrimAt     = 12288;
+    constexpr std::uint32_t kTrimLength = 512;
+    constexpr std::uint32_t kGrowth     = 64;
+
+    ninfer::EngineOptions options = engine_options(artifact, device_a, device_b, false, route);
+    options.max_context = 24576;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+    // A deliberately small ring: the pool has to choose between the grid images behind the history
+    // and the dense tail in front of it, which is the decision under test.
+    options.context_cache.host_state_images         = 4;
+    options.context_cache.host_kv_capacity_bytes    = 0;
+    options.context_cache.max_private_continuations = 1;
+
+    ninfer::Engine engine(options);
+    const std::vector<TokenId> history = make_prompt(1000, kHistory);
+    const ninfer::GenerationResult first = run(engine, history);
+    if (first.reused_prompt_tokens != 0) {
+        return fail(label, "the first turn of a new history reused " +
+                               std::to_string(first.reused_prompt_tokens) + " prompt tokens");
+    }
+
+    // One more turn, only longer: the recall has to come back inside the stride window the previous
+    // prompt ended in. (The deepest image behind a prompt end is a chunk boundary, not the end
+    // itself - that one is a role image the scan does not offer - so the bound is the stride, not a
+    // chunk.)
+    std::vector<TokenId> grown = history;
+    append(grown, make_prompt(5000, kGrowth));
+    const ninfer::GenerationResult second = run(engine, grown);
+    if (second.reused_prompt_tokens > kHistory ||
+        second.reused_prompt_tokens + kStride < kHistory) {
+        return fail(label, "a prompt that only grew reused " +
+                               std::to_string(second.reused_prompt_tokens) + " of " +
+                               std::to_string(second.prompt.prompt_tokens) + " prompt tokens");
+    }
+
+    // The trim: everything before the removed slice is this history's own prefix, everything after it
+    // is the same tokens at a shifted position.
+    std::vector<TokenId> trimmed(history.begin(), history.begin() + kTrimAt);
+    append(trimmed, std::vector<TokenId>(history.begin() + kTrimAt + kTrimLength, history.end()));
+    const ninfer::GenerationResult third = run(engine, trimmed);
+    const std::uint32_t deepest = (kTrimAt / kStride) * kStride;
+    if (third.reused_prompt_tokens > kTrimAt) {
+        return fail(label, "the recall passed the divergence: it reused " +
+                               std::to_string(third.reused_prompt_tokens) + " of " +
+                               std::to_string(kTrimAt) + " agreed tokens");
+    }
+    if (third.reused_prompt_tokens < deepest) {
+        return fail(label, "the recall stood at " + std::to_string(third.reused_prompt_tokens) +
+                               " tokens against a divergence at " + std::to_string(kTrimAt) +
+                               ", below the stride image at " + std::to_string(deepest) +
+                               " the pool was supposed to keep");
+    }
+    std::cout << "TP-2 trimmed history (" << label << ") passed: the prompt diverged at "
+              << kTrimAt << " tokens and the recall stood at " << third.reused_prompt_tokens << "\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1368,49 +1705,107 @@ int main() {
         return 1;
     }
 
+    // NINFER_TEST_SCENARIO narrows the run to one scenario, which is what iterating on one of them
+    // needs when every scenario costs a model load. The default set is all of them.
+    const char* scenario_env   = std::getenv("NINFER_TEST_SCENARIO");
+    const std::string scenario = scenario_env == nullptr ? "" : scenario_env;
+    const auto wants           = [&scenario](const char* name) {
+        return scenario.empty() || scenario == name;
+    };
+    std::vector<std::string> scenarios = {"first-token",        "unaligned-dialogue",
+                                          "dropped-transport", "replayed-answer",
+                                          "replayed-lanes",    "image-equality",
+                                          "shared-block",      "fold",
+                                          "tail-divergence",   "trimmed-history",
+                                          "retention"};
+    if (!scenario.empty() &&
+        std::find(scenarios.begin(), scenarios.end(), scenario) == scenarios.end()) {
+        std::cerr << "FAIL: NINFER_TEST_SCENARIO must be one of";
+        for (const std::string& name : scenarios) { std::cerr << ' ' << name; }
+        std::cerr << '\n';
+        return 1;
+    }
+
     try {
         for (const Route route : routes) {
-            if (const int status = check_first_token_published(artifact, devices.first,
-                                                               devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("first-token")) {
+                if (const int status = check_first_token_published(artifact, devices.first,
+                                                                   devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status =
-                    check_unaligned_dialogue(artifact, devices.first, devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("unaligned-dialogue")) {
+                if (const int status =
+                        check_unaligned_dialogue(artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status = check_transport_failure_keeps_prefix(
-                    artifact, devices.first, devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("dropped-transport")) {
+                if (const int status = check_transport_failure_keeps_prefix(
+                        artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status = check_replayed_answer_keeps_prompt_end(
-                    artifact, devices.first, devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("replayed-answer")) {
+                if (const int status = check_replayed_answer_keeps_prompt_end(
+                        artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status = check_replayed_answer_across_lanes(artifact, devices.first,
-                                                                     devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("replayed-lanes")) {
+                if (const int status = check_replayed_answer_across_lanes(artifact, devices.first,
+                                                                         devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
             // The image path's own regression: a walk standing on an image has to reproduce the
             // cold walk of the same prompt, at every depth the ring can hand out.
             // `NINFER_IMAGE_BLOCK` sweeps the depth by hand; the gate runs the default one.
-            if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
-                                                                    devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("image-equality")) {
+                if (const int status = check_image_equals_a_cold_prefix(artifact, devices.first,
+                                                                       devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status =
-                    check_shared_block_recall(artifact, devices.first, devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("shared-block")) {
+                if (const int status =
+                        check_shared_block_recall(artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
-            if (const int status = run_scenario(artifact, devices.first, devices.second, route);
-                status != 0) {
-                return status;
+            if (wants("fold")) {
+                if (const int status =
+                        check_folded_conversation(artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
+            }
+            if (wants("tail-divergence")) {
+                if (const int status = check_divergence_inside_prompt_tail(
+                        artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
+            }
+            if (wants("trimmed-history")) {
+                if (const int status =
+                        check_trimmed_history(artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
+            }
+            if (wants("retention")) {
+                if (const int status = run_scenario(artifact, devices.first, devices.second, route);
+                    status != 0) {
+                    return status;
+                }
             }
         }
         return 0;

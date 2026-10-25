@@ -41,9 +41,14 @@ std::optional<Anchor> AnchorTable::erase_at(std::uint32_t position) {
 }
 
 ReuseLedger::ReuseLedger(ReuseBudget budget) : budget_(budget) {
+    // The arrays cover the whole ring, role slots included. They are addressed by a slot number that
+    // comes from either hand-out path (the rotation pool or `reserve_prompt_end_slot`), so sizing them
+    // by the pool alone left the role tail readable and writable one past the end - a latent overflow
+    // that only stayed unreachable because the pool is never full on the one prefill that claims a
+    // role. Which slots the pool may hand out is a separate question, answered by `allocate_slot`.
     used_slots_.assign(budget_.capacity + budget_.prompt_end_capacity, false);
-    owned_slots_.assign(budget_.capacity, false);
-    holders_.resize(budget_.capacity);
+    owned_slots_.assign(budget_.capacity + budget_.prompt_end_capacity, false);
+    holders_.resize(budget_.capacity + budget_.prompt_end_capacity);
 }
 
 std::uint32_t ReuseLedger::free_slots() const noexcept {
@@ -139,7 +144,9 @@ std::int32_t ReuseLedger::reserve_image_slot() {
 }
 
 std::int32_t ReuseLedger::allocate_slot() {
-    for (std::size_t slot = 0; slot < used_slots_.size(); ++slot) {
+    // Only the rotation pool: a role slot is handed out by index to the writer that owns the role, and
+    // rotating it would give the same role to two writers.
+    for (std::size_t slot = 0; slot < budget_.capacity; ++slot) {
         if (used_slots_[slot]) { continue; }
         used_slots_[slot]  = true;
         owned_slots_[slot] = true;
@@ -180,12 +187,17 @@ void ReuseLedger::free_slot(std::size_t slot) {
 }
 
 bool ReuseLedger::evict_one() {
-    // The position farthest from the frontier loses first, i.e. the smallest one. Sampling and
-    // eviction run in the same direction, so whatever survives is a contiguous recent window: there
-    // is never a hole in the middle of the coverage.
+    // Coverage decides, not recency. The stride is the resolution the pool promises, so one image
+    // per stride below the shared prefix is worth its slot and a second image inside the same stride
+    // is not: a redundant anchor goes before a lone one even when the lone one sits much shallower.
+    // Without this the dense tail a prefill writes at chunk width - up to eight images inside the
+    // last stride - crowds out the grid images behind it, and the pool ends up describing only the
+    // last few chunks of the history. A prompt a client shortens in the middle then finds no image
+    // at or before its divergence, and the whole prefill behind it is recomputed.
     ConversationLog* victim = nullptr;
     std::uint32_t victim_at = 0;
     bool have_victim        = false;
+    bool victim_redundant   = false;
     for (auto& entry : conversations_) {
         for (const Anchor& anchor : entry.second.anchors.all()) {
             if (anchor.policy != AnchorPolicy::Lru) { continue; }
@@ -198,10 +210,23 @@ bool ReuseLedger::evict_one() {
                     continue;
                 }
             }
-            if (have_victim && anchor.position >= victim_at) { continue; }
-            victim      = &entry.second;
-            victim_at   = anchor.position;
-            have_victim = true;
+            // Redundant means this conversation covers the stride below the position with another
+            // image: whichever of the two survives, a recall below this anchor still has a state
+            // within one stride. The table is sorted, so the neighbour is `floor(position - 1)`.
+            bool redundant = false;
+            if (budget_.stride != 0 && anchor.position > budget_.stride) {
+                const Anchor* below = entry.second.anchors.floor(anchor.position - 1U);
+                redundant = below != nullptr &&
+                            below->position + budget_.stride > anchor.position;
+            }
+            if (have_victim) {
+                if (victim_redundant && !redundant) { continue; }
+                if (victim_redundant == redundant && anchor.position >= victim_at) { continue; }
+            }
+            victim           = &entry.second;
+            victim_at        = anchor.position;
+            victim_redundant = redundant;
+            have_victim      = true;
         }
     }
     if (!have_victim) { return false; }
@@ -215,6 +240,14 @@ bool ReuseLedger::evict_one() {
         }
     }
     return true;
+}
+
+void ReuseLedger::abandon(std::uint64_t session, std::int32_t slot) {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= budget_.capacity) { return; }
+    const std::size_t index = static_cast<std::size_t>(slot);
+    if (index >= holders_.size()) { return; }
+    drop_hold(index, session);
+    if (holders_[index].empty()) { free_slot(index); }
 }
 
 ReuseLedger::RecordResult ReuseLedger::record(ConversationLog& conversation,
@@ -262,9 +295,12 @@ ReuseLedger::RecordResult ReuseLedger::record(ConversationLog& conversation,
             anchor.slot = request.slot;
             if (anchor.slot >= 0 && static_cast<std::size_t>(anchor.slot) < used_slots_.size()) {
                 const std::size_t index = static_cast<std::size_t>(anchor.slot);
+                // A role slot is claimed but never owned: releasing its anchor leaves the slot to the
+                // same role's next image instead of returning it to the rotation pool, which is why
+                // `owned_slots_` stays false for it even after this claim.
                 if (!used_slots_[index]) {
-                    used_slots_[index]  = true;
-                    owned_slots_[index] = true;
+                    used_slots_[index] = true;
+                    if (index < budget_.capacity) { owned_slots_[index] = true; }
                 }
                 hold_slot(index, conversation.session);
             }

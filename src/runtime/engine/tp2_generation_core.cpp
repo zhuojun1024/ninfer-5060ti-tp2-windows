@@ -2677,6 +2677,11 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         // again. Dropping the holds here would retire images this very prefill just wrote - the
         // ones a failed walk leaves behind are exactly what the next turn has to stand on.
         ConversationLog& conversation = reuse_ledger_->conversation(key);
+        // The rebuild below re-registers only what this prompt can still stand on, and an anchor's
+        // hold is what keeps its slot out of circulation. An image past the shared prefix keeps its
+        // bytes in the ring but loses its anchor - a client that shortens its history leaves one per
+        // dropped position - so the holds they leave behind are released once the offers are in.
+        const std::vector<Anchor> previous = conversation.anchors.all();
         conversation.anchors.clear();
         // Only the part this prompt agrees with is comparable, and the media identity already
         // capped it: registering the rest would let the decision answer with a position the prompt
@@ -2741,6 +2746,11 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
             // buffer that no longer holds it - the slot's retirement never reaches the ring, which
             // is why the question is asked here.
             if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(slot))) {
+                if (std::getenv("NINFER_TP2_CHECKPOINT_TRACE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[tp2-cp] retire lane=%u slot=%u pos=%u: the pool released it\n",
+                                 lane, slot, checkpoint.position);
+                }
                 checkpoint.valid = false;
                 continue;
             }
@@ -2756,6 +2766,30 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
                 continue;
             }
             offer(checkpoint.position, slot, ReuseSource::HostCheckpoint, AnchorStorage::Host);
+        }
+        // Every image the rebuild did not take back loses its hold: the conversation no longer names
+        // it, so nothing can restore from it, and a slot held for an image nobody names is pressure
+        // the pool reports against itself. A slot a live anchor still names is not one of those: a
+        // ring slot can be rewritten while an older anchor of this conversation still carries its
+        // number, and releasing it there would delete the anchor the rebuild just registered.
+        //
+        // Losing such an image costs nothing a later request could have used. The rebuild takes back
+        // an image only when it is at or below this prompt's shared prefix; one above it was stamped
+        // over text this prompt no longer contains (a client-side prune) or belongs to a prefix the
+        // lane's next request will not compare against either - the scan's baseline is always the last
+        // prompt, so the image could never pass its fingerprint again. Releasing the slot here is what
+        // lets the re-prefill that follows write its own ladder without evicting a live image first.
+        for (const Anchor& stale : previous) {
+            if (stale.storage != AnchorStorage::Host || stale.slot < 0) { continue; }
+            const Anchor* now = conversation.anchors.floor(stale.position);
+            if (now != nullptr && now->position == stale.position && now->slot == stale.slot) {
+                continue;
+            }
+            const auto still_named = std::find_if(
+                conversation.anchors.all().begin(), conversation.anchors.all().end(),
+                [&stale](const Anchor& anchor) { return anchor.slot == stale.slot; });
+            if (still_named != conversation.anchors.all().end()) { continue; }
+            reuse_ledger_->abandon(conversation.session, stale.slot);
         }
         const DecideResult decision = reuse_ledger_->decide(conversation, token_ids);
         reuse_reason                = decision.reason;
@@ -2790,11 +2824,12 @@ TP2GenerationCore::scan_lane_reuse(std::uint32_t lane, std::span<const TokenId> 
         std::fprintf(stderr,
                      "[tp2-reuse] lane=%u prompt=%u cached=%zu shared=%zu replay_split=%zu "
                      "adopted=%d prefill_end=%u host=%zu/%zu lane_slots=%zu refused_hash=%zu "
-                     "conv=%llu stride=%u -> reuse=%u slot=%u src=%s reason=%s\n",
+                     "free=%u conv=%llu stride=%u -> reuse=%u slot=%u src=%s reason=%s\n",
                      lane, prompt_tokens, lane_state.cached_prompt_tokens.size(), shared_prefix,
                      replay_split, adopted ? 1 : 0, lane_state.cached_boundaries[0],
                      valid_checkpoints, shard_a_.host_checkpoints.size(), lane_checkpoints,
-                     refused_fingerprint, static_cast<unsigned long long>(conversation_key(lane)),
+                     refused_fingerprint, reuse_ledger_->free_slots(),
+                     static_cast<unsigned long long>(conversation_key(lane)),
                      host_checkpoint_stride_, result.tokens, result.slot, source,
                      reuse_reason == ReuseReason::Used ? "used" : "no-anchor");
     }
@@ -6318,17 +6353,18 @@ bool TP2GenerationCore::session_store_active(std::uint32_t lane) {
     return true;
 }
 
-void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t boundary,
-                                        RecallState state, std::uint32_t lane) {
-    const std::uint32_t pages = pages_for_tokens(boundary);
-    if (pages == 0) {
-        entry.tokens.clear();
-        entry.frontier         = 0;
-        entry.host_frontier_end = 0;
-        mark_device_lane(sessions_, static_cast<std::size_t>(&entry - sessions_.data()),
-                         static_cast<std::int32_t>(lane));
-        return;
-    }
+std::uint32_t TP2GenerationCore::session_restore_kv(SessionEntry& entry, std::uint32_t extent,
+                                                    std::uint32_t lane) {
+    // The slabs hold the entry's KV to the entry's own extent, and a prompt that recalls this entry
+    // reproduces all of it up to the prefix the two share, so the pages are restored to the whole
+    // reproduced extent and not just up to the boundary the state comes back at (§8.1 step 1-2: the
+    // state has to fit *inside* the KV source's extent, it does not define it). Restoring only up to
+    // the boundary left the images the owning prefill wrote above it - stride and tail images, which
+    // the ring still holds - outside the reachable extent, and a prompt that diverged just inside the
+    // tail of the history it recalled therefore restarted at the boundary instead of at the deepest
+    // image it already had.
+    const std::uint32_t pages = pages_for_tokens(extent);
+    if (pages == 0) { return 0; }
     Shard* const shards[2] = {&shard_a_, &shard_b_};
     const Clock::time_point recall_start = kv_trace_enabled() ? Clock::now() : Clock::time_point{};
     for (std::size_t index = 0; index < 2; ++index) {
@@ -6339,46 +6375,6 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
         const HostKVAllocationConstView view =
             host_kv_arena_[index]->view(*entry.host_kv[index]).subview(0, pages);
         shard.decoder->text_kv.page_pool().copy_from_host(view, destination, shard.device.stream);
-
-                // Every boundary is one compact lane image at a fixed offset, so the choice of which one to
-        // load is a pointer, not a type: the lane-local boundary lives on the shard rather than in a
-        // session entry.
-        const void* frozen_image = nullptr;
-        switch (state) {
-            case RecallState::Frontier: frozen_image = entry.host_state[index]->data(); break;
-            case RecallState::PromptEnd:
-                frozen_image = entry.host_prompt_state[index]->data();
-                break;
-            case RecallState::Shared: frozen_image = entry.host_shared_state[index]->data(); break;
-        }
-        copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
-                        static_cast<std::int32_t>(lane),
-                        static_cast<std::byte*>(const_cast<void*>(frozen_image)) +
-                            static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes,
-                        cudaMemcpyHostToDevice, shard.device.stream);
-        // The draft context comes back with the target state it belongs to: the skipped prefix
-        // produces no target residual, so nothing else rebuilds the ring, and a recall that restored
-        // only the target half would verify against a draft describing the wrong tokens. A boundary is
-        // only offered when its draft pair exists, so a null here means it never was.
-        if (shard.dflash_round != nullptr) {
-            const void* frozen_dflash = nullptr;
-            std::size_t frozen_bytes  = 0;
-            switch (state) {
-                case RecallState::Frontier:
-                    frozen_dflash = entry.host_dflash[index]->data();
-                    frozen_bytes  = entry.host_dflash[index]->size();
-                    break;
-                case RecallState::PromptEnd:
-                    frozen_dflash = entry.host_dflash_prompt[index]->data();
-                    frozen_bytes  = entry.host_dflash_prompt[index]->size();
-                    break;
-                case RecallState::Shared:
-                    frozen_dflash = entry.host_dflash_shared[index]->data();
-                    frozen_bytes  = entry.host_dflash_shared[index]->size();
-                    break;
-            }
-            load_dflash_image(shard, frozen_dflash, frozen_bytes, lane);
-        }
     }
     if (mtp_enabled_) {
         shard_a_.device.bind_to_current_thread();
@@ -6394,17 +6390,101 @@ void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t bound
         CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
     }
     if (kv_trace_enabled()) {
-        const char* state_name = state == RecallState::Frontier  ? "frontier"
-                                 : state == RecallState::PromptEnd ? "prompt-end"
-                                                                   : "shared";
         std::fprintf(
-            stderr, "[tp2-kv] recall lane=%u pages=%u boundary=%u state=%s runs=%u/%u ms=%.1f\n",
-            lane, pages, boundary, state_name,
-            shard_a_.decoder->text_kv.page_pool().contiguous_run_count(
-                shard_a_.kv_lane_handles[lane]),
+            stderr, "[tp2-kv] recall lane=%u pages=%u extent=%u runs=%u/%u ms=%.1f\n", lane, pages,
+            extent, shard_a_.decoder->text_kv.page_pool().contiguous_run_count(
+                        shard_a_.kv_lane_handles[lane]),
             shard_b_.decoder->text_kv.page_pool().contiguous_run_count(
                 shard_b_.kv_lane_handles[lane]),
             std::chrono::duration<double, std::milli>(Clock::now() - recall_start).count());
+    }
+    return pages;
+}
+
+void TP2GenerationCore::session_restore(SessionEntry& entry, std::uint32_t boundary,
+                                        RecallState state, std::uint32_t lane,
+                                        std::uint32_t kv_extent, std::uint32_t ring_slot) {
+    if (session_restore_kv(entry, std::max(boundary, kv_extent), lane) == 0) {
+        entry.tokens.clear();
+        entry.frontier         = 0;
+        entry.host_frontier_end = 0;
+        mark_device_lane(sessions_, static_cast<std::size_t>(&entry - sessions_.data()),
+                         static_cast<std::int32_t>(lane));
+        return;
+    }
+    Shard* const shards[2] = {&shard_a_, &shard_b_};
+    for (std::size_t index = 0; index < 2; ++index) {
+        Shard& shard = *shards[index];
+        shard.device.bind_to_current_thread();
+        // Every boundary the entry owns is one compact lane image at a fixed offset, so the choice of
+        // which one to load is a pointer, not a type. A ring image is the other shape: the slot holds
+        // exactly one lane's state, not a slice of a multi-lane one, so 'Ring' copies from the slot's
+        // buffer directly and the lane is expressed by the geometry alone.
+        const void* frozen_image = nullptr;
+        std::size_t image_offset =
+            static_cast<std::size_t>(lane) * shard.lane_state_geometry.image_bytes;
+        switch (state) {
+            case RecallState::Frontier: frozen_image = entry.host_state[index]->data(); break;
+            case RecallState::PromptEnd:
+                frozen_image = entry.host_prompt_state[index]->data();
+                break;
+            case RecallState::Shared: frozen_image = entry.host_shared_state[index]->data(); break;
+            case RecallState::Ring:
+                frozen_image  = shard.host_checkpoints[ring_slot].buffer->data();
+                image_offset  = 0;
+                break;
+        }
+        copy_lane_state(shard.lane_state_geometry, shard.state_backing.data,
+                        static_cast<std::int32_t>(lane),
+                        static_cast<std::byte*>(const_cast<void*>(frozen_image)) + image_offset,
+                        cudaMemcpyHostToDevice, shard.device.stream);
+        // The draft context comes back with the target state it belongs to: the skipped prefix
+        // produces no target residual, so nothing else rebuilds the ring, and a recall that restored
+        // only the target half would verify against a draft describing the wrong tokens. A boundary is
+        // only offered when its draft pair exists, so a null here means it never was.
+        if (shard.dflash_round != nullptr) {
+            const void* frozen_dflash = nullptr;
+            std::size_t frozen_bytes  = 0;
+            bool loaded_draft         = false;
+            switch (state) {
+                case RecallState::Frontier:
+                    frozen_dflash = entry.host_dflash[index]->data();
+                    frozen_bytes  = entry.host_dflash[index]->size();
+                    break;
+                case RecallState::PromptEnd:
+                    frozen_dflash = entry.host_dflash_prompt[index]->data();
+                    frozen_bytes  = entry.host_dflash_prompt[index]->size();
+                    break;
+                case RecallState::Shared:
+                    frozen_dflash = entry.host_dflash_shared[index]->data();
+                    frozen_bytes  = entry.host_dflash_shared[index]->size();
+                    break;
+                case RecallState::Ring: {
+                    // The draft half is only trustworthy when its writer froze it at the frontier the
+                    // slot reports, which the ring candidate filter already demanded; a checkpoint
+                    // that slips through here would verify against the wrong tokens.
+                    const Shard::HostCheckpoint& checkpoint = shard.host_checkpoints[ring_slot];
+                    if (checkpoint.dflash_buffer == nullptr ||
+                        checkpoint.dflash_frontier != checkpoint.position) {
+                        throw std::logic_error(
+                            "TP-2 DFlash2 checkpoint does not carry the draft context at its frontier");
+                    }
+                    // The ring slot holds this lane's image alone, so the lane is expressed by the
+                    // geometry and not by an offset into the buffer: load_dflash_image() would step
+                    // 'lane' images into a buffer that holds one.
+                    shard.dflash_round->copy_context_from_host(
+                        static_cast<const std::byte*>(checkpoint.dflash_buffer->data()),
+                        shard.device.stream, static_cast<std::int32_t>(lane));
+                    loaded_draft = true;
+                    break;
+                }
+            }
+            if (!loaded_draft) { load_dflash_image(shard, frozen_dflash, frozen_bytes, lane); }
+        }
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+        shards[index]->device.bind_to_current_thread();
+        CUDA_CHECK(cudaStreamSynchronize(shards[index]->device.stream));
     }
     shard_a_.device.bind_to_current_thread();
     // A prompt-end recall leaves the entry standing where that prompt ended: the device pools hold
@@ -6528,6 +6608,25 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
                 resident_depth = checkpoint.position;
             }
         }
+        // The proofs above are images the scan can point at, and they are not the whole answer: a
+        // conversation the device pools were built from can be continued anywhere inside it that this
+        // prompt reproduces, without any image existing for that position. Comparing a host slab
+        // against the images alone therefore let a shallow slab preempt a lineage that was already
+        // deeper - req#14 of a real session restored the 8,192-token stable block over a live 82,944
+        // and re-prefilled 79,899 tokens it had just paid for, and req#20 did it again at 117,534.
+        // Claiming a depth that only exists on the device is safe even when the walk then starts
+        // shallower: it skips a recall, and the scan still picks its own start point from the states
+        // it can prove. The reverse is not safe - the recall it displaces is unrecoverable.
+        if (lane_state.active_session != kNoSession) {
+            const SessionEntry& entry = sessions_[lane_state.active_session];
+            // Only a prompt that still contains the resident prompt is a later turn of it; a
+            // conversation switching in shares the system prefix and nothing of the lineage.
+            if (entry.prompt_end != 0 && active_shared >= entry.prompt_end) {
+                const std::uint32_t served = static_cast<std::uint32_t>(
+                    std::min<std::size_t>(active_shared, lane_state.device_kv_limit));
+                if (served > resident_depth) { resident_depth = served; }
+            }
+        }
     }
 
     // A host-resident entry carries three frozen GDN states: the one its evicted frontier stood on,
@@ -6543,9 +6642,80 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
     // the column the walk ends on, so a prompt that is exactly the recalled history would restore
     // the whole thing and then prefill it again from zero. Taking that recall also discards the
     // device lineage and the checkpoint ring, which is strictly worse than not taking it.
-    std::size_t best_host       = kNoSession;
-    std::uint32_t best_frontier = 0;
-    RecallState best_state      = RecallState::Frontier;
+    // The state to stand on and the KV to stand it on are two different questions (§8.1). An image
+    // names a position; the entry's slab names an extent, and the extent is what a recall hands over
+    // (§9.1: the host store covers its own positions, and a divergence only shortens what the device
+    // side can offer). Reading the extent off the deepest image conflated the two, and a real session
+    // paid for it three times: a prompt that diverged inside the tail of the history it recalled had
+    // no image at or below the divergence, while the slab that filled that history still carried
+    // every token of it and the ring still held grid images below the divergence - the recall
+    // reported reach=0 with 36 valid images in the pool and re-prefilled 97,096 tokens.
+    //
+    // The ring is therefore a fourth source, and the one §9.1 puts beside the slabs. An image
+    // qualifies when the pool still holds its slot, its stamp describes this prompt's prefix (§18:
+    // the fingerprint, not the writer, decides), and it sits on the prefill grid (§18.7 - the reason
+    // fd9d6ded's lane-local boundary image was deleted: a state off the grid makes the walk cut
+    // different chunks than a from-scratch walk and can flip a near tie). Ring images are written at
+    // chunk ends by construction, so this test guards later writers rather than filtering today's.
+    const std::uint32_t chunk = prefill_chunk_width(shard_a_.model->config().text);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ring_states; // position, slot
+    if (reuse_ledger_ != nullptr) {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> candidates;
+        for (std::uint32_t slot = 0; slot < shard_a_.host_checkpoints.size(); ++slot) {
+            const Shard::HostCheckpoint& checkpoint = shard_a_.host_checkpoints[slot];
+            if (!checkpoint.valid || checkpoint.history_hash == 0 || checkpoint.position == 0 ||
+                checkpoint.position >= prompt_tokens.size() || checkpoint.position % chunk != 0) {
+                continue;
+            }
+            if (!reuse_ledger_->holds_slot(static_cast<std::int32_t>(slot))) { continue; }
+            // The draft half has to describe the same frontier, or the state and the ring it is
+            // paired with come from two different moments. A slot whose peer half is not even valid
+            // is refused here rather than allowed to throw inside the restore: a restore that fails
+            // halfway leaves the lane with KV, state and draft out of step, which §8.1 forbids.
+            bool draft_ok = true;
+            for (Shard* shard : {&shard_a_, &shard_b_}) {
+                if (shard->dflash_round == nullptr) { continue; }
+                const Shard::HostCheckpoint& paired = shard->host_checkpoints[slot];
+                if (!paired.valid || paired.dflash_buffer == nullptr ||
+                    paired.dflash_frontier != paired.position) {
+                    draft_ok = false;
+                    break;
+                }
+            }
+            if (!draft_ok) { continue; }
+            candidates.emplace_back(checkpoint.position, slot);
+        }
+        std::sort(candidates.begin(), candidates.end());
+        // One pass over the prompt for all candidates: the stamp is FNV over the prefix the writer
+        // froze, and a candidate describes this prompt exactly when this prompt's prefix hashes the
+        // same. Media is already accounted for by `shared` being media-capped, so a position inside
+        // it reproduces the tokens alone.
+        std::uint64_t hash = kFnvOffsetBasis;
+        std::size_t next   = 0;
+        for (const auto& [position, slot] : candidates) {
+            for (; next < position; ++next) {
+                hash = (hash ^ static_cast<std::uint64_t>(prompt_tokens[next])) * kFnvPrime;
+            }
+            if (shard_a_.host_checkpoints[slot].history_hash == hash) {
+                ring_states.emplace_back(position, slot);
+            }
+        }
+        if (session_trace_enabled()) {
+            // `states=none` rather than an empty list: on an empty ring the line used to read
+            // "states=of 36 slots", which looks like a truncated log rather than an empty pool.
+            std::fprintf(stderr, "[tp2-session] ring states=");
+            if (ring_states.empty()) { std::fprintf(stderr, "none "); }
+            for (const auto& [position, slot] : ring_states) {
+                std::fprintf(stderr, "%u:%u ", position, slot);
+            }
+            std::fprintf(stderr, "of %zu slots\n", shard_a_.host_checkpoints.size());
+        }
+    }
+    std::size_t best_host         = kNoSession;
+    std::uint32_t best_frontier   = 0;
+    std::uint32_t best_kv_end     = 0;
+    std::uint32_t best_ring_slot  = 0;
+    RecallState best_state        = RecallState::Frontier;
     for (std::size_t index = 0; index < sessions_.size(); ++index) {
         const SessionEntry& entry = sessions_[index];
         if (index == lane_state.active_session || entry.device_lane >= 0 || entry.tokens.empty()) {
@@ -6555,18 +6725,17 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         std::size_t shared       = 0;
         while (shared < common && entry.tokens[shared] == prompt_tokens[shared]) { ++shared; }
         shared = media_prefix_cap(entry.media, media, shared);
-        // Three images, deepest wins: the frontier the entry reached on the device, the prompt end
-        // it published, and the stable block it shares with a later conversation. A fourth source
-        // used to sit here - a lane-local state frozen at the exact position the prompt diverged -
-        // and it is gone: its image sat off the prefill grid, so a recall through it cut different
-        // chunks than a from-scratch walk and could flip a near tie (fd9d6ded measured the gain it
-        // bought at 137 tokens on a 21K prompt, and said so itself). The divergence anchor covers
-        // the same need on the grid, and it is exact.
-        static constexpr const char* kReachName[3] = {"frontier", "prompt-end", "shared"};
+        // Four sources, deepest wins: the frontier the entry reached on the device, the prompt end
+        // it published, the stable block it shares with a later conversation, and the ring image the
+        // entry's KV extent reaches. The first three are positions the entry itself froze; the ring
+        // is a store of its own (§9.1), and it is the only one that has a state below a prompt that
+        // diverges inside the tail of the history being recalled.
+        static constexpr const char* kReachName[4] = {"frontier", "prompt-end", "shared", "ring"};
         const std::uint32_t offered[3] = {entry.host_frontier_end, entry.host_prompt_end,
                                           entry.host_shared_end};
-        std::uint32_t reach = 0;
-        RecallState via     = RecallState::Frontier;
+        std::uint32_t reach     = 0;
+        RecallState via         = RecallState::Frontier;
+        std::uint32_t ring_slot = 0;
         for (std::size_t kind = 0; kind < 3; ++kind) {
             // Every image is capped by the extent the slabs were actually filled to, so a recall
             // and the prompt-end and shared images are taken at or behind it, so no image needs a
@@ -6587,32 +6756,60 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
                 via   = static_cast<RecallState>(kind);
             }
         }
+        // The extent this entry can hand this prompt: its slab extent, capped by the prefix the two
+        // reproduce. Everything below it is this prompt's own KV, whichever prefill computed it.
+        const std::uint32_t kv_served = static_cast<std::uint32_t>(
+            std::min<std::size_t>(entry.host_kv_end, shared));
+        // The ring's deepest state that fits inside that extent (§8.1 step 1: the state has to fit
+        // inside the KV the source can hand over). The recall restores that state onto the device
+        // itself (§8.1 step 3), so the entry it makes resident really stands there.
+        if (!ring_states.empty() && kv_served > reach) {
+            const auto ring_end = std::upper_bound(
+                ring_states.begin(), ring_states.end(), kv_served,
+                [](std::uint32_t value, const std::pair<std::uint32_t, std::uint32_t>& item) {
+                    return value < item.first;
+                });
+            if (ring_end != ring_states.begin()) {
+                const std::uint32_t position = (ring_end - 1)->first;
+                if (position < prompt_tokens.size() && position > reach) {
+                    reach     = position;
+                    via       = RecallState::Ring;
+                    ring_slot = (ring_end - 1)->second;
+                }
+            }
+        }
         if (session_trace_enabled()) {
             std::fprintf(stderr,
                          "[tp2-session]   entry %zu session=%s tokens=%zu frontier=%u "
                          "frontier_end=%u kv_end=%u prompt_end=%u host_prompt_end=%u shared_end=%u "
-                         "shared=%zu reach=%u via=%s resident=%d\n",
+                         "shared=%zu kv=%u reach=%u via=%s resident=%d\n",
                          index,
                          session_key_label(entry.session ? &*entry.session : nullptr).c_str(),
                          entry.tokens.size(), entry.frontier, entry.host_frontier_end,
                          entry.host_kv_end, entry.prompt_end, entry.host_prompt_end,
-                         entry.host_shared_end, shared, reach,
+                         entry.host_shared_end, shared, kv_served, reach,
                          reach == 0 ? "none" : kReachName[static_cast<std::size_t>(via)],
                          entry.device_lane >= 0 ? 1 : 0);
         }
         if (reach == 0) { continue; }
         if (best_host == kNoSession || reach > best_frontier) {
-            best_host     = index;
-            best_frontier = reach;
-            best_state    = via;
+            best_host      = index;
+            best_frontier  = reach;
+            best_state     = via;
+            best_ring_slot = ring_slot;
+            best_kv_end    = kv_served;
         }
     }
     if (best_host != kNoSession && best_frontier > resident_depth) {
         const std::size_t previous = lane_state.active_session;
         const bool drop_previous   = previous != kNoSession && !session_store_active(lane);
         // Restoring before dropping keeps the recalled entry's index valid: nothing has been erased
-        // yet, and the drop below only shifts indices the restore is already done with.
-        session_restore(sessions_[best_host], best_frontier, best_state, lane);
+        // yet, and the drop below only shifts indices the restore is already done with. The state
+        // comes back inside the recall even when it lives in the ring, so the device really stands at
+        // 'best_frontier' before the catalog calls this entry resident: an entry must never claim a
+        // state that no longer exists.
+        session_restore(sessions_[best_host], best_frontier, best_state, lane, best_kv_end,
+                        best_ring_slot);
         lane_state.active_session       = best_host;
         lane_state.live_state_valid     = true;
         lane_state.cached_prompt_tokens = sessions_[best_host].tokens;
@@ -6623,9 +6820,9 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         // inside the recalled history but whose prefix was another conversation's is refused by the
         // scan's fingerprint rather than by dropping every image this lane happens to carry.
         lane_state.cached_boundaries.fill(0);
-        // The recall restored pages up to `best_frontier` and no further, so an image past that
-        // point - however well its stamp matches this history - has no KV under it any more.
-        lane_state.device_kv_limit    = best_frontier;
+        // The recall restored pages up to `best_kv_end` and no further, so an image past that point -
+        // however well its stamp matches this history - has no KV under it any more.
+        lane_state.device_kv_limit    = best_kv_end;
         lane_state.cached_state_valid = true;
         lane_state.reuse_source       = ReuseSource::None;
         if (drop_previous) { session_drop(previous); }
@@ -6637,11 +6834,14 @@ void TP2GenerationCore::session_recall(std::uint32_t lane, std::span<const Token
         lane_state.block_anchor_position   = 0;
         lane_state.block_anchor_prefill_id = 0;
         if (session_trace_enabled()) {
-            std::fprintf(
-                stderr,
-                "[tp2-session] recall frontier=%u resident_depth=%u tokens=%zu entries=%zu\n",
-                sessions_[lane_state.active_session].frontier, resident_depth,
-                sessions_[lane_state.active_session].tokens.size(), sessions_.size());
+            static constexpr const char* kStateName[4] = {"frontier", "prompt-end", "shared", "ring"};
+            std::fprintf(stderr,
+                         "[tp2-session] recall frontier=%u kv_end=%u state=%s slot=%u "
+                         "resident_depth=%u tokens=%zu entries=%zu\n",
+                         sessions_[lane_state.active_session].frontier, best_kv_end,
+                         kStateName[static_cast<std::size_t>(best_state)], best_ring_slot,
+                         resident_depth, sessions_[lane_state.active_session].tokens.size(),
+                         sessions_.size());
         }
         return;
     }
@@ -6747,8 +6947,9 @@ void TP2GenerationCore::session_publish(
     // one-off call beside the conversation opens on instructions of its own, so the prefix it shares
     // stops at the boilerplate the two happen to have in common and covers neither history. Matching
     // content is also what lets a conversation take its slot back after such a call took it first.
-    std::size_t parent      = kNoSession;
-    std::size_t parent_span = 0;
+    std::size_t parent        = kNoSession;
+    std::size_t parent_span   = 0;
+    std::size_t parent_shared = 0;
     if (names_conversation) {
         for (std::size_t index = 0; index < sessions_.size(); ++index) {
             const SessionEntry& entry = sessions_[index];
@@ -6762,15 +6963,40 @@ void TP2GenerationCore::session_publish(
             const std::size_t shared = shared_history_prefix(history, entry.tokens);
             if (shared < session_retention_floor_tokens_) { continue; }
             const std::size_t span = std::min(history.size(), entry.tokens.size());
-            if (shared + kSessionRewrittenTailTokens < span) { continue; }
+            // "Reproduces the entry bar a rewritten tail" has to mean most of it. Below the margin the
+            // first half of the test accepts any overlap at all, and a one-off call short enough to be
+            // entirely a rewritten tail would then be continued - and named - by whatever comes next
+            // that happens to share its boilerplate.
+            if (shared + kSessionRewrittenTailTokens < span || 2 * shared < span) { continue; }
             if (parent == kNoSession || span > parent_span) {
-                parent      = index;
-                parent_span = span;
+                parent        = index;
+                parent_span   = span;
+                parent_shared = shared;
             }
         }
     }
     const std::size_t named_owner =
         names_conversation ? session_owner_index(*cache_hints.session_key) : kNoSession;
+    // The content match above cannot see a fold. The entry's span is the history the client rewrote,
+    // so `shared + margin` does not reach it however long the prefix the two still agree on is; the
+    // request then looks exactly like a one-off call beside the conversation, which is the one case
+    // that must not take the entry. The floor is the line between them - a title or summary call
+    // shares the boilerplate at most, a compaction shares the conversation - and the entry that
+    // carries the name wins whenever it reproduces more of the history than the content match does:
+    // a short entry beside the session must not take the name either. Above the floor the request
+    // continues that entry in the only sense the catalog needs: the prefix the entry still describes
+    // is this prompt's own prefix, so that entry is where this turn's images belong.
+    if (names_conversation && named_owner != kNoSession) {
+        const SessionEntry& owner = sessions_[named_owner];
+        const bool owner_busy =
+            owner.device_lane >= 0 && owner.device_lane != static_cast<std::int32_t>(lane);
+        const std::size_t owner_shared = shared_history_prefix(history, owner.tokens);
+        if (!owner_busy &&
+            owner_shared >= std::max<std::size_t>(session_retention_floor_tokens_, 1U) &&
+            (parent == kNoSession || owner_shared > parent_shared)) {
+            parent = named_owner;
+        }
+    }
     // A named request that continues an entry adopts it, even one an earlier one-off call left
     // unnamed; a named request that continues nothing opens the conversation only while the name has
     // no entry at all. A request that continues nothing beside a named entry publishes anonymously
@@ -7174,6 +7400,17 @@ void TP2GenerationCore::snapshot_host_pair(std::uint32_t frontier, std::uint32_t
             if (shard_a_.host_checkpoints[index].valid) { continue; }
             const std::int32_t slot = static_cast<std::int32_t>(index);
             if (!reuse_ledger_->holds_slot(slot)) { continue; }
+            // A slot a running prefill has already written is not garbage yet: its image becomes
+            // readable at that prefill's publish, and reclaiming the slot here would publish an image
+            // no anchor can ever name - the fold that froze its divergence first and filled the pool
+            // afterwards lost exactly that state this way. Only what an earlier prefill left behind is
+            // this pass's to take.
+            const std::uint64_t writer_id = shard_a_.host_checkpoints[index].prefill_id;
+            bool in_flight                = false;
+            for (std::uint32_t other = 0; other < lanes_ && !in_flight; ++other) {
+                in_flight = writer_id != 0 && writer_id == retention(other).host_checkpoint_live_id;
+            }
+            if (in_flight) { continue; }
             reuse_ledger_->force_release(slot);
             reclaimed = true;
         }
@@ -7206,16 +7443,21 @@ void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
         std::uint32_t position;
     };
 
-    std::array<PendingStamp, 64> pending{};
-    std::size_t pending_count = 0;
+    // One entry per image this prefill wrote, sized by what it actually wrote. A fixed array here
+    // silently stopped stamping once a long enough prefill crossed more stride boundaries than it
+    // held (a full --max-context cold prefill writes 32 of them, plus the tail window, the divergence
+    // and the block image), and an image without a stamp is refused by every later scan forever,
+    // holding its slot while being worth nothing.
+    std::vector<PendingStamp> pending;
+    pending.reserve(2 * shard_a_.host_checkpoints.size());
     for (Shard* shard : {&shard_a_, &shard_b_}) {
         for (std::size_t slot = 0; slot < shard->host_checkpoints.size(); ++slot) {
             const Shard::HostCheckpoint& checkpoint = shard->host_checkpoints[slot];
-            if (checkpoint.prefill_id != live_id || pending_count == pending.size()) { continue; }
-            pending[pending_count++] = PendingStamp{shard, slot, checkpoint.position};
+            if (checkpoint.prefill_id != live_id) { continue; }
+            pending.push_back(PendingStamp{shard, slot, checkpoint.position});
         }
     }
-    std::sort(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(pending_count),
+    std::sort(pending.begin(), pending.end(),
               [](const PendingStamp& left, const PendingStamp& right) {
                   return left.position < right.position;
               });
@@ -7225,16 +7467,15 @@ void TP2GenerationCore::publish_lane_checkpoints(std::uint32_t lane,
     const auto step         = [&hash](TokenId token) {
         hash = (hash ^ static_cast<std::uint64_t>(token)) * 1099511628211ULL;
     };
-    for (std::size_t index = 0; index < pending_count; ++index) {
-        const std::uint32_t position = pending[index].position;
+    for (const PendingStamp& stamp : pending) {
+        const std::uint32_t position = stamp.position;
         const std::size_t end        = std::min<std::size_t>(position, total);
         for (; next < end; ++next) {
             step(next < history.size() ? history[next] : tail[next - history.size()]);
         }
         // A position past the stream is not this history's image at all: leave it unstamped rather
         // than record a hash of a prefix the walk never stood on.
-        Shard::HostCheckpoint& checkpoint =
-            pending[index].shard->host_checkpoints[pending[index].slot];
+        Shard::HostCheckpoint& checkpoint = stamp.shard->host_checkpoints[stamp.slot];
         checkpoint.history_hash = position <= total ? hash : 0;
     }
     std::size_t published = 0;

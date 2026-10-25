@@ -286,6 +286,61 @@ int main() {
         failures += check(ledger.free_slots() == 1, "the image stayed after its last holder left");
     }
 
+    // Eviction is about coverage, not recency. One image per stride is what a recall can stand on,
+    // so a second image inside a stride the conversation already covers is the one that goes - even
+    // when it is the deepest anchor in the pool. Evicting the shallowest instead turns the pool into
+    // a window over the last few chunk ends, which is why a client that shortens its history in the
+    // middle found no image at or before its divergence and recomputed the whole prefix.
+    {
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 4});
+        ConversationLog& conversation = ledger.conversation(1);
+        const ReuseLedger::RecordResult first  = ledger.record(conversation, grid(8192));
+        const ReuseLedger::RecordResult second = ledger.record(conversation, grid(16384));
+        const ReuseLedger::RecordResult third  = ledger.record(conversation, grid(25600));
+        // One more image inside the third anchor's stride: redundant coverage, not new coverage.
+        const ReuseLedger::RecordResult redundant = ledger.record(conversation, grid(26624));
+        failures += check(first.recorded && second.recorded && third.recorded && redundant.recorded,
+                          "the coverage scenario could not fill the pool");
+        failures += check(ledger.free_slots() == 0, "the coverage scenario left slots free");
+
+        const std::int32_t reused = ledger.reserve_image_slot();
+        failures += check(reused == redundant.slot,
+                          "the pool took a lone image instead of the redundant one inside its stride");
+        failures += check(conversation.anchors.floor(8192) != nullptr &&
+                              conversation.anchors.floor(16384) != nullptr &&
+                              conversation.anchors.floor(25600) != nullptr,
+                          "the stride coverage did not survive the eviction");
+        failures += check(conversation.anchors.floor(26624) == nullptr ||
+                              conversation.anchors.floor(26624)->position != 26624,
+                          "the redundant image survived its own eviction");
+
+        // With one image per stride left, the pool degrades the documented way: the shallowest goes.
+        failures += check(ledger.reserve_image_slot() == first.slot,
+                          "a pool of lone images did not degrade to the shallowest");
+    }
+
+    // A rebuild that drops an anchor gives its slot back. A shortened prompt cannot stand on the
+    // images past its divergence, so those anchors go without a replacement - and a hold nobody
+    // re-registers is pressure the pool would report against itself forever.
+    {
+        ReuseLedger ledger(ReuseBudget{.stride = 8192, .capacity = 2, .prompt_end_capacity = 1});
+        ConversationLog& conversation = ledger.conversation(1);
+        const ReuseLedger::RecordResult deep = ledger.record(conversation, grid(8192));
+        failures += check(ledger.free_slots() == 1, "the deep image did not take a slot");
+
+        ledger.abandon(conversation.session, deep.slot);
+        failures += check(ledger.free_slots() == 2, "abandon did not return the slot");
+        failures += check(conversation.anchors.floor(8192) == nullptr,
+                          "abandon left the anchor that named the slot");
+
+        // A role slot belongs to its role, not to the conversation that last named it.
+        const std::int32_t role = ledger.reserve_prompt_end_slot(0);
+        failures += check(role >= 0, "the prompt-end role slot was refused");
+        ledger.abandon(conversation.session, role);
+        failures += check(ledger.reserve_prompt_end_slot(0) == role,
+                          "abandon released a role slot into the rotation pool");
+    }
+
     std::cout << (failures == 0 ? "ok" : "failures") << '\n';
     return failures == 0 ? 0 : 1;
 }
