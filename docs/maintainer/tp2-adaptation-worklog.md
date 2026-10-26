@@ -7761,3 +7761,54 @@ Implementation (reverted): `prompt_fp8.cuh` split into two resident roles + one 
 **Revert execution and G2 re-check (2026-09-27)**: `src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh` has been `git checkout`ed back to HEAD (`git status` has only the plan file left); after rebuilding, bench re-measurement gives 65,536 = 19,728.6 µs, 245,760 = 74,132.0 µs (same tier as baseline, math 42.13 TFLOP/s), `ninfer_softmax_attention_test` all PASS (exit 0). **Digest criterion**: `tp2_dflash_solo` (q4all artifact) = **`0xad284a4b774b1cc3`**, consistent across two independent processes, PASS; the reverted source is byte-identical to HEAD, so this value is the baseline value (§6's recorded `0x19047f8ccaf5707f` is the **FP8 PV version's** value — §7.2's initial citation of it was a misremembering and has been changed to "bit-identical to the pre-change HEAD build"; the working-tree historical value `0x4bcc3994a5efba7d` predates the two frontend changes `6e01537a`/b7d352e8, and the three do not contradict each other).
 
 The working tree has only the plan file left. **This section is CLOSED and will not be reopened** — unless the execution envelope itself changes (e.g. Br=32 lowering acc/thread to 16, or a >100 KB block-level smem budget appearing so that `v_f16` can also be double-buffered).
+
+---
+
+## 8. Br=32 envelope probe: the reopening condition, measured and closed (2026-10-26)
+
+§7 closed with "unless the execution envelope itself changes (Br=32 …, or a >100 KB smem budget)".
+This round measures the only reachable part of that condition.
+
+**Why Br=32 is the whole of it.** A 2-CTA/SM shape needs ≤50 KB smem and ≤64 registers/thread per
+CTA, i.e. 256-thread CTAs; Br=64 alone needs 8 producer warps, so the row block must halve, and
+Bc=64's 32 KB V widening staging does not fit twice, so the key tile must halve as well. Both block
+dimensions halve, and the two block-wide barriers, the KV tile load, the V widening and the softmax
+rescale are then amortized over a quarter of the work. The probe isolates the Br half: a bench-only
+copy of the production fp8 prompt kernel with Br=32 only (16 warps, Bc=64, 79,104 B smem, 1 CTA/SM,
+projected acc 32→16 registers/thread), arithmetic unchanged.
+
+**Method**: `bench/ops/causal_softmax_attention_bench_br32.cuh` selected by `--prompt-br 32`;
+`--entry cached --geometry d256-h12-kv2 --kv-dtype fp8 --tokens 1024 --execution eager --cache cold
+--warmup 5 --repeat 30`, medians, and `--digest` (FNV-1a over the output buffer) as the bit-identity
+criterion.
+
+| depth | Br=64 (production) | Br=32 (probe) | ratio | math Br=64 / Br=32 |
+|---:|---:|---:|---:|---:|
+| 8,192 | 2,638.5 µs | 3,054.2 µs | **0.864** | 41.51 / 35.86 TFLOP/s |
+| 32,768 | 9,947.3 | 11,425.8 | **0.871** | 42.10 / 36.65 |
+| 131,072 | 39,169.7 | 44,888.7 | **0.873** | 42.27 / 36.88 |
+| 245,760 | 73,526.4 | 83,931.3 | **0.876** | 42.15 / 36.92 |
+
+Digests identical at every depth (`cb26fc0c7b915d4d`, `1bb70c61927d76ee`, `4e9407879cc53c2b`,
+`c5a1962d6c235802`), stable across runs ⇒ the probe is exactly the shape change.
+
+**A checked-in lesson**: the probe's first build copied the k8v4 kernel's output tail (smem round trip
++ inverse Hadamard, which the fp8 cache does not need — its V is not rotated) and silently produced
+different bytes at *every* depth while looking perfectly plausible. The digest comparison caught it
+on the first run. Any future shape work should carry the same flag.
+
+**Verdict: halving a block dimension costs 12.6-13.6%, flat over 30× depth.** A 2-CTA shape pays that
+in both dimensions and can buy back at most the 26.3% barrier stall, part of which §7 already showed
+is tensor-pipe drain (V1: barrier 3.34→2.23 cyc/inst but math throttle 4.44→5.24 and total latency
+12.71→13.31). Break-even needs ≥25% of pure barrier fill out of a 26% budget ⇒ **expected value ≤1.0×,
+not implemented**. The shipped shape is the interior optimum of this envelope: Br=64 is the largest
+row block that keeps 8 producer + 8 V-widening warps with 4 PV slices, and Bc=64 is the largest key
+tile that fits 92,416 B.
+
+Residual levers on the attention term, recorded so they are not rediscovered: FP8 PV (§6, 1.18× at the
+op level, reverted — now a quality-policy choice, not an engineering one); the grid tail (192 blocks
+over 36 SMs = 5.33 waves, ≤4%, needs a workspace-backed persistent work queue the zero-workspace
+prompt route does not have). Nothing else was identified at this envelope.
+
+Provenance: `profiles/bench/attn_br32_probe/` (report, raw stdout). The Br=64 arm reproduces §7's
+baseline (73,517.7 µs at 245,760; 39,553 µs at 131,072) within 0.5%, so the two rounds are comparable.

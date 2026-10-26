@@ -159,6 +159,15 @@ line number, and `tp2-plan.md §N` cites [tp2-plan.md](maintainer/tp2-plan.md).
   pipeline 63.5% busiest, occupancy locked at 33% (100 regs + ~100 KB smem per
   thread). Warp doubling: −12% (register spilling). Bc 64→128: cannot launch.
   The 6× KV-request redundancy is not a DRAM cost. (worklog §3.14)
+- **Br=32 prompt-attention envelope probe (2026-10-26): rejected by measurement,
+  bit-exact.** Br=32 is the forcing condition of the only remaining shape (a
+  2-CTA/SM kernel needs 256-thread CTAs, hence Br=32 and Bc=32). A bench-only
+  copy measured 0.864–0.876× of the shipped 64×64×16-warp kernel from 8k to
+  245k depth with identical output digests. Halving one block dimension costs
+  ~13%; the 2-CTA shape pays both to buy at most the 26% barrier stall, part of
+  which is pipe drain (worklog §7 V1). The envelope is closed; the only
+  remaining attention lever is the FP8 PV quality trade (1.18×, reverted).
+  (worklog §8; profiles/bench/attn_br32_probe)
 - **Reducing AR call count requires giving up weight splitting** ⇒ always a loss
   in decode. The only correct direction is overlap. (worklog §12)
 - **Prefill allreduce is at the hardware floor.** Card 2 sits in a chipset
