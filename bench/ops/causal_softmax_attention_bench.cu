@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
+#include "causal_softmax_attention_bench_br32.cuh"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -73,6 +74,11 @@ struct Options {
     int warmup      = 5;
     int repeat      = 30;
     bool profile    = false;
+    // Envelope probe: 64 is the production prompt kernel, 32 is the benchmark-only Br=32 variant
+    // (cached entry only). See causal_softmax_attention_bench_br32.cuh.
+    int prompt_br = 64;
+    // Print an FNV-1a hash of the output buffer so two variants can be compared for bit identity.
+    bool digest = false;
     std::string csv_out;
 };
 
@@ -114,6 +120,7 @@ struct Result {
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] "
+                 "[--prompt-br 64|32] [--digest] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -245,6 +252,14 @@ Options parse_options(int argc, char** argv) {
             options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
         } else if (argument == "--repeat") {
             options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+        } else if (argument == "--prompt-br") {
+            options.prompt_br =
+                parse_i32(next("--prompt-br requires a value"), 32, 64, "--prompt-br");
+            if (options.prompt_br != 32 && options.prompt_br != 64) {
+                usage("--prompt-br expects 32 or 64");
+            }
+        } else if (argument == "--digest") {
+            options.digest = true;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -303,6 +318,10 @@ Options parse_options(int argc, char** argv) {
         std::any_of(options.batches.begin(), options.batches.end(),
                     [](std::int32_t batch) { return batch > 1; })) {
         usage("cached entry is B=1 only");
+    }
+    if (options.prompt_br != 64 &&
+        (options.entry != Entry::Cached || options.kv != KvChoice::Fp8)) {
+        usage("--prompt-br 32 requires --entry cached --kv-dtype fp8");
     }
     if (options.profile &&
         (options.entry == Entry::Both || options.geometry == GeometryChoice::All ||
@@ -528,11 +547,31 @@ public:
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
                 workspace_, output_tensor_, stream);
-        } else {
-            ops::causal_softmax_attention_cached(
-                q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
-                kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
+            return;
         }
+        if (prompt_br_ == 32) {
+            ops::br32_probe::br32_causal_attention_cached(q_tensor_, positions_tensor_, kScale,
+                                                          cache_view_, output_tensor_, stream);
+            return;
+        }
+        ops::causal_softmax_attention_cached(
+            q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
+            kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
+    }
+
+    void set_prompt_br(int value) { prompt_br_ = value; }
+
+    // FNV-1a over the whole output buffer. Two shapes that compute the same operands in the same
+    // order must produce the same bytes, so this is the probe's bit-identity check.
+    [[nodiscard]] std::uint64_t output_digest() const {
+        std::vector<unsigned char> host(output_.bytes);
+        CUDA_CHECK(cudaMemcpy(host.data(), output_.p, output_.bytes, cudaMemcpyDeviceToHost));
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const unsigned char byte : host) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        return hash;
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -576,6 +615,7 @@ private:
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
     ops::CausalAttentionExecutionEnvelope envelope_;
+    int prompt_br_ = 64;
 };
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
@@ -879,6 +919,7 @@ int main(int argc, char** argv) {
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
                       options.mapping);
+            data.set_prompt_br(options.prompt_br);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
@@ -900,6 +941,7 @@ int main(int argc, char** argv) {
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
                                       rows.table_rows, options.mapping);
+                            data.set_prompt_br(options.prompt_br);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||
@@ -973,6 +1015,13 @@ int main(int argc, char** argv) {
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;
                                         report(result);
+                                        if (options.digest) {
+                                            std::printf("  prompt_br=%d output_digest=%016llx\n",
+                                                        options.prompt_br,
+                                                        static_cast<unsigned long long>(
+                                                            data.output_digest()));
+                                            std::fflush(stdout);
+                                        }
                                         results.push_back(result);
                                     }
                                 }

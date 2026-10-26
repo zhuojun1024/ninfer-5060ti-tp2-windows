@@ -1,0 +1,12 @@
+entry=cached geometry=d256-h12-kv2   kv=fp8    mapping=identity   execution=eager cache=cold B=1 W=1024 contexts=8192 valid=1024 rows=0 workspace=        0 peak=        0 nodes=0 calls=1 median=  3054.400 us min=  3046.208 us p95=  3056.256 us logical_payload=  5980.6 GB/s physical_payload=  3015.7 GB/s math=  35.86 TFLOP/s
+  vectors K=258 V=258 bytes cache logical=18874368 physical=9510912 bytes qk_flops=54763978752 pv_flops=54763978752 qk_full_op=  17.93 TFLOP/s pv_full_op=  17.93 TFLOP/s unique_kv=9510912 bytes unique_cache_rate=     3.1 GB/s
+  prompt_br=32 output_digest=cb26fc0c7b915d4d
+entry=cached geometry=d256-h12-kv2   kv=fp8    mapping=identity   execution=eager cache=cold B=1 W=1024 contexts=32768 valid=1024 rows=0 workspace=        0 peak=        0 nodes=0 calls=1 median= 11427.136 us min= 11421.760 us p95= 11430.080 us logical_payload=  6108.9 GB/s physical_payload=  3078.8 GB/s math=  36.65 TFLOP/s
+  vectors K=258 V=258 bytes cache logical=69206016 physical=34873344 bytes qk_flops=209382801408 pv_flops=209382801408 qk_full_op=  18.32 TFLOP/s pv_full_op=  18.32 TFLOP/s unique_kv=34873344 bytes unique_cache_rate=     3.1 GB/s
+  prompt_br=32 output_digest=1bb70c61927d76ee
+entry=cached geometry=d256-h12-kv2   kv=fp8    mapping=identity   execution=eager cache=cold B=1 W=1024 contexts=131072 valid=1024 rows=0 workspace=        0 peak=        0 nodes=0 calls=1 median= 44886.719 us min= 44874.207 us p95= 44897.472 us logical_payload=  6148.0 GB/s physical_payload=  3098.2 GB/s math=  36.89 TFLOP/s
+  vectors K=258 V=258 bytes cache logical=270532608 physical=136323072 bytes qk_flops=827858092032 pv_flops=827858092032 qk_full_op=  18.44 TFLOP/s pv_full_op=  18.44 TFLOP/s unique_kv=136323072 bytes unique_cache_rate=     3.0 GB/s
+  prompt_br=32 output_digest=4e9407879cc53c2b
+entry=cached geometry=d256-h12-kv2   kv=fp8    mapping=identity   execution=eager cache=cold B=1 W=1024 contexts=245760 valid=1024 rows=0 workspace=        0 peak=        0 nodes=0 calls=1 median= 84111.549 us min= 83912.445 us p95= 84132.065 us logical_payload=  6140.5 GB/s physical_payload=  3094.3 GB/s math=  36.84 TFLOP/s
+  vectors K=258 V=258 bytes cache logical=505413632 physical=254681088 bytes qk_flops=1549412597760 pv_flops=1549412597760 qk_full_op=  18.42 TFLOP/s pv_full_op=  18.42 TFLOP/s unique_kv=254681088 bytes unique_cache_rate=     3.0 GB/s
+  prompt_br=32 output_digest=c5a1962d6c235802
