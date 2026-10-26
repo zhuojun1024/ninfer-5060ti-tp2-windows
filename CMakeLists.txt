@@ -14,7 +14,7 @@ endif()
 
 # Single source for the release version: the tagged release vX.Y.Z carries exactly this version,
 # and tools/win_port/package.ps1 refuses to package a tree whose tag does not match.
-project(ninfer VERSION 0.1.2 LANGUAGES C CXX CUDA)
+project(ninfer VERSION 0.2.0 LANGUAGES C CXX CUDA)
 
 # Every object file's header dependencies come from cl.exe's localized `/showIncludes` note, which
 # CMake decodes with the ANSI code page. When that disagrees with the bytes the compiler writes, the
